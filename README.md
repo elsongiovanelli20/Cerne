@@ -16,6 +16,33 @@ Este é o "demo matador": num único fluxo, exercita quatro camadas do produto.
 
 ---
 
+## 🚀 Subir do zero (máquina nova)
+
+```bash
+# 1. Clonar
+git clone https://github.com/elsongiovanelli20/Cerne.git
+cd Cerne
+
+# 2. Criar o .env a partir do modelo e preencher os segredos
+cp .env.example .env            # Windows:  copy .env.example .env
+#   → edite o .env: LITELLM_MASTER_KEY (obrigatória), senhas (DB/UI/Neo4j)
+#     e, se for usar, as *_API_KEY dos provedores externos.
+
+# 3. Subir o stack (build + up)
+docker compose up -d --build
+#   Windows (também baixa os modelos):  .\scripts\up.ps1
+
+# 4. Baixar os modelos locais do Ollama (se não usou o up.ps1)
+docker compose exec ollama ollama pull qwen2.5:3b
+docker compose exec ollama ollama pull nomic-embed-text
+```
+
+- **Painel:** http://localhost:8000 — a senha inicial do admin (`admin@orqion.com.br`) sai em `docker logs cerne-app` quando `ADMIN_SENHA` está vazio; o 1º login exige troca de senha.
+- **Segredos ficam FORA do git** (`.env`, `data/`, `*.key`). Na migração, traga o **`.env`** da máquina antiga por um canal seguro (ou recrie a partir do `.env.example`). Traga o **`data/`** só se quiser levar o estado/histórico local — em produção o estado real vive no servidor.
+- **Produção** (Oracle ARM): `ssh` na instância, `git clone`, copie o `.env` de produção, `docker compose up -d --build`. Ver a seção "Preparado para a nuvem" abaixo.
+
+---
+
 ## Pré-requisitos
 - Docker Desktop com backend WSL2 (já instalado).
 - `C:\Users\<você>\.wslconfig` limitando a RAM do WSL (este repositório assume `memory=10GB`).
