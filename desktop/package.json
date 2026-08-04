@@ -1,0 +1,14 @@
+{
+  "name": "cerne-desktop",
+  "version": "1.0.0",
+  "description": "Cerne Desktop — app soberano que roda o Workspace do Cerne e ingere pastas locais no acervo.",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

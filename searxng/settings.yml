@@ -1,0 +1,14 @@
+# SearXNG — metabusca self-hosted para a ferramenta "Buscar na web" do Cerne.
+use_default_settings: true
+server:
+  secret_key: "477e4a2ae6af527a41cf0efa3f8585d0b849dbb6b4df50d5f3c130e8b51563fd"
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+engines:
+  - name: wikipedia
+    disabled: false

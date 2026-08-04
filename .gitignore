@@ -1,0 +1,35 @@
+# Segredos — NUNCA versionar
+.env
+*.env
+.env.*
+# Chaves privadas / assinatura (mantém apenas a .pub, que é pública)
+*.key
+*.pem
+*.p12
+*.keystore
+id_rsa*
+*secret*
+*token*.txt
+
+# Dados persistidos (Qdrant, Neo4j, Postgres, uploads, audit ledger, appstate)
+data/
+appstate*.json
+
+# Build / dependências (regeneráveis)
+node_modules/
+target/
+dist/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Logs e temporários
+*.log
+__pycache__/
+*.pyc
+*.bak
+Caddyfile*.bak
+.__wtest
+.DS_Store
+Thumbs.db

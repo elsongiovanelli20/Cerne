@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+httpx
+pydantic>=2
+qdrant-client
+pypdf
+python-multipart
+pytesseract
+pillow
+neo4j
+rarfile
+py7zr
+cryptography
+sqlalchemy
+psycopg2-binary
+pymysql

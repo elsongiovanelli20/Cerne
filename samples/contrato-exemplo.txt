@@ -1,0 +1,26 @@
+CONTRATO DE PRESTAÇÃO DE SERVIÇOS
+
+CONTRATANTE: João da Silva Souza, portador do CPF 111.444.777-35,
+residente na Rua das Acácias, 120, CEP 01310-100, São Paulo/SP,
+e-mail joao.souza@exemplo.com.br, telefone (11) 98765-4321.
+
+CONTRATADA: Orqion Tecnologia Ltda., inscrita no CNPJ 11.222.333/0001-81.
+
+CLÁUSULA 1 — OBJETO
+A CONTRATADA prestará serviços de implantação de uma plataforma de
+inteligência artificial soberana, incluindo instalação, configuração
+e treinamento da equipe do CONTRATANTE.
+
+CLÁUSULA 2 — PRAZO DE PAGAMENTO
+O pagamento será realizado em até 30 (trinta) dias corridos após a
+emissão da nota fiscal, mediante transferência bancária.
+
+CLÁUSULA 3 — RETENÇÃO DE DADOS
+Todos os dados pessoais tratados durante o projeto serão retidos por,
+no máximo, 12 (doze) meses após o encerramento do contrato, em
+conformidade com a LGPD (Lei nº 13.709/2018), sendo eliminados de
+forma segura ao término desse período.
+
+CLÁUSULA 4 — CONFIDENCIALIDADE
+As partes obrigam-se a manter sigilo sobre todas as informações
+técnicas e comerciais trocadas durante a vigência deste contrato.

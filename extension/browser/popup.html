@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{--cyan:#38d6d6;--iris:#6c8cff;--bg:#0a0f14;--panel:#111820;--line:#1e2a35;--ink:#e6f2f2;--dim:#8aa;}
+  *{box-sizing:border-box}
+  body{width:320px;margin:0;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+  .hd{display:flex;align-items:center;gap:9px;padding:14px 15px;border-bottom:1px solid var(--line);
+      background:linear-gradient(120deg,rgba(56,214,214,.10),rgba(108,140,255,.07))}
+  .logo{width:24px;height:24px;border-radius:6px;background:conic-gradient(from 210deg,var(--cyan),var(--iris),var(--cyan));box-shadow:0 0 12px rgba(56,214,214,.5)}
+  .hd b{font-size:14px}.hd .sub{font-size:10.5px;color:var(--dim)}
+  .bd{padding:14px 15px;display:flex;flex-direction:column;gap:11px}
+  label{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;display:block}
+  input{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--ink);padding:9px 11px;font-size:12.5px}
+  input:focus{outline:none;border-color:var(--cyan)}
+  .row{display:flex;gap:8px}
+  button{border:0;border-radius:8px;padding:9px 13px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .primary{background:var(--cyan);color:#04121a;flex:1}
+  .ghost{background:var(--panel);color:var(--ink);border:1px solid var(--line)}
+  .st{display:flex;align-items:center;gap:8px;font-size:12px;padding:9px 11px;border-radius:8px;background:var(--panel);border:1px solid var(--line)}
+  .dot{width:9px;height:9px;border-radius:50%;background:#556}
+  .dot.on{background:var(--cyan);box-shadow:0 0 9px 1px var(--cyan)}
+  .muted{font-size:10.5px;color:var(--dim);line-height:1.5}
+  a{color:var(--cyan);text-decoration:none}
+  .sw{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .toggle{position:relative;width:40px;height:22px;background:var(--panel);border:1px solid var(--line);border-radius:999px;cursor:pointer;transition:.15s}
+  .toggle.on{background:rgba(56,214,214,.25);border-color:var(--cyan)}
+  .knob{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--dim);transition:.15s}
+  .toggle.on .knob{left:20px;background:var(--cyan)}
+</style>
+</head>
+<body>
+  <div class="hd"><div class="logo"></div><div><b>Cerne · Copiloto do Navegador</b><div class="sub">soberano · você autoriza cada operação</div></div></div>
+  <div class="bd">
+    <div class="st"><span class="dot" id="dot"></span><span id="stTxt">verificando…</span></div>
+    <div class="sw"><span>Ativar controle pelo Cerne</span><div class="toggle" id="tg"><div class="knob"></div></div></div>
+    <div>
+      <label>Servidor Cerne</label>
+      <input id="base" placeholder="https://cerne.orqion-ia.com.br" autocomplete="off" spellcheck="false">
+    </div>
+    <div>
+      <label>Código de pareamento</label>
+      <input id="token" placeholder="cole o código gerado no Cerne" autocomplete="off" spellcheck="false">
+      <div class="muted" style="margin-top:6px">No Cerne, abra <b>Agentes → Navegador do usuário</b>, gere o código e cole aqui. Enquanto o Cerne opera, uma moldura aparece na página.</div>
+    </div>
+    <div class="row">
+      <button class="primary" id="save">Parear e conectar</button>
+      <button class="ghost" id="test">Testar</button>
+    </div>
+  </div>
+<script src="popup.js"></script>
+</body>
+</html>

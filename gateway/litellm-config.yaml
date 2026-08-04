@@ -1,0 +1,98 @@
+# Gateway universal (L5) — API compatível com OpenAI na porta 4000.
+# O app e qualquer ferramenta externa falam "OpenAI"; o gateway roteia para o
+# backend real. Hoje: Ollama local. Amanhã: adicione um modelo em GPU na nuvem
+# ou um fallback para OpenAI/Anthropic apenas mudando este arquivo.
+
+model_list:
+  - model_name: chat
+    litellm_params:
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+
+  # Alias soberano para a CAMADA DE AGENTES (NanoClaw via Claude Agent SDK).
+  # NanoClaw aponta ANTHROPIC_BASE_URL para este gateway e usa o modelo "agent":
+  # a inferência dos agentes fica 100% local (Ollama) e separada na observabilidade.
+  # Para um agente mais forte, troque o 'model' aqui (GPU local) ou roteie a um
+  # provedor externo COM PII mascarada, sob a governança híbrida — sem tocar no NanoClaw.
+  - model_name: agent
+    litellm_params:
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+  # Nomes de modelo padrão do Claude Agent SDK → resolvem para o modelo local soberano,
+  # para o NanoClaw funcionar apontado ao gateway sem precisar de chave da Anthropic.
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: ollama/qwen2.5:3b
+      api_base: http://ollama:11434
+
+  # (Gemma 4 E4B removido do gateway: 9.6GB inviável em CPU-only — reservado p/ tier com GPU)
+  - model_name: embed
+    litellm_params:
+      model: ollama/bge-m3                 # embeddings MULTILÍNGUES (1024d) — muito melhor recall PT-BR/cross-lingual
+      api_base: http://ollama:11434
+
+  # --- provedores externos GRATUITOS ---
+  # O app (/ask-externo) MASCARA a PII antes de chamar qualquer um destes.
+  # Cada modelo só funciona se a respectiva chave estiver no .env; sem chave = indisponível.
+  - model_name: ext-glm              # GLM-4.7-Flash direto na Z.ai (tier Flash grátis)
+    litellm_params:
+      model: openai/glm-4.7-flash
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+  - model_name: ext-gemini           # Google Gemini Flash (1500 req/dia grátis, sem cartão)
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: ext-groq             # Groq (muito rápido; Llama 3.3 70B)
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: ext-cerebras         # Cerebras (grátis; gpt-oss-120b e zai-glm-4.7)
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: ext-mistral          # Mistral (Codestral, para código)
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: ext-qwen             # Qwen3-32B via Groq (grátis e rápido; reusa GROQ_API_KEY)
+    litellm_params:
+      model: groq/qwen/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: ext-qwen-max         # Qwen3-Max oficial (Alibaba DashScope, free trial)
+    litellm_params:
+      model: openai/qwen3-max
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/DASHSCOPE_API_KEY
+  - model_name: ext-reason           # 🧠 Thinking: GPT-OSS 120B (raciocínio), LIVE via Groq (reusa GROQ_API_KEY)
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: ext-openrouter       # roteador FREE do OpenRouter: escolhe o melhor modelo grátis por prompt
+    litellm_params:
+      model: openrouter/openrouter/free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: ext-deepseek         # DeepSeek-V3 / R1 oficial (barato; grátis via OpenRouter)
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: ext-kimi             # Moonshot Kimi (contexto gigante)
+    litellm_params:
+      model: openai/moonshot-v1-128k
+      api_base: https://api.moonshot.ai/v1
+      api_key: os.environ/MOONSHOT_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600        # inferência em CPU é lenta; timeout generoso
+  cache: true                 # cache de respostas: pergunta idêntica = instantânea
+  cache_params:
+    type: local
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  store_model_in_db: true          # loga requisições/tokens/latência/custo no Postgres

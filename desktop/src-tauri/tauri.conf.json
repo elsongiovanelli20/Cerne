@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Cerne Desktop",
+  "version": "1.0.4",
+  "identifier": "br.com.orqion.cerne-desktop",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Cerne",
+        "url": "https://cerne.orqion-ia.com.br/?app=desktop",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 940,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://cerne.orqion-ia.com.br/download/desktop-manifest"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQzQkVGQkIwMDBCRUYwM0YKUldRLzhMNEFzUHUrUTdOdy9sTkZiN2N4aER0Z0tucDZ3M280Si9CbGJnYUNGL2hqVFNJcVZsbTEK"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Orqion",
+    "copyright": "© Orqion · Cerne — plataforma privada de IA",
+    "category": "Productivity",
+    "shortDescription": "Cerne Desktop",
+    "longDescription": "App soberano do Cerne: roda o Workspace e ingere pastas locais no acervo, sob a governança da sua organização.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["PortugueseBR", "English"]
+      }
+    }
+  }
+}

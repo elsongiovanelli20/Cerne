@@ -1,0 +1,225 @@
+name: cerne
+
+# Stack Cerne — RAG privado com PII masking, 100% local e portável para a nuvem.
+# Camadas do produto exercitadas:
+#   L4 Intelligence  -> ollama (inferência + embeddings)
+#   L5 Action/Bus    -> gateway (LiteLLM, API compatível com OpenAI)
+#   L2 Integration   -> pii (Presidio + reconhecedores BR: CPF/CNPJ/CEP)
+#   L3 Context       -> qdrant (busca vetorial) + app (ingestão/RAG)
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cerne-ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=-1                   # mantem o modelo carregado: mata o cold-start (~74s)
+      - OLLAMA_FLASH_ATTENTION=1               # atencao mais eficiente
+      - OLLAMA_KV_CACHE_TYPE=q8_0              # cache KV quantizado: menos RAM
+    volumes:
+      - ./data/ollama:/root/.ollama          # modelos persistem em D:\cerne\data\ollama
+    ports:
+      - "11434:11434"                          # exposto só p/ debug local
+    mem_limit: ${OLLAMA_MEM:-5g}               # ajustável por máquina (Gemma 4 E4B precisa ~12g)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: cerne-qdrant
+    volumes:
+      - ./data/qdrant:/qdrant/storage          # vetores persistem em D:\cerne\data\qdrant
+    ports:
+      - "6333:6333"
+    mem_limit: 1g
+    restart: unless-stopped
+
+  pii:
+    build: ./pii
+    container_name: cerne-pii
+    environment:
+      - PII_LANG=pt
+      - SPACY_MODEL=${SPACY_MODEL:-pt_core_news_lg}   # NER grande = melhor detecção de nomes
+    mem_limit: 2200m                                   # modelo _lg precisa de mais RAM que o _sm
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 75s
+
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: cerne-litellm-db
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${LITELLM_DB_PASSWORD}
+      - POSTGRES_DB=litellm
+    volumes:
+      - ./data/litellm-db:/var/lib/postgresql/data
+    mem_limit: 400m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: cerne-gateway
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]
+    volumes:
+      - ./gateway/litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@litellm-db:5432/litellm
+      - UI_USERNAME=${UI_USERNAME:-admin}
+      - UI_PASSWORD=${UI_PASSWORD:-}
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    mem_limit: 2g
+    depends_on:
+      ollama:
+        condition: service_healthy
+      litellm-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  rerank:
+    build: ./rerank
+    container_name: cerne-rerank
+    profiles: ["rerank"]                       # opcional: sobe só com --profile rerank
+    environment:
+      - RERANK_MODEL=BAAI/bge-reranker-base
+    volumes:
+      - ./data/rerank:/cache
+    mem_limit: 2g
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: cerne-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASS}
+      - NEO4J_server_memory_heap_max__size=512m
+      - NEO4J_server_memory_pagecache_size=384m
+    volumes:
+      - ./data/neo4j:/data
+    mem_limit: 1500m
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    container_name: cerne-app
+    environment:
+      - GATEWAY_URL=http://gateway:4000
+      - GATEWAY_KEY=${LITELLM_MASTER_KEY}
+      - PII_URL=http://pii:8080
+      - QDRANT_URL=http://qdrant:6333
+      - CHAT_ALIAS=chat
+      - EMBED_ALIAS=embed
+      - EMBED_DIM=${EMBED_DIM:-1024}          # bge-m3 = 1024d (era 768 no nomic); reindexar ao trocar
+      - COLLECTION=cerne_docs
+      - OLLAMA_URL=http://ollama:11434
+      - VISION_MODEL=${VISION_MODEL:-qwen2.5vl:3b}   # modelo de visão LOCAL (soberano); baixe com: ollama pull qwen2.5vl:3b
+      - VISION_ENABLED=${VISION_ENABLED:-1}
+      - SEARXNG_URL=http://searxng:8080
+      - RERANK=1
+      - RERANK_URL=http://rerank:8090
+      - NEO4J_URL=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASS=${NEO4J_PASS}
+      - APPSTATE_PATH=/data/app/appstate.json
+      - ADMIN_SENHA=${ADMIN_SENHA:-}          # senha inicial do admin do painel; vazio = gerada e impressa no log
+      - AUTH_TTL_HORAS=${AUTH_TTL_HORAS:-12}  # validade da sessão de login (horas)
+      - NANOCLAW_DB=/data/nanoclaw/v2.db      # estado do runtime de agentes (somente-leitura) p/ o painel Runtime
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - SANDBOX_URL=http://sandbox:8090        # executor isolado de código dos agentes (container separado)
+      - RENDER_URL=http://render:8091          # renderizador Chromium (HTML → PNG/PDF/MP4), container separado
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/audit:/data/audit
+      - ./data/app:/data/app
+      - ./data/inbox:/data/inbox          # conector: arquivos soltos aqui são ingeridos (subpasta = coleção)
+      - ${NANOCLAW_DATA:-./data/nanoclaw}:/data/nanoclaw:ro   # runtime NanoClaw (v2.db) p/ o painel Runtime de Agentes
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    mem_limit: 600m
+    depends_on:
+      - qdrant
+      - pii
+      - gateway
+    networks:
+      - default        # rede interna (gateway/qdrant/pii/etc.)
+      - sandboxnet      # ponte só p/ falar com o executor isolado
+      - rendernet       # ponte só p/ falar com o renderizador Chromium
+    restart: unless-stopped
+
+  searxng:                                     # metabusca self-hosted p/ a ferramenta "Buscar na web"
+    image: searxng/searxng:latest
+    container_name: cerne-searxng
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    mem_limit: 500m
+    restart: unless-stopped
+
+  sandbox:                                     # executor ISOLADO de código dos agentes (Excel/Word/PPT/dados)
+    build: ./sandbox
+    container_name: cerne-sandbox
+    read_only: true                            # rootfs somente-leitura
+    tmpfs:
+      - /work:size=1536m,mode=1777            # área efêmera (frames de vídeo/imagens); some ao reiniciar
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 2200m                            # rembg/onnxruntime (Photoshoot) precisa de folga de RAM
+    networks:
+      - sandboxnet                             # SEM acesso à rede interna (gateway/qdrant/segredos)
+    restart: unless-stopped
+
+  render:                                      # renderizador Chromium (HTML → PNG/PDF/MP4) — SEM segredos
+    build: ./render
+    container_name: cerne-render
+    shm_size: 1g                               # Chromium
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2500m
+    pids_limit: 512
+    networks:
+      - rendernet                              # tem internet (fontes/imagens públicas), mas NÃO alcança gateway/qdrant/segredos
+    restart: unless-stopped
+
+networks:
+  default:
+  sandboxnet:
+    driver: bridge
+  rendernet:
+    driver: bridge
