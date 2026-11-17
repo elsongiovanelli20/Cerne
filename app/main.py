@@ -10002,6 +10002,7 @@ class PlanoReq(BaseModel):
     mensagem: str
     tipo: str = "documento"
     colecoes: list | None = None
+    session_id: str = ""         # p/ o plano refletir o anexo (case/brief) da conversa
 
 
 @app.post("/plano")
@@ -10012,7 +10013,11 @@ def plano(body: PlanoReq):
     sys = ("Você é um planejador conciso. Dado o pedido de criação de um " + tipo + ", responda SOMENTE com JSON válido no "
            "formato {\"titulo\": \"...\", \"passos\": [\"...\", \"...\"], \"resumo\": \"uma frase\"}. De 3 a 6 passos; cada item de "
            "\"passos\" é uma STRING (uma frase começando por um verbo), NUNCA um objeto, e ESPECÍFICO ao pedido (nada genérico). Em português.")
-    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": (body.mensagem or "")[:1500]}]
+    _ax, _axn = _anexos_texto(body.session_id or "")
+    umsg = (body.mensagem or "")[:1500]
+    if _ax:
+        umsg += "\n\n[DOCUMENTO ANEXADO — base do pedido; planeje para ATENDER a todos os pontos dele]:\n" + _ax[:1800]
+    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": umsg}]
     raw = re.sub(r"(?s)<think>.*?</think>", "", (_chat_completo("chat", msgs, max_tokens=500, conts=1) or "")).strip()
     data = {}
     mm = re.search(r"\{.*\}", raw, re.S)
@@ -10058,21 +10063,60 @@ class GerarReq(BaseModel):
     instrucao: str
     colecao: str = COLLECTION
     colecoes: list | None = None
+    session_id: str = ""         # p/ incluir os anexos efêmeros da conversa como base do entregável
+
+
+def _limpa_placeholders(t):
+    """Neutraliza marcadores de preenchimento (ex.: [LOCATION], <ORGANIZATION>, <[PERSON_1]>) que o
+    modelo inventa OU que sobraram sem de-mascarar. Preserva links Markdown [texto](url) e checkboxes [x]."""
+    if not t:
+        return t
+    def _repl(m):
+        tok = m.group(1)
+        if re.match(r"LOCATION|GPE|LOC|CIDADE|LOCAL", tok):
+            return "essa localidade"
+        if re.match(r"PERSON|PESSOA|NOME|NAME", tok):
+            return "a pessoa responsável"
+        if re.match(r"ORG(?:ANIZATION)?|EMPRESA|COMPANY|CLIENTE", tok):
+            return "a empresa"
+        if re.match(r"EMAIL|PHONE|TEL|CPF|CNPJ|DATA|DATE|VALOR|MONEY", tok):
+            return "—"
+        return ""
+    t = re.sub(r"<\[?([A-Z][A-Z0-9_]{2,})\]?>", _repl, t)        # <TOKEN> e <[TOKEN]>
+    t = re.sub(r"\[([A-Z][A-Z0-9_]{2,})\](?!\()", _repl, t)      # [TOKEN] (não engole link [txt](url))
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r" +([,.;:])", r"\1", t)
+    return t
 
 
 @app.post("/gerar")
 def gerar(body: GerarReq):
     _quota_consumir()
     hits = _search_multi(body.instrucao, 5, _colls_of(body))
-    ctx = "\n\n---\n\n".join(h.payload.get("text", "") for h in hits)
+    ax, axn = _anexos_texto(body.session_id or "")
+    _parts = []
+    if ax:
+        _parts.append("DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax)
+    _parts += [h.payload.get("text", "") for h in hits]
+    ctx = "\n\n---\n\n".join(p for p in _parts if p)
+    _anexo_regra = (" Se houver DOCUMENTO(S) ANEXADO(S) no contexto, trate-os como a BASE PRINCIPAL do pedido (leia o brief/case, "
+                    "atenda a TODOS os pontos/perguntas dele); o acervo do projeto é apenas apoio." if axn else "")
     if body.tipo == "site":
         sys = ("Você gera UMA página HTML completa e autocontida (com <style> inline), profissional, moderna e em português, "
-               "que ATENDA AO PEDIDO do usuário. Use o CONTEXTO do acervo apenas como referência quando for pertinente ao pedido "
+               "que ATENDA AO PEDIDO do usuário." + _anexo_regra + " Use o CONTEXTO do acervo apenas como referência quando for pertinente ao pedido "
                "(NÃO copie o contexto se ele não tiver relação com o pedido). Responda SOMENTE com o HTML começando por <!doctype html>, sem comentários e sem cercas de código.")
     else:
-        sys = ("Você gera um DOCUMENTO em Markdown bem estruturado (título com #, seções com ##, listas e tabelas quando útil), "
-               "profissional e em português, que ATENDA AO PEDIDO do usuário. Use o CONTEXTO do acervo apenas como referência quando for pertinente "
-               "(NÃO copie o contexto se ele não tiver relação com o pedido). Responda SOMENTE com o Markdown, sem explicações.")
+        sys = ("Você é um CONSULTOR SÊNIOR. Produza um DOCUMENTO EXECUTIVO completo, aprofundado e bem estruturado em "
+               "Markdown (título #, seções ##, subtítulos ###), profissional e em português, que ATENDA INTEGRALMENTE AO PEDIDO." + _anexo_regra +
+               " Se o brief/case tiver perguntas ou requisitos numerados, RESPONDA A CADA UM — do PRIMEIRO ao ÚLTIMO, sem pular nenhum e "
+               "incluindo o fechamento/apresentação executiva (ex.: o que levar à diretoria) — cada um em seção própria e FUNDAMENTANDO a escolha. "
+               "Comece com um Sumário Executivo. Use TABELAS em Markdown (linhas com | e uma linha de cabeçalho |---|) para todo conteúdo "
+               "comparativo ou estruturado: cronogramas, riscos e mitigação, responsabilidades (RACI), entregáveis e objetivos, perguntas por área. "
+               "NUNCA escreva marcadores de preenchimento entre colchetes (ex.: [EMPRESA], [LOCATION], [NOME], [CIDADE]); se um dado específico for "
+               "desconhecido, use expressão neutra ('a empresa', 'a operadora', 'a área responsável'). "
+               "Seja abrangente, concreto e específico ao contexto — nível de entrega para a diretoria — NUNCA raso, genérico ou fora do tema. "
+               "Use o CONTEXTO do acervo apenas como APOIO; não copie o acervo nem troque o assunto do pedido. "
+               "Responda SOMENTE com o Markdown do documento, sem explicações fora dele.")
     org = _org()
     prov = _best_provider(org) if org.get("soberania") == "hibrido" else None   # híbrido: modelo forte escreve o entregável
     tokens = None
@@ -10088,18 +10132,19 @@ def gerar(body: GerarReq):
         else:
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=4096)
+                                    max_tokens=6000)
             out = _strip_think(out or "")
     except Exception as e:
         try:                                            # provedor externo falhou (429/etc.) -> cai p/ local soberano
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=4096)
+                                    max_tokens=6000)
             out = _strip_think(out or "")
         except Exception as e2:
             return JSONResponse(status_code=502, content={"error": "falha na geração", "detail": str(e2)[:300]})
     out = re.sub(r"^```[a-zA-Z]*\n?", "", out.strip())
     out = re.sub(r"\n?```$", "", out).strip()
+    out = _limpa_placeholders(out)
     _event("geração", f"{body.tipo} · {body.instrucao[:50]}")
     return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits})}
 
@@ -10272,6 +10317,7 @@ class InterpretarReq(BaseModel):
     colecao: str = COLLECTION
     colecoes: list | None = None
     sem_opcoes: bool | None = False     # True quando a msg já é a resposta de uma escolha (não reoferecer opções)
+    session_id: str = ""                # p/ enxergar os anexos efêmeros da conversa (senão o roteador é cego ao anexo)
 
 
 @app.post("/interpretar")
@@ -10287,14 +10333,21 @@ def interpretar(body: InterpretarReq):
         pass
     docs = sorted(docs)
     doclist = ", ".join(docs) if docs else ("(conversa sem acervo — pode responder livremente)" if not colls else "(nenhum documento neste projeto ainda)")
+    ax, axn = _anexos_texto(body.session_id or "")
+    anexo_ctx = ""
+    if axn:
+        anexo_ctx = (f"DOCUMENTO(S) ANEXADO(S) nesta conversa (efêmeros, geralmente a BASE do pedido atual): {', '.join(axn)}. "
+                     f"Trecho do anexo: {ax[:700].strip()}… ")
     sys = ("Você é o roteador do copiloto do Cerne (plataforma da Orqion); nunca diga que foi criado por outra empresa. Ele trabalha SOBRE os documentos de um projeto. "
-           f"DOCUMENTOS disponíveis no projeto: {doclist}. "
+           f"DOCUMENTOS disponíveis no projeto: {doclist}. " + anexo_ctx +
            "Analise a MENSAGEM do usuário e escolha UMA ação:\n"
            "- perguntar: pergunta cujo conteúdo está (ou deveria estar) nos documentos.\n"
            "- responder: saudação, agradecimento, ou pergunta sobre o que você CONSEGUE fazer (capacidades).\n"
            "- esclarecer: a pessoa quer gerar um documento ou site, mas o pedido está VAGO (falta assunto, tipo, ou qual documento usar).\n"
            "- documento: pedido CLARO de gerar um texto/documento, com assunto definido.\n"
            "- site: pedido CLARO de gerar uma página/site, com assunto definido.\n"
+           "IMPORTANTE: se há DOCUMENTO(S) ANEXADO(S) e a pessoa pede para avaliá-lo, estruturá-lo ou gerar algo a partir dele "
+           "(um plano, análise, proposta, resumo, resposta a um case), o ASSUNTO ESTÁ NO ANEXO — o pedido NÃO é vago: escolha 'documento', NUNCA 'esclarecer'.\n"
            "Responda EXATAMENTE em duas linhas:\n"
            "ACAO: <perguntar|responder|esclarecer|documento|site>\n"
            "TEXTO: <se for responder ou esclarecer, escreva a mensagem ao usuário: explique brevemente o que você faz e/ou faça 1-2 perguntas objetivas, citando os documentos disponíveis quando útil. Caso contrário, deixe vazio>")
@@ -10317,12 +10370,16 @@ def interpretar(body: InterpretarReq):
         intent = "responder"
     else:
         intent = "perguntar"
+    # rede de segurança: anexo presente + verbo de construção -> é 'documento' (o assunto está no anexo, não é vago)
+    if axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
+        intent = "documento"; texto = ""
     if intent in ("responder", "esclarecer") and not texto:
         texto = ("Consigo responder sobre os documentos deste projeto e gerar documentos ou sites com base neles. "
                  "Me diga o assunto e o tipo — ex.: um resumo do contrato, ou uma landing page sobre o serviço. "
                  f"Documentos disponíveis: {doclist}.")
-    # oferece opções de escolha quando o pedido pode ser especificado melhor (o gerador decide se cabem)
-    if intent in ("esclarecer", "documento", "site") and not body.sem_opcoes:
+    # oferece opções de escolha quando o pedido pode ser especificado melhor (o gerador decide se cabem).
+    # Com anexo, o brief já define tudo -> não interromper com opções genéricas.
+    if intent in ("esclarecer", "documento", "site") and not body.sem_opcoes and not axn:
         esc = _gerar_opcoes(body.mensagem, doclist)
         if esc.get("opcoes"):
             return {"intent": "escolher", "texto": esc["pergunta"], "opcoes": esc["opcoes"], "docs": docs}
@@ -12490,7 +12547,7 @@ async function wRun(msg,th,tk){
  if(/^\s*(lembr|guard[ae]|anot[ae]|memoriz)/i.test(msg)){try{await P('/memoria',{texto:msg});}catch(e){}const s=stopThink(tk);th.querySelector('.bub').innerHTML='🧠 <b>Anotado na memória.</b> Vou lembrar disso nas próximas conversas. <span class="faint">Gerencie em 🧠 Memória.</span><div class="trace">↳ memória · '+s+'s</div>';return;}
  if(WS.orquestrar){stopThink(tk);await streamLocal(th,msg);return;}
  if(isCodeRequest(msg)){await codeFlow(msg,th,tk);return;}
- let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
+ let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice,session_id:WS.sid})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
  WS._skipChoice=false;
  if(intent==='escolher'&&opcoes.length){const s=stopThink(tk);th.querySelector('.bub').innerHTML=(texto?esc(texto).replace(/\n/g,'<br>'):'Como você prefere seguir?')+'<div class="trace">↳ '+s+'s · escolha uma opção abaixo</div>';renderChoice(msg,texto,opcoes);return;}
  if(intent==='responder'||intent==='esclarecer'){const s=stopThink(tk);th.querySelector('.bub').innerHTML=(texto?esc(texto).replace(/\n/g,'<br>'):'Como posso ajudar? Posso responder sobre os documentos do projeto ou gerar um documento/site — me diga o assunto e o tipo.')+'<div class="trace">↳ '+s+'s</div>';return;}
@@ -12503,11 +12560,11 @@ function showSources(fs){const el=document.getElementById("cvSources");if(!el)re
 // Decide se a resposta é um DOCUMENTO longo (plano/relatório) — melhor lido na Prévia — ou conversa curta (chat).
 /* ---- Modo agente: plano -> aprovação -> execução (só gasta o modelo após o OK) ---- */
 let _PLANS={};
-async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
+async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
 function wPlanRun(k,btn){const it=_PLANS[k];if(!it)return;delete _PLANS[k];const bub=btn.closest('.bub');wGerarExec(it,bub);}
 function wPlanEdit(k){const it=_PLANS[k];if(!it)return;const inp=document.getElementById('amsg');if(inp){inp.value=it.msg;inp.focus();}try{toast('Ajuste o pedido e envie de novo.','info');}catch(e){}}
 function wPlanCancel(k,btn){delete _PLANS[k];const bub=btn.closest('.bub');if(bub)bub.innerHTML='<span class="faint">Plano cancelado — nada foi gerado.</span>';}
-async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
+async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
 let _DOCS={};
 function isLongDoc(t){t=t||'';if(t.length<1400)return false;
  const heads=(t.match(/^#{1,4}\s+\S/gm)||[]).length;
