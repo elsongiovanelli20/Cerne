@@ -72,10 +72,13 @@ def _graph_noise(v, t):
     return False
 
 # alias externo -> variável de ambiente da chave (para marcar quais estão prontos)
-PROV_KEY_ENV = {"ext-glm": "ZAI_API_KEY", "ext-gemini": "GEMINI_API_KEY", "ext-groq": "GROQ_API_KEY",
-                "ext-qwen": "GROQ_API_KEY", "ext-reason": "GROQ_API_KEY", "ext-cerebras": "CEREBRAS_API_KEY",
+# (2026-11-16) removidos: ext-groq/ext-qwen (Groq tirou Llama 3.3 70B e Qwen3-32B do ar → 404) e
+# ext-cerebras (free tier passou a exigir pagamento → 402).
+PROV_KEY_ENV = {"ext-glm": "ZAI_API_KEY", "ext-gemini": "GEMINI_API_KEY", "ext-reason": "GROQ_API_KEY",
                 "ext-mistral": "MISTRAL_API_KEY", "ext-qwen-max": "DASHSCOPE_API_KEY",
-                "ext-openrouter": "OPENROUTER_API_KEY", "ext-deepseek": "DEEPSEEK_API_KEY", "ext-kimi": "MOONSHOT_API_KEY"}
+                "ext-openrouter": "OPENROUTER_API_KEY", "ext-deepseek": "DEEPSEEK_API_KEY", "ext-kimi": "MOONSHOT_API_KEY",
+                "ext-nvidia-ultra": "NVIDIA_API_KEY", "ext-nvidia-gemma": "NVIDIA_API_KEY",
+                "ext-nvidia-mistral": "NVIDIA_API_KEY", "ext-nvidia-lightning": "NVIDIA_API_KEY"}
 
 # Provedores PAGOS (topo de linha) — configurados pela UI (chave cifrada, sem .env). Registrados no
 # gateway LiteLLM em runtime (/model/new, store_model_in_db). Entram nas regras de híbrido + PII mascarada.
@@ -102,7 +105,14 @@ def _all_provs():
     return sorted(set(PROV_KEY_ENV) | set(LLM_PAGAS))
 
 
+# Provedores que deixaram de existir no gateway: mesmo se ainda estiverem em provedores_habilitados de
+# alguma organização (estado salvo), nunca são roteados.
+PROV_REMOVIDOS = {"ext-groq", "ext-qwen", "ext-cerebras"}
+
+
 def _prov_ok(alias):
+    if alias in PROV_REMOVIDOS:
+        return False
     ev = PROV_KEY_ENV.get(alias)
     if ev:
         return bool((os.getenv(ev) or "").strip())
@@ -193,7 +203,7 @@ def _ext_permitidos(org=None):
 
 def _best_provider(org=None):
     perm = _ext_permitidos(org)
-    for pref in ("ext-reason", "ext-groq", "ext-qwen"):
+    for pref in ("ext-reason", "ext-nvidia-ultra", "ext-nvidia-lightning"):
         if pref in perm:
             return pref
     return perm[0] if perm else None
@@ -216,10 +226,10 @@ def _best_provider_for(msg, org=None):
     perm = _ext_permitidos(org)
     if not perm:
         return None
-    prefs = {"codigo": ["ext-mistral", "ext-deepseek", "ext-qwen", "ext-groq"],
-             "raciocinio": ["ext-reason", "ext-deepseek", "ext-cerebras", "ext-qwen"],
-             "longo": ["ext-kimi", "ext-gemini", "ext-reason", "ext-groq"],
-             "geral": ["ext-cerebras", "ext-reason", "ext-groq", "ext-qwen"]}.get(_task_kind(msg), [])
+    prefs = {"codigo": ["ext-mistral", "ext-deepseek", "ext-nvidia-mistral", "ext-reason"],
+             "raciocinio": ["ext-reason", "ext-deepseek", "ext-nvidia-ultra", "ext-nvidia-mistral"],
+             "longo": ["ext-kimi", "ext-gemini", "ext-reason", "ext-nvidia-mistral"],
+             "geral": ["ext-reason", "ext-nvidia-lightning", "ext-nvidia-ultra", "ext-openrouter", "ext-nvidia-gemma"]}.get(_task_kind(msg), [])
     for p in prefs:
         if p in perm:
             return p
@@ -236,10 +246,10 @@ def _task_needs_external(msg):
 
 
 def _resolve_provider(provider, msg):
-    """'ext-groq-auto' -> melhor modelo FREE do Groq por tarefa (mesma chave); demais passam direto."""
+    """'ext-groq-auto' -> modelo FREE do Groq (mesma chave); demais passam direto. Llama 3.3 70B e Qwen3-32B
+    saíram da Groq (2026-11-16), então hoje todo tipo de tarefa vai para o GPT-OSS 120B (ext-reason)."""
     if provider == "ext-groq-auto":
-        return {"codigo": "ext-qwen", "raciocinio": "ext-reason", "longo": "ext-reason",
-                "geral": "ext-groq"}.get(_task_kind(msg), "ext-groq")
+        return "ext-reason"
     return provider
 
 
@@ -2934,7 +2944,7 @@ def agent_stream(body: AgentReq):
         # --- ORQUESTRADOR: demandas grandes viram plano -> subtarefas em paralelo -> síntese ---
         if body.orquestrar or _needs_orchestration(body.message):
             org = _org(); pool = _ext_permitidos(org); strong = _best_provider(org) or lm
-            planner_m = next((p for p in ("ext-cerebras", "ext-groq", "ext-qwen", "ext-mistral") if p in pool), strong)
+            planner_m = next((p for p in ("ext-nvidia-lightning", "ext-reason", "ext-nvidia-ultra", "ext-mistral") if p in pool), strong)
             yield "[[STEP]]planejando: quebrando o pedido em subtarefas"
             plan = [{"role": "system", "content": "Você é um planejador. Quebre o pedido do usuário em 3 a 6 subtarefas objetivas, independentes e complementares que, somadas, entregam um resultado completo. Responda SOMENTE com um array JSON válido, sem markdown e sem texto ao redor, no formato: [{\"titulo\":\"curto\",\"prompt\":\"instrução completa e autossuficiente para uma IA executar essa subtarefa\"}]"},
                     {"role": "user", "content": body.message}]
@@ -3556,7 +3566,7 @@ def _orquestrar_sync(message: str, colls: list, skill_prompt: str = None):
     """Orquestrador NÃO-streaming (usado pela fila): plano → subtarefas em paralelo → síntese.
     Espelha o /agent-stream. Retorna (resposta_final, fontes)."""
     org = _org(); pool = _ext_permitidos(org); strong = _best_provider(org) or "chat"
-    planner_m = next((p for p in ("ext-cerebras", "ext-groq", "ext-qwen", "ext-mistral") if p in pool), strong)
+    planner_m = next((p for p in ("ext-nvidia-lightning", "ext-reason", "ext-nvidia-ultra", "ext-mistral") if p in pool), strong)
     plan = [{"role": "system", "content": "Você é um planejador. Quebre o pedido do usuário em 3 a 6 subtarefas objetivas, independentes e complementares que, somadas, entregam um resultado completo. Responda SOMENTE com um array JSON válido, sem markdown e sem texto ao redor, no formato: [{\"titulo\":\"curto\",\"prompt\":\"instrução completa e autossuficiente para uma IA executar essa subtarefa\"}]"},
             {"role": "user", "content": message}]
     subs = _parse_json_list(_strip_think(_chat_resiliente(planner_m, plan, max_tokens=1600) or "")) or [{"titulo": "Resposta", "prompt": message}]
@@ -10002,6 +10012,7 @@ class PlanoReq(BaseModel):
     mensagem: str
     tipo: str = "documento"
     colecoes: list | None = None
+    session_id: str = ""         # p/ o plano refletir o anexo (case/brief) da conversa
 
 
 @app.post("/plano")
@@ -10012,7 +10023,11 @@ def plano(body: PlanoReq):
     sys = ("Você é um planejador conciso. Dado o pedido de criação de um " + tipo + ", responda SOMENTE com JSON válido no "
            "formato {\"titulo\": \"...\", \"passos\": [\"...\", \"...\"], \"resumo\": \"uma frase\"}. De 3 a 6 passos; cada item de "
            "\"passos\" é uma STRING (uma frase começando por um verbo), NUNCA um objeto, e ESPECÍFICO ao pedido (nada genérico). Em português.")
-    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": (body.mensagem or "")[:1500]}]
+    _ax, _axn = _anexos_texto(body.session_id or "")
+    umsg = (body.mensagem or "")[:1500]
+    if _ax:
+        umsg += "\n\n[DOCUMENTO ANEXADO — base do pedido; planeje para ATENDER a todos os pontos dele]:\n" + _ax[:1800]
+    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": umsg}]
     raw = re.sub(r"(?s)<think>.*?</think>", "", (_chat_completo("chat", msgs, max_tokens=500, conts=1) or "")).strip()
     data = {}
     mm = re.search(r"\{.*\}", raw, re.S)
@@ -10058,21 +10073,60 @@ class GerarReq(BaseModel):
     instrucao: str
     colecao: str = COLLECTION
     colecoes: list | None = None
+    session_id: str = ""         # p/ incluir os anexos efêmeros da conversa como base do entregável
+
+
+def _limpa_placeholders(t):
+    """Neutraliza marcadores de preenchimento (ex.: [LOCATION], <ORGANIZATION>, <[PERSON_1]>) que o
+    modelo inventa OU que sobraram sem de-mascarar. Preserva links Markdown [texto](url) e checkboxes [x]."""
+    if not t:
+        return t
+    def _repl(m):
+        tok = m.group(1)
+        if re.match(r"LOCATION|GPE|LOC|CIDADE|LOCAL", tok):
+            return "essa localidade"
+        if re.match(r"PERSON|PESSOA|NOME|NAME", tok):
+            return "a pessoa responsável"
+        if re.match(r"ORG(?:ANIZATION)?|EMPRESA|COMPANY|CLIENTE", tok):
+            return "a empresa"
+        if re.match(r"EMAIL|PHONE|TEL|CPF|CNPJ|DATA|DATE|VALOR|MONEY", tok):
+            return "—"
+        return ""
+    t = re.sub(r"<\[?([A-Z][A-Z0-9_]{2,})\]?>", _repl, t)        # <TOKEN> e <[TOKEN]>
+    t = re.sub(r"\[([A-Z][A-Z0-9_]{2,})\](?!\()", _repl, t)      # [TOKEN] (não engole link [txt](url))
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r" +([,.;:])", r"\1", t)
+    return t
 
 
 @app.post("/gerar")
 def gerar(body: GerarReq):
     _quota_consumir()
     hits = _search_multi(body.instrucao, 5, _colls_of(body))
-    ctx = "\n\n---\n\n".join(h.payload.get("text", "") for h in hits)
+    ax, axn = _anexos_texto(body.session_id or "")
+    _parts = []
+    if ax:
+        _parts.append("DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax)
+    _parts += [h.payload.get("text", "") for h in hits]
+    ctx = "\n\n---\n\n".join(p for p in _parts if p)
+    _anexo_regra = (" Se houver DOCUMENTO(S) ANEXADO(S) no contexto, trate-os como a BASE PRINCIPAL do pedido (leia o brief/case, "
+                    "atenda a TODOS os pontos/perguntas dele); o acervo do projeto é apenas apoio." if axn else "")
     if body.tipo == "site":
         sys = ("Você gera UMA página HTML completa e autocontida (com <style> inline), profissional, moderna e em português, "
-               "que ATENDA AO PEDIDO do usuário. Use o CONTEXTO do acervo apenas como referência quando for pertinente ao pedido "
+               "que ATENDA AO PEDIDO do usuário." + _anexo_regra + " Use o CONTEXTO do acervo apenas como referência quando for pertinente ao pedido "
                "(NÃO copie o contexto se ele não tiver relação com o pedido). Responda SOMENTE com o HTML começando por <!doctype html>, sem comentários e sem cercas de código.")
     else:
-        sys = ("Você gera um DOCUMENTO em Markdown bem estruturado (título com #, seções com ##, listas e tabelas quando útil), "
-               "profissional e em português, que ATENDA AO PEDIDO do usuário. Use o CONTEXTO do acervo apenas como referência quando for pertinente "
-               "(NÃO copie o contexto se ele não tiver relação com o pedido). Responda SOMENTE com o Markdown, sem explicações.")
+        sys = ("Você é um CONSULTOR SÊNIOR. Produza um DOCUMENTO EXECUTIVO completo, aprofundado e bem estruturado em "
+               "Markdown (título #, seções ##, subtítulos ###), profissional e em português, que ATENDA INTEGRALMENTE AO PEDIDO." + _anexo_regra +
+               " Se o brief/case tiver perguntas ou requisitos numerados, RESPONDA A CADA UM — do PRIMEIRO ao ÚLTIMO, sem pular nenhum e "
+               "incluindo o fechamento/apresentação executiva (ex.: o que levar à diretoria) — cada um em seção própria e FUNDAMENTANDO a escolha. "
+               "Comece com um Sumário Executivo. Use TABELAS em Markdown (linhas com | e uma linha de cabeçalho |---|) para todo conteúdo "
+               "comparativo ou estruturado: cronogramas, riscos e mitigação, responsabilidades (RACI), entregáveis e objetivos, perguntas por área. "
+               "NUNCA escreva marcadores de preenchimento entre colchetes (ex.: [EMPRESA], [LOCATION], [NOME], [CIDADE]); se um dado específico for "
+               "desconhecido, use expressão neutra ('a empresa', 'a operadora', 'a área responsável'). "
+               "Seja abrangente, concreto e específico ao contexto — nível de entrega para a diretoria — NUNCA raso, genérico ou fora do tema. "
+               "Use o CONTEXTO do acervo apenas como APOIO; não copie o acervo nem troque o assunto do pedido. "
+               "Responda SOMENTE com o Markdown do documento, sem explicações fora dele.")
     org = _org()
     prov = _best_provider(org) if org.get("soberania") == "hibrido" else None   # híbrido: modelo forte escreve o entregável
     tokens = None
@@ -10088,18 +10142,19 @@ def gerar(body: GerarReq):
         else:
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=4096)
+                                    max_tokens=6000)
             out = _strip_think(out or "")
     except Exception as e:
         try:                                            # provedor externo falhou (429/etc.) -> cai p/ local soberano
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=4096)
+                                    max_tokens=6000)
             out = _strip_think(out or "")
         except Exception as e2:
             return JSONResponse(status_code=502, content={"error": "falha na geração", "detail": str(e2)[:300]})
     out = re.sub(r"^```[a-zA-Z]*\n?", "", out.strip())
     out = re.sub(r"\n?```$", "", out).strip()
+    out = _limpa_placeholders(out)
     _event("geração", f"{body.tipo} · {body.instrucao[:50]}")
     return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits})}
 
@@ -10272,6 +10327,7 @@ class InterpretarReq(BaseModel):
     colecao: str = COLLECTION
     colecoes: list | None = None
     sem_opcoes: bool | None = False     # True quando a msg já é a resposta de uma escolha (não reoferecer opções)
+    session_id: str = ""                # p/ enxergar os anexos efêmeros da conversa (senão o roteador é cego ao anexo)
 
 
 @app.post("/interpretar")
@@ -10287,14 +10343,21 @@ def interpretar(body: InterpretarReq):
         pass
     docs = sorted(docs)
     doclist = ", ".join(docs) if docs else ("(conversa sem acervo — pode responder livremente)" if not colls else "(nenhum documento neste projeto ainda)")
+    ax, axn = _anexos_texto(body.session_id or "")
+    anexo_ctx = ""
+    if axn:
+        anexo_ctx = (f"DOCUMENTO(S) ANEXADO(S) nesta conversa (efêmeros, geralmente a BASE do pedido atual): {', '.join(axn)}. "
+                     f"Trecho do anexo: {ax[:700].strip()}… ")
     sys = ("Você é o roteador do copiloto do Cerne (plataforma da Orqion); nunca diga que foi criado por outra empresa. Ele trabalha SOBRE os documentos de um projeto. "
-           f"DOCUMENTOS disponíveis no projeto: {doclist}. "
+           f"DOCUMENTOS disponíveis no projeto: {doclist}. " + anexo_ctx +
            "Analise a MENSAGEM do usuário e escolha UMA ação:\n"
            "- perguntar: pergunta cujo conteúdo está (ou deveria estar) nos documentos.\n"
            "- responder: saudação, agradecimento, ou pergunta sobre o que você CONSEGUE fazer (capacidades).\n"
            "- esclarecer: a pessoa quer gerar um documento ou site, mas o pedido está VAGO (falta assunto, tipo, ou qual documento usar).\n"
            "- documento: pedido CLARO de gerar um texto/documento, com assunto definido.\n"
            "- site: pedido CLARO de gerar uma página/site, com assunto definido.\n"
+           "IMPORTANTE: se há DOCUMENTO(S) ANEXADO(S) e a pessoa pede para avaliá-lo, estruturá-lo ou gerar algo a partir dele "
+           "(um plano, análise, proposta, resumo, resposta a um case), o ASSUNTO ESTÁ NO ANEXO — o pedido NÃO é vago: escolha 'documento', NUNCA 'esclarecer'.\n"
            "Responda EXATAMENTE em duas linhas:\n"
            "ACAO: <perguntar|responder|esclarecer|documento|site>\n"
            "TEXTO: <se for responder ou esclarecer, escreva a mensagem ao usuário: explique brevemente o que você faz e/ou faça 1-2 perguntas objetivas, citando os documentos disponíveis quando útil. Caso contrário, deixe vazio>")
@@ -10317,12 +10380,16 @@ def interpretar(body: InterpretarReq):
         intent = "responder"
     else:
         intent = "perguntar"
+    # rede de segurança: anexo presente + verbo de construção -> é 'documento' (o assunto está no anexo, não é vago)
+    if axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
+        intent = "documento"; texto = ""
     if intent in ("responder", "esclarecer") and not texto:
         texto = ("Consigo responder sobre os documentos deste projeto e gerar documentos ou sites com base neles. "
                  "Me diga o assunto e o tipo — ex.: um resumo do contrato, ou uma landing page sobre o serviço. "
                  f"Documentos disponíveis: {doclist}.")
-    # oferece opções de escolha quando o pedido pode ser especificado melhor (o gerador decide se cabem)
-    if intent in ("esclarecer", "documento", "site") and not body.sem_opcoes:
+    # oferece opções de escolha quando o pedido pode ser especificado melhor (o gerador decide se cabem).
+    # Com anexo, o brief já define tudo -> não interromper com opções genéricas.
+    if intent in ("esclarecer", "documento", "site") and not body.sem_opcoes and not axn:
         esc = _gerar_opcoes(body.mensagem, doclist)
         if esc.get("opcoes"):
             return {"intent": "escolher", "texto": esc["pergunta"], "opcoes": esc["opcoes"], "docs": docs}
@@ -10435,7 +10502,7 @@ async function run(btn,fn){btn.disabled=true;try{await fn()}catch(e){alert(e)}fi
 function coll(){return (document.getElementById('coll').value||'').trim()||'cerne_docs'}
 async function ingestText(){await run(event.target,async()=>{show('ingestOut',await post('/ingest',{text:document.getElementById('txt').value,source:'texto-colado',colecao:coll()}))})}
 async function ingestFile(){await run(event.target,async()=>{const f=document.getElementById('file').files[0];if(!f)return alert('Escolha um arquivo');const fd=new FormData();fd.append('file',f);const r=await fetch('/ingest-file?colecao='+encodeURIComponent(coll()),{method:'POST',body:fd});show('ingestOut',await r.json())})}
-const PROV_LABELS={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-qwen-max':'Alibaba · Qwen3-Max','ext-gemini':'Google · Gemini Flash','ext-cerebras':'Cerebras · gpt-oss-120b','ext-glm':'Z.ai · GLM-4.7-Flash','ext-mistral':'Mistral · Codestral','ext-reason':'Thinking · DeepSeek-R1 (Groq)','ext-openrouter':'OpenRouter · modelos :free','ext-deepseek':'DeepSeek · V3/R1','ext-kimi':'Moonshot · Kimi 128k','ext-claude':'Anthropic · Claude 💵','ext-openai':'OpenAI · GPT 💵','ext-gemini-pro':'Google · Gemini Pro 💵','ext-kimi-pro':'Moonshot · Kimi K3 💵'};
+const PROV_LABELS={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-qwen-max':'Alibaba · Qwen3-Max','ext-gemini':'Google · Gemini Flash','ext-cerebras':'Cerebras · gpt-oss-120b','ext-glm':'Z.ai · GLM-4.7-Flash','ext-mistral':'Mistral · Codestral','ext-reason':'Thinking · DeepSeek-R1 (Groq)','ext-openrouter':'OpenRouter · modelos :free','ext-deepseek':'DeepSeek · V3/R1','ext-kimi':'Moonshot · Kimi 128k','ext-nvidia-ultra':'NVIDIA · Nemotron 3 Ultra','ext-nvidia-gemma':'NVIDIA · Gemma 4 31B','ext-nvidia-mistral':'NVIDIA · Mistral Large 4','ext-nvidia-lightning':'NVIDIA · Nemotron 3.5 Lightning','ext-claude':'Anthropic · Claude 💵','ext-openai':'OpenAI · GPT 💵','ext-gemini-pro':'Google · Gemini Pro 💵','ext-kimi-pro':'Moonshot · Kimi K3 💵'};
 async function populateProviders(){try{const s=await(await fetch('/stats')).json();const sel=document.getElementById('prov');s.provedores.filter(p=>p.indexOf('ext-')===0).forEach(p=>{const o=document.createElement('option');o.value=p;const ic=p==='ext-reason'?'🧠 ':'🌐 ';o.textContent=ic+(PROV_LABELS[p]||p)+' (mascarado)';sel.appendChild(o)})}catch(e){}}
 async function populateSkills(){try{const d=await(await fetch('/skills')).json();const sel=document.getElementById('skill');(d.skills||[]).forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent='🎯 '+s.nome;sel.appendChild(o)})}catch(e){}}
 async function ask(){const btn=event.target;const prov=document.getElementById('prov').value;const q=document.getElementById('q').value;const out=document.getElementById('askOut');const note=document.getElementById('provnote');btn.disabled=true;out.style.display='block';note.style.display='none';
@@ -11465,7 +11532,7 @@ V.components=async()=>{const s=await J('/stats'),svc=s.servicos||{};
  ];
  return `<h1 class="h">Componentes</h1><div class="lead">A pilha do Cerne em <b>planos</b> — do núcleo à governança, cada um sobre software aberto e soberano.</div>
   <div class="planestack">${P.map(p=>`<div class="plane${p[4]?' new':(p[3]?'':' off')}"><div class="pl-rail"><span class="pl-tag">${p[4]?'NOVO':'PLANO'}</span><span class="pl-st"><span class="dot ${p[3]?'ok':'crit'}"></span>${p[4]?(p[3]?'no ar · novo':'novo'):(p[3]?'no ar':'—')}</span></div><div class="pl-body"><div class="pl-name">${p[0]}</div><div class="pl-role">${p[1]}</div><div class="pl-chips">${p[2].map(c=>`<b>${c}</b>`).join('')}</div></div></div>`).join('')}</div>`;};
-V.gateway=async()=>{const s=await J('/stats'),pr=(s.provedores||[]);const lab={'ext-reason':'🧠 Groq · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Google · Gemini','ext-glm':'Z.ai · GLM','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Moonshot Kimi','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Alibaba Qwen-Max'};
+V.gateway=async()=>{const s=await J('/stats'),pr=(s.provedores||[]);const lab={'ext-reason':'🧠 Groq · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Google · Gemini','ext-glm':'Z.ai · GLM','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Moonshot Kimi','ext-nvidia-ultra':'NVIDIA · Nemotron Ultra','ext-nvidia-gemma':'NVIDIA · Gemma 4','ext-nvidia-mistral':'NVIDIA · Mistral Large 4','ext-nvidia-lightning':'NVIDIA · Nemotron Lightning','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Alibaba Qwen-Max'};
  const rows=pr.map(p=>{const ext=p.indexOf('ext-')===0;return `<tr><td class="mono"><b>${p}</b></td><td>${ext?(lab[p]||'externo'):'local (Ollama)'}</td><td>${ext?'<span class="badge b-cyan">mascarado</span>':'<span class="badge b-ok">soberano</span>'}</td></tr>`;}).join('');
  return `<h1 class="h">Model Gateway</h1><div class="lead">Dispatcher OpenAI-compatível (LiteLLM). Operação completa em <a href="#ops">Model Ops →</a>. ${pr.length} modelos.</div><div class="panel pad0"><table class="tbl"><thead><tr><th>Alias</th><th>Backend</th><th>Modo</th></tr></thead><tbody>${rows}</tbody></table></div>`;};
 V.preflight=async()=>{const p=await J('/preflight');const rows=(p.checks||[]).map(c=>`<div class="kv"><span class="k"><span class="dot ${c.ok?'ok':'crit'}" style="margin-right:9px"></span>${c.check} ${c.detalhe?`<span class="mono faint">· ${c.detalhe}</span>`:''}</span><span class="badge ${c.ok?'b-ok':'b-crit'}">${c.ok?'OK':'FALHA'}</span></div>`).join('');
@@ -12027,7 +12094,7 @@ V.agentes=async()=>{const d=await J('/agentes'),ags=d.agentes||[],tools=d.ferram
        <details class="muted" style="font-size:11px;margin-top:8px"><summary style="cursor:pointer">instalação manual (avançado)</summary><div style="margin-top:6px">Baixe o <a href="/download/office-manifest" style="color:var(--iris)">manifesto (XML)</a> e no Office: <b>Inserir → Suplementos → Meus Suplementos → Carregar Meu Suplemento</b> → escolha o XML. Ou publique pela central de implantação do M365.</div></details></div>
      <div style="min-width:150px"><div class="kv" style="margin:0"><span class="k">Excel</span><span class="badge ${(ext.office||{}).excel?'b-ok':'b-plan'}">${(ext.office||{}).excel?'● conectado':'—'}</span></div><div class="kv" style="margin:0"><span class="k">Word</span><span class="badge ${(ext.office||{}).word?'b-ok':'b-plan'}">${(ext.office||{}).word?'● conectado':'—'}</span></div><div class="kv" style="margin:0"><span class="k">PowerPoint</span><span class="badge ${(ext.office||{}).ppt?'b-ok':'b-plan'}">${(ext.office||{}).ppt?'● conectado':'—'}</span></div></div>
    </div></div>`;
- const PL={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-reason':'Thinking · GPT-OSS','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Kimi','ext-openrouter':'OpenRouter','ext-glm':'GLM','ext-qwen-max':'Qwen-Max','ext-claude':'Anthropic Claude 💵','ext-openai':'OpenAI GPT 💵','ext-gemini-pro':'Gemini Pro 💵','ext-kimi-pro':'Kimi K3 💵'};
+ const PL={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-reason':'Thinking · GPT-OSS','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Kimi','ext-nvidia-ultra':'NVIDIA Nemotron','ext-nvidia-gemma':'NVIDIA Gemma','ext-nvidia-mistral':'NVIDIA Mistral','ext-nvidia-lightning':'NVIDIA Lightning','ext-openrouter':'OpenRouter','ext-glm':'GLM','ext-qwen-max':'Qwen-Max','ext-claude':'Anthropic Claude 💵','ext-openai':'OpenAI GPT 💵','ext-gemini-pro':'Gemini Pro 💵','ext-kimi-pro':'Kimi K3 💵'};
  const modelopts='<option value="agent">🔒 Soberano (local)</option>'+(hib?habs.map(p=>`<option value="${p}">🌐 Híbrido · ${esc(PL[p]||p)}</option>`).join(''):'');
  const PF={colaborador:'Colaborador',gestor:'Gestor',admin:'Administrador'};
  const instById={};INSTS.forEach(i=>instById[i.id]=i);
@@ -12264,18 +12331,19 @@ V.map=async()=>{const h=await V.components();return h.replace("Componentes","Map
 V.org=async()=>{const d=await J('/org');const o=d.org||{};const provs=d.provedores||{};const hib=o.soberania==='hibrido';const hab=o.provedores_habilitados||[];
  const PROV_INFO={
   'ext-reason':{m:'Groq · GPT-OSS 120B',best:'Raciocínio e análise passo a passo (modo Thinking)',tags:['🧠 raciocínio','⚡ muito rápido','💸 grátis','📏 128k']},
-  'ext-groq':{m:'Groq · Llama 3.3 70B',best:'Respostas gerais com ótima velocidade e qualidade',tags:['💬 geral','⚡ muito rápido','💸 grátis','📏 128k']},
-  'ext-qwen':{m:'Groq · Qwen3-32B',best:'Multilíngue, raciocínio e código',tags:['🌍 multilíngue','💻 código','⚡ rápido','💸 grátis']},
   'ext-gemini':{m:'Google · Gemini 2.5 Flash',best:'Contexto gigante e multimodal, muito rápido',tags:['📏 1M contexto','🖼️ multimodal','⚡ rápido','🎁 free tier']},
   'ext-glm':{m:'Z.ai · GLM-4.7-Flash',best:'Uso geral com bom custo-benefício',tags:['💬 geral','💸 grátis','📏 128k']},
-  'ext-cerebras':{m:'Cerebras · GPT-OSS 120B',best:'Velocidade extrema + raciocínio',tags:['🚀 ultra-rápido','🧠 raciocínio','🎁 free tier']},
   'ext-mistral':{m:'Mistral · Codestral',best:'Programação e geração de código',tags:['💻 código','⚡ rápido','🎁 free tier']},
   'ext-deepseek':{m:'DeepSeek · V3 / R1',best:'Raciocínio (R1) e código com custo baixíssimo',tags:['🧠 raciocínio','💻 código','💵 barato']},
   'ext-kimi':{m:'Moonshot · Kimi',best:'Documentos MUITO longos (contexto gigante)',tags:['📏 128k+','📚 docs longos']},
+  'ext-nvidia-ultra':{m:'NVIDIA · Nemotron 3 Ultra 550B',best:'Raciocínio e agentes com ferramentas (API trial NVIDIA: protótipo/teste)',tags:['🧠 raciocínio','🤖 ferramentas','⚡ rápido','🎁 trial grátis']},
+  'ext-nvidia-mistral':{m:'NVIDIA · Mistral Large 4',best:'Modelo grande de ponta: código, análise e agentes (API trial NVIDIA: protótipo/teste)',tags:['🏆 topo de linha','💻 código','🤖 ferramentas','🎁 trial grátis']},
+  'ext-nvidia-lightning':{m:'NVIDIA · Nemotron 3.5 Lightning',best:'Respostas rápidas do dia a dia (API trial NVIDIA: protótipo/teste)',tags:['⚡ muito rápido','💬 geral','🤖 ferramentas','🎁 trial grátis']},
+  'ext-nvidia-gemma':{m:'NVIDIA · Gemma 4 31B',best:'Uso geral multilíngue (trial NVIDIA; se congestionado, cai p/ Nemotron Ultra)',tags:['💬 geral','🌍 multilíngue','🎁 trial grátis']},
   'ext-kimi-pro':{m:'Moonshot · Kimi K3 💵',best:'Contexto de 1M tokens, agente e automação (pago)',tags:['📏 1M contexto','🤖 agente','💵 pago']},
   'ext-openrouter':{m:'OpenRouter (agregador)',best:'Acesso a dezenas de modelos :free com 1 chave',tags:['🔀 multi-modelo','🎁 modelos free']},
   'ext-qwen-max':{m:'Alibaba · Qwen3-Max',best:'Modelo grande de ponta, multilíngue e raciocínio',tags:['🏆 topo de linha','🌍 multilíngue','💵 pago']}};
- const permit=hab.filter(p=>provs[p]);const target=['ext-reason','ext-groq','ext-qwen'].find(p=>permit.indexOf(p)>=0)||permit[0]||null;
+ const permit=hab.filter(p=>provs[p]);const target=['ext-reason','ext-nvidia-ultra','ext-nvidia-lightning'].find(p=>permit.indexOf(p)>=0)||permit[0]||null;
  const TAG_TIPS={'🧠 raciocínio':'Pensa passo a passo: análises, comparações, decisões. Ex.: "compare 2 contratos e aponte riscos".','⚡ muito rápido':'Resposta quase instantânea (infra Groq).','⚡ rápido':'Boa velocidade de resposta.','🚀 ultra-rápido':'Velocidade extrema (infra Cerebras).','💸 grátis':'Sem custo — tier gratuito do provedor.','🎁 free tier':'Tem camada gratuita, com limites de uso.','💵 barato':'Custo muito baixo por uso.','💵 pago':'Cobra por uso (sem tier grátis relevante).','📏 128k':'~128 mil tokens de contexto (documentos médios/grandes).','📏 128k+':'Contexto grande, acima de 128k tokens.','📏 1M contexto':'Até ~1 milhão de tokens — livros/muitos documentos de uma vez.','📚 docs longos':'Ótimo p/ textos longos. Ex.: analisar um PDF de 200 páginas.','🌍 multilíngue':'Forte em vários idiomas, incl. português.','💻 código':'Bom em programação. Ex.: "gere um script Python que...".','🖼️ multimodal':'Entende imagens além de texto.','🔀 multi-modelo':'Vários modelos por 1 chave (OpenRouter).','🎁 modelos free':'Inclui modelos gratuitos.','💬 geral':'Bom para uso geral do dia a dia.','🏆 topo de linha':'Modelo grande, de ponta, mais capaz (e mais caro).'};
  const semchave=Object.keys(provs).filter(p=>!provs[p]);
  const provrows=Object.keys(provs).filter(p=>provs[p]).map(p=>{const key=provs[p];const on=hab.indexOf(p)>=0;const info=PROV_INFO[p]||{m:'',best:'—',tags:[]};
@@ -12366,11 +12434,11 @@ async function renderWork(){
  let files='',ndocs=0;for(const n of WS.colecoes){const a=await J('/acervo?colecao='+encodeURIComponent(n));(a.fontes||[]).forEach(f=>{files+=`<div class="file"><span class="fi">${ico('doc')}</span><div>${esc(f.source)}<div class="faint mono" style="font-size:10px">${n} · ${f.chunks} trechos</div></div></div>`;ndocs++;});}if(!files)files='<div class="muted" style="font-size:12px;padding:6px">'+(WS.colecoes.length?'coleção vazia':'chat livre — sem acervo')+'</div>';
  WSK_ALL=sks;
  const st=await J('/stats');const ext=(st.provedores||[]).filter(p=>p.indexOf('ext-')===0);
- const mlab={'ext-reason':'🧠 Thinking · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-glm':'GLM-Flash','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek R1','ext-kimi':'Kimi 128k','ext-kimi-pro':'Kimi K3 💵','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Qwen-Max'};
+ const mlab={'ext-reason':'🧠 Thinking · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-glm':'GLM-Flash','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek R1','ext-kimi':'Kimi 128k','ext-nvidia-ultra':'NVIDIA Nemotron Ultra','ext-nvidia-gemma':'NVIDIA Gemma 4','ext-nvidia-mistral':'NVIDIA Mistral Large 4','ext-nvidia-lightning':'NVIDIA Nemotron Lightning','ext-kimi-pro':'Kimi K3 💵','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Qwen-Max'};
  const canExt=role!=='colaborador';const stt=st.provedores_status||{};
  const og=await J('/org');const orgg=og.org||{};const hib=orgg.soberania==='hibrido';const hab=orgg.provedores_habilitados||[];WS.hib=hib;WS.routing=!!(orgg.escalonamento||orgg.roteamento_adaptativo);
  function extState(p){if(!hib)return{dis:true,suf:' · modo soberano'};if(!canExt)return{dis:true,suf:' · requer Gestor/Admin'};if(stt[p]===false)return{dis:true,suf:' · colar chave'};if(hab.indexOf(p)<0)return{dis:true,suf:' · habilitar na Organização'};return{dis:false,suf:' (mascarado)'};}
- const GROQ=['ext-groq','ext-qwen','ext-reason'];const usable=p=>hib&&!extState(p).dis;
+ const GROQ=['ext-reason'];const usable=p=>hib&&!extState(p).dis;
  if(WS.model!=='local'&&WS.model!=='ext-groq-auto'&&extState(WS.model).dis)WS.model='local';
  if(WS.model==='ext-groq-auto'&&!GROQ.some(usable))WS.model='local';
  let modopt='<option value="local"'+(WS.model==='local'?' selected':'')+'>🔒 Local (soberano)</option>';
@@ -12490,7 +12558,7 @@ async function wRun(msg,th,tk){
  if(/^\s*(lembr|guard[ae]|anot[ae]|memoriz)/i.test(msg)){try{await P('/memoria',{texto:msg});}catch(e){}const s=stopThink(tk);th.querySelector('.bub').innerHTML='🧠 <b>Anotado na memória.</b> Vou lembrar disso nas próximas conversas. <span class="faint">Gerencie em 🧠 Memória.</span><div class="trace">↳ memória · '+s+'s</div>';return;}
  if(WS.orquestrar){stopThink(tk);await streamLocal(th,msg);return;}
  if(isCodeRequest(msg)){await codeFlow(msg,th,tk);return;}
- let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
+ let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice,session_id:WS.sid})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
  WS._skipChoice=false;
  if(intent==='escolher'&&opcoes.length){const s=stopThink(tk);th.querySelector('.bub').innerHTML=(texto?esc(texto).replace(/\n/g,'<br>'):'Como você prefere seguir?')+'<div class="trace">↳ '+s+'s · escolha uma opção abaixo</div>';renderChoice(msg,texto,opcoes);return;}
  if(intent==='responder'||intent==='esclarecer'){const s=stopThink(tk);th.querySelector('.bub').innerHTML=(texto?esc(texto).replace(/\n/g,'<br>'):'Como posso ajudar? Posso responder sobre os documentos do projeto ou gerar um documento/site — me diga o assunto e o tipo.')+'<div class="trace">↳ '+s+'s</div>';return;}
@@ -12503,11 +12571,11 @@ function showSources(fs){const el=document.getElementById("cvSources");if(!el)re
 // Decide se a resposta é um DOCUMENTO longo (plano/relatório) — melhor lido na Prévia — ou conversa curta (chat).
 /* ---- Modo agente: plano -> aprovação -> execução (só gasta o modelo após o OK) ---- */
 let _PLANS={};
-async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
+async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
 function wPlanRun(k,btn){const it=_PLANS[k];if(!it)return;delete _PLANS[k];const bub=btn.closest('.bub');wGerarExec(it,bub);}
 function wPlanEdit(k){const it=_PLANS[k];if(!it)return;const inp=document.getElementById('amsg');if(inp){inp.value=it.msg;inp.focus();}try{toast('Ajuste o pedido e envie de novo.','info');}catch(e){}}
 function wPlanCancel(k,btn){delete _PLANS[k];const bub=btn.closest('.bub');if(bub)bub.innerHTML='<span class="faint">Plano cancelado — nada foi gerado.</span>';}
-async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
+async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
 let _DOCS={};
 function isLongDoc(t){t=t||'';if(t.length<1400)return false;
  const heads=(t.match(/^#{1,4}\s+\S/gm)||[]).length;
