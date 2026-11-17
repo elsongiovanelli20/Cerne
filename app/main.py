@@ -718,6 +718,16 @@ class _OrgMiddleware:
             finally:
                 _USER_CTX.reset(utoken)
                 _ORG_CTX.reset(token)
+        # Servidor MCP (runtime PicoClaw): autenticado por CERNE_MCP_TOKEN DENTRO do endpoint (links de arquivo
+        # por assinatura HMAC); roda na org padrão como o usuário de serviço de perfil mínimo.
+        if scope.get("path", "") == "/mcp" or scope.get("path", "").startswith("/mcp/"):
+            token = _ORG_CTX.set(DEFAULT_ORG)
+            utoken = _USER_CTX.set(dict(_MCP_USER))
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                _USER_CTX.reset(utoken)
+                _ORG_CTX.reset(token)
         key, xff = "", ""
         for k, v in scope.get("headers", []):
             if k == b"x-api-key":
@@ -2737,7 +2747,11 @@ def _proxy_master_ok(request: Request) -> bool:
     auth = request.headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
         k = k or auth[7:]
-    return bool(GATEWAY_KEY) and secrets.compare_digest(k, GATEWAY_KEY)
+    if bool(GATEWAY_KEY) and secrets.compare_digest(k, GATEWAY_KEY):
+        return True
+    # runtime PicoClaw: usa o token MCP próprio (nunca recebe a master key do gateway)
+    tok_mcp = os.getenv("CERNE_MCP_TOKEN", "").strip()
+    return bool(tok_mcp) and bool(k) and secrets.compare_digest(k, tok_mcp)
 
 
 def _proxy_texto_da_resposta(resp):
@@ -3192,6 +3206,246 @@ def preflight():
     add("Audit ledger íntegro", lg.get("integro", True), f"{lg.get('total', 0)} registros")
     passing = sum(1 for c in checks if c["ok"])
     return {"passando": passing, "total": len(checks), "checks": checks}
+
+
+# ============ Servidor MCP do Cerne (runtime PicoClaw: Telegram/WhatsApp/desktop → ferramentas do Cerne) ============
+# Transporte MCP "Streamable HTTP" em modo request/response (JSON-RPC 2.0 em POST /mcp, sem SSE standalone).
+# Autenticado por CERNE_MCP_TOKEN (token PRÓPRIO, nunca a master key). Roda na org padrão como o usuário de serviço
+# "picoclaw@runtime" com perfil mínimo (colaborador): mesmo isolamento/RBAC/guardrails/auditoria do painel.
+CERNE_MCP_TOKEN = os.getenv("CERNE_MCP_TOKEN", "").strip()
+_MCP_USER = {"email": "picoclaw@runtime", "nome": "PicoClaw (runtime)", "perfil": "colaborador"}
+_MCP_PROTO = "2025-06-18"
+_MCP_LINK_TTL = 24 * 3600
+
+_MCP_TOOLS = [
+    {"name": "buscar_acervo",
+     "description": "Busca trechos relevantes no acervo de documentos da organização (RAG). Use antes de responder sobre documentos, políticas, contratos ou dados internos.",
+     "inputSchema": {"type": "object", "properties": {
+         "consulta": {"type": "string", "description": "o que procurar"},
+         "colecao": {"type": "string", "description": "coleção específica (opcional; padrão = acervo principal)"}},
+         "required": ["consulta"]}},
+    {"name": "gerar_documento",
+     "description": "Gera um arquivo Office REAL (planilha .xlsx, documento .docx ou apresentação .pptx) a partir do pedido e devolve um link de download válido por 24h.",
+     "inputSchema": {"type": "object", "properties": {
+         "tipo": {"type": "string", "enum": ["planilha", "documento", "apresentacao"]},
+         "pedido": {"type": "string", "description": "o que o arquivo deve conter, com os dados reais"},
+         "usar_acervo": {"type": "boolean", "description": "aterrar o conteúdo no acervo (padrão: false)"}},
+         "required": ["tipo", "pedido"]}},
+    {"name": "listar_agentes",
+     "description": "Lista os agentes do Cerne disponíveis (id, nome, descrição, ferramentas).",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "executar_agente",
+     "description": "Executa um agente do Cerne com uma mensagem e devolve a resposta (e links dos arquivos gerados, se houver).",
+     "inputSchema": {"type": "object", "properties": {
+         "agente_id": {"type": "string"}, "mensagem": {"type": "string"},
+         "session_id": {"type": "string", "description": "para continuar a mesma conversa com o agente (opcional)"}},
+         "required": ["agente_id", "mensagem"]}},
+    {"name": "solicitar_aprovacao",
+     "description": "OBRIGATÓRIO antes de qualquer ação destrutiva ou irreversível (apagar/sobrescrever arquivos, instalar/desinstalar, enviar e-mail/mensagem em nome do usuário, pagamentos, alterar configurações). Cria um pedido na fila de aprovação do Cerne e devolve o id. Depois use consultar_aprovacao e só prossiga se o status for 'aprovado'.",
+     "inputSchema": {"type": "object", "properties": {
+         "acao": {"type": "string", "description": "a ação exata que será executada"},
+         "justificativa": {"type": "string", "description": "por que ela é necessária"}},
+         "required": ["acao"]}},
+    {"name": "consultar_aprovacao",
+     "description": "Consulta o status de um pedido de aprovação: aguardando_aprovacao | aprovado | recusado.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "lembrar",
+     "description": "Salva um fato duradouro na memória governada da organização (preferências, decisões, contexto do usuário).",
+     "inputSchema": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]}},
+    {"name": "data_hora",
+     "description": "Data e hora atuais do servidor (America/Sao_Paulo).",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def _mcp_sig(run_id, nome, exp):
+    msg = f"{run_id}/{nome}/{exp}".encode("utf-8")
+    return hashlib.sha256(CERNE_MCP_TOKEN.encode("utf-8") + b"|" + msg).hexdigest()[:32]
+
+
+def _mcp_link(url_artefato):
+    """/agentes/artefato/{run}/{nome} (exige login) → link público ASSINADO e temporário (24h) p/ o chat externo."""
+    m = re.match(r"^/agentes/artefato/([A-Za-z0-9_-]+)/(.+)$", url_artefato or "")
+    if not m:
+        return url_artefato
+    run_id, nome = m.group(1), m.group(2)
+    exp = int(time.time()) + _MCP_LINK_TTL
+    return f"{_OFFICE_BASE}/mcp/arquivo/{run_id}/{nome}?exp={exp}&sig={_mcp_sig(run_id, nome, exp)}"
+
+
+@app.get("/mcp/arquivo/{run_id}/{nome}")
+def mcp_arquivo(run_id: str, nome: str, exp: int = 0, sig: str = ""):
+    nome = os.path.basename(nome)
+    if (not CERNE_MCP_TOKEN or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or exp < time.time()
+            or not secrets.compare_digest(sig or "", _mcp_sig(run_id, nome, exp))):
+        raise HTTPException(status_code=403, detail="link inválido ou expirado")
+    p = os.path.join(_ART_DIR, run_id, nome)
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="arquivo não encontrado")
+    return FileResponse(p, filename=nome)
+
+
+def _mcp_gerar_documento(args):
+    tipo = args.get("tipo")
+    pedido = (args.get("pedido") or "").strip()
+    if tipo not in ("planilha", "documento", "apresentacao") or not pedido:
+        return "parâmetros inválidos: tipo ∈ {planilha, documento, apresentacao} e pedido obrigatório", True
+    ok, why = guard_input(pedido)
+    if not ok:
+        return f"bloqueado pelo guardrail: {why}", True
+    contexto = ""
+    if args.get("usar_acervo"):
+        hits = _search(pedido, 5)
+        contexto = "\n".join(f"[{h.payload.get('source', '?')}] {(h.payload.get('text', '') or '')[:300]}" for h in hits)
+    workdir = "mcp" + uuid.uuid4().hex[:12]
+    try:
+        spec = _office_spec(tipo, pedido, contexto)
+        if not spec:
+            return "não consegui estruturar os dados do arquivo; reformule o pedido com mais detalhes", True
+        code, fnome = _office_code(tipo, spec)
+        saida = _sandbox_exec(code, "python", workdir) if code else ""
+        if "OK arquivo:" not in (saida or ""):
+            return f"falha ao gerar o arquivo: {(saida or '')[:300]}", True
+        arts = _agente_coletar_artefatos(workdir)
+    finally:
+        _sb_reset(workdir)
+    if not arts:
+        return "o arquivo foi gerado mas não consegui disponibilizá-lo para download", True
+    links = "\n".join(f"- {a['nome']} ({a['bytes'] // 1024 or 1} KB): {_mcp_link(a['url'])}" for a in arts)
+    return f"Arquivo gerado (link válido por 24h):\n{links}", False
+
+
+def _mcp_call(name, args):
+    """Executa uma ferramenta MCP. Retorna (texto, is_error)."""
+    args = args or {}
+    if name == "buscar_acervo":
+        q = (args.get("consulta") or "").strip()
+        if not q:
+            return "consulta vazia", True
+        coll = args.get("colecao") or COLLECTION
+        if not _org_can(coll):
+            return f"coleção '{coll}' não existe ou não pertence à organização", True
+        hits = _search(q, 5, coll)
+        if not hits:
+            return "(nada encontrado no acervo)", False
+        return "\n\n---\n\n".join(f"[fonte: {h.payload.get('source', '?')}]\n{h.payload.get('text', '')}" for h in hits), False
+    if name == "gerar_documento":
+        return _mcp_gerar_documento(args)
+    if name == "listar_agentes":
+        rank = _PERFIL_RANK.get(_MCP_USER["perfil"], 1)
+        ags = [{"id": a.get("id"), "nome": a.get("nome"), "descricao": (a.get("descricao") or "")[:200],
+                "ferramentas": a.get("ferramentas") or []}
+               for a in _agentes() if a.get("ativo") and a.get("org", DEFAULT_ORG) == _tenant()
+               and _PERFIL_RANK.get(a.get("perfil_minimo", "colaborador"), 1) <= rank]
+        return json.dumps(ags, ensure_ascii=False), False
+    if name == "executar_agente":
+        aid, msg = args.get("agente_id") or "", (args.get("mensagem") or "").strip()
+        if not aid or not msg:
+            return "agente_id e mensagem são obrigatórios", True
+        try:
+            r = agentes_run(aid, AgenteRunReq(mensagem=msg, session_id=args.get("session_id") or None))
+        except HTTPException as e:
+            return f"erro: {e.detail}", True
+        if not isinstance(r, dict):
+            return "erro ao executar o agente", True
+        out = r.get("answer") or ""
+        if r.get("artefatos"):
+            out += "\n\nArquivos (links válidos por 24h):\n" + "\n".join(
+                f"- {a['nome']}: {_mcp_link(a['url'])}" for a in r["artefatos"])
+        out += f"\n\n(session_id: {r.get('session_id')})"
+        return out, bool(r.get("bloqueado"))
+    if name == "solicitar_aprovacao":
+        acao = (args.get("acao") or "").strip()
+        if not acao:
+            return "descreva a ação", True
+        jid = uuid.uuid4().hex[:10]
+        just = (args.get("justificativa") or "").strip()
+        j = {"id": jid, "org": _tenant(), "tipo": "aprovacao_runtime", "titulo": ("🤖 PicoClaw · " + acao)[:80],
+             "status": "aguardando_aprovacao", "pergunta": acao + (("\n\nJustificativa: " + just) if just else ""),
+             "colecoes": [], "skill_id": "", "skill_ids": [], "resultado": None, "fontes": [], "erro": None,
+             "criado": time.time(), "atualizado": time.time(), "aprovacao": True, "por": None}
+        _JOBS[jid] = j
+        _event("aprovação solicitada", f"PicoClaw · {acao[:60]} · {jid}", actor=_MCP_USER["email"])
+        return (f"Pedido de aprovação criado (id {jid}). Um responsável precisa aprovar em Workspace → Fila no Cerne. "
+                f"Consulte com consultar_aprovacao e NÃO execute a ação antes do status 'aprovado'."), False
+    if name == "consultar_aprovacao":
+        j = _JOBS.get(args.get("id") or "")
+        if not j or j.get("org") != _tenant() or j.get("tipo") != "aprovacao_runtime":
+            return "pedido não encontrado", True
+        return json.dumps({"id": j["id"], "status": j["status"], "acao": j["pergunta"][:300]}, ensure_ascii=False), False
+    if name == "lembrar":
+        r = memoria_add(MemoriaReq(texto=args.get("texto") or ""))
+        if isinstance(r, dict):
+            return f"memória salva (id {r['id']})", False
+        return "texto vazio", True
+    if name == "data_hora":
+        import datetime as _dt
+        try:
+            from zoneinfo import ZoneInfo
+            agora = _dt.datetime.now(ZoneInfo("America/Sao_Paulo"))
+        except Exception:                                   # sem tzdata: Brasília é UTC-3 fixo (sem horário de verão)
+            agora = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=-3)))
+        return agora.strftime("%d/%m/%Y %H:%M:%S (horário de Brasília)"), False
+    return f"ferramenta desconhecida: {name}", True
+
+
+def _mcp_rpc(msg):
+    """Processa UMA mensagem JSON-RPC. Retorna o dict de resposta, ou None p/ notificações."""
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    if mid is None:                                          # notificação (ex.: notifications/initialized)
+        return None
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+    if method == "initialize":
+        return ok({"protocolVersion": params.get("protocolVersion") or _MCP_PROTO,
+                   "capabilities": {"tools": {"listChanged": False}},
+                   "serverInfo": {"name": "cerne", "version": "1.0.0"},
+                   "instructions": "Ferramentas do Cerne (acervo, Office, agentes, aprovação humana, memória). "
+                                   "Ações destrutivas exigem solicitar_aprovacao antes."})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": _MCP_TOOLS})
+    if method == "tools/call":
+        name = params.get("name") or ""
+        t0 = time.time()
+        try:
+            texto, erro = _mcp_call(name, params.get("arguments") or {})
+        except Exception as e:
+            texto, erro = f"erro interno: {str(e)[:200]}", True
+        _event("mcp · ferramenta", f"{name} · {'erro' if erro else 'ok'} · {int((time.time() - t0) * 1000)}ms",
+               actor=_MCP_USER["email"])
+        return ok({"content": [{"type": "text", "text": texto}], "isError": bool(erro)})
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"método não suportado: {method}"}}
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    auth = request.headers.get("authorization") or ""
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not CERNE_MCP_TOKEN or not secrets.compare_digest(tok, CERNE_MCP_TOKEN):
+        return JSONResponse(status_code=401, content={"error": "token MCP inválido"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": None,
+                                                      "error": {"code": -32700, "message": "JSON inválido"}})
+    lote = body if isinstance(body, list) else [body]
+    # ferramentas são síncronas (HTTP/LLM/sandbox): roda no threadpool, copiando o contexto (org/usuário)
+    ctx = contextvars.copy_context()
+    import starlette.concurrency as _sc
+    resps = await _sc.run_in_threadpool(lambda: ctx.run(lambda: [r for r in (_mcp_rpc(m) for m in lote if isinstance(m, dict)) if r]))
+    if not resps:
+        return Response(status_code=202)
+    return JSONResponse(resps if isinstance(body, list) else resps[0])
+
+
+@app.get("/mcp")
+def mcp_get():
+    # sem stream SSE standalone (modo request/response); o cliente usa só POST
+    return Response(status_code=405, headers={"Allow": "POST"})
 
 
 # ============ Skills / Prompt Templates · Instruções globais · Projetos · Adoção ============
@@ -3698,6 +3952,10 @@ def job_aprovar(jid: str):
     if not j or j.get("org") != _tenant():
         return JSONResponse(status_code=404, content={"error": "job não encontrado"})
     if j["status"] != "aguardando_aprovacao":
+        return _job_pub(j)
+    if j.get("tipo") == "aprovacao_runtime":             # aprovação de ação do runtime (PicoClaw): só libera, não orquestra
+        j["status"] = "aprovado"; j["por"] = _actor(); j["atualizado"] = time.time()
+        _event("ação do runtime aprovada", f'{j["titulo"][:50]} · {jid}')
         return _job_pub(j)
     j["status"] = "na_fila"; j["por"] = _tenant(); j["atualizado"] = time.time()
     _event("job aprovado", f'{j["titulo"][:50]} · {jid}')
@@ -12496,7 +12754,7 @@ async function memDel(id,btn){await fetch('/memoria/'+id,{method:'DELETE'});cons
 async function jobsOpen(){const wrap=document.createElement('div');wrap.innerHTML='<div class="modal" id="modal"><div class="modalbox" style="max-width:660px"><div class="modalh"><b>🗂 Fila de tarefas · execução durável</b><button class="cvbtn" onclick="jobsClose()">✕</button></div><div class="faint" style="font-size:11.5px;margin-bottom:10px">Orquestrações longas rodam em 2º plano — você não fica preso esperando. Marque <b>exigir aprovação</b> para revisar antes de executar (human-in-the-loop). Usa as coleções e o skill selecionados no chat.</div><div class="row" style="gap:8px;margin-bottom:8px"><input class="field" id="job_txt" placeholder="Ex.: elabore um plano de implantação do Cerne para 90 dias" style="flex:1" onkeydown="if(event.key===\'Enter\')jobCreate()"></div><div class="row" style="gap:12px;align-items:center;margin-bottom:12px"><label class="faint" style="font-size:12px;display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="job_apr"> exigir aprovação antes de executar</label><button class="btn" onclick="jobCreate()">Enfileirar ▸</button></div><div class="lstitle" style="margin:0 0 6px">TAREFAS</div><div id="jobs_list" style="max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:7px"><div class="faint" style="font-size:12px">carregando…</div></div></div></div>';document.body.appendChild(wrap.firstChild);await jobsRefresh();WS._jobsTimer=setInterval(jobsRefresh,3000);}
 function jobsClose(){if(WS._jobsTimer){clearInterval(WS._jobsTimer);WS._jobsTimer=null;}closeModal();}
 async function jobsRefresh(){const el=document.getElementById('jobs_list');if(!el){if(WS._jobsTimer){clearInterval(WS._jobsTimer);WS._jobsTimer=null;}return;}let js=[];try{const r=await J('/jobs');js=r.jobs||[];}catch(e){}if(!js.length){el.innerHTML='<div class="faint" style="font-size:12px;padding:6px">Nenhuma tarefa ainda. Enfileire uma acima — ela roda em 2º plano.</div>';return;}el.innerHTML=js.map(jobRow).join('');}
-function jobStatus(s){return {aguardando_aprovacao:['⏳ aguarda aprovação','var(--warn)'],na_fila:['• na fila','var(--dim)'],rodando:['⟳ rodando','var(--iris)'],concluido:['✓ concluído','#39d98a'],erro:['⚠ erro','var(--crit)'],recusado:['✕ recusado','var(--dim)']}[s]||[s,'var(--dim)'];}
+function jobStatus(s){return {aguardando_aprovacao:['⏳ aguarda aprovação','var(--warn)'],na_fila:['• na fila','var(--dim)'],rodando:['⟳ rodando','var(--iris)'],concluido:['✓ concluído','#39d98a'],erro:['⚠ erro','var(--crit)'],recusado:['✕ recusado','var(--dim)'],aprovado:['✓ aprovado','#39d98a']}[s]||[s,'var(--dim)'];}
 function jobRow(j){const st=jobStatus(j.status);const when=new Date((j.atualizado||j.criado)*1000).toLocaleTimeString().slice(0,5);let acts='';if(j.status==='aguardando_aprovacao')acts='<button class="btn" style="padding:4px 10px;font-size:11px" onclick="jobAprovar(\''+j.id+'\')">Aprovar</button><button class="pjdx" onclick="jobRecusar(\''+j.id+'\')">Recusar</button>';else if(j.status==='concluido')acts='<button class="sel" style="padding:4px 10px;font-size:11px" onclick="jobVer(\''+j.id+'\')">Ver resultado ▸</button>';else if(j.status==='rodando')acts='<span class="spin"></span>';return '<div class="poprow" style="justify-content:space-between;align-items:center;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:10px"><div style="min-width:0"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px">'+esc(j.titulo||j.pergunta||'tarefa')+'</div><div style="font-size:11px;color:'+st[1]+'">'+st[0]+' · '+when+(j.erro?(' · '+esc(j.erro)):'')+'</div></div><div style="display:flex;gap:6px;align-items:center">'+acts+'</div></div>';}
 async function jobCreate(){const i=document.getElementById('job_txt');const t=(i.value||'').trim();if(!t)return;const apr=!!(document.getElementById('job_apr')||{}).checked;i.value='';try{await P('/jobs',{message:t,colecoes:WS.colecoes||[],skill_ids:WS.skills||[],aprovacao:apr});}catch(e){}await jobsRefresh();}
 async function jobAprovar(id){try{await P('/jobs/'+id+'/aprovar',{});}catch(e){}await jobsRefresh();}
