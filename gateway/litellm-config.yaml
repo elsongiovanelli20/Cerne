@@ -36,6 +36,8 @@ model_list:
       api_base: http://ollama:11434
 
   # --- provedores externos GRATUITOS ---
+  # (2026-11-16) removidos por pararem de funcionar: ext-groq (Llama 3.3 70B saiu da Groq), ext-qwen
+  # (Qwen3-32B saiu da Groq) e ext-cerebras (free tier passou a exigir pagamento).
   # O app (/ask-externo) MASCARA a PII antes de chamar qualquer um destes.
   # Cada modelo só funciona se a respectiva chave estiver no .env; sem chave = indisponível.
   - model_name: ext-glm              # GLM-4.7-Flash direto na Z.ai (tier Flash grátis)
@@ -47,22 +49,10 @@ model_list:
     litellm_params:
       model: gemini/gemini-2.5-flash
       api_key: os.environ/GEMINI_API_KEY
-  - model_name: ext-groq             # Groq (muito rápido; Llama 3.3 70B)
-    litellm_params:
-      model: groq/llama-3.3-70b-versatile
-      api_key: os.environ/GROQ_API_KEY
-  - model_name: ext-cerebras         # Cerebras (grátis; gpt-oss-120b e zai-glm-4.7)
-    litellm_params:
-      model: cerebras/gpt-oss-120b
-      api_key: os.environ/CEREBRAS_API_KEY
   - model_name: ext-mistral          # Mistral (Codestral, para código)
     litellm_params:
       model: mistral/codestral-latest
       api_key: os.environ/MISTRAL_API_KEY
-  - model_name: ext-qwen             # Qwen3-32B via Groq (grátis e rápido; reusa GROQ_API_KEY)
-    litellm_params:
-      model: groq/qwen/qwen3-32b
-      api_key: os.environ/GROQ_API_KEY
   - model_name: ext-qwen-max         # Qwen3-Max oficial (Alibaba DashScope, free trial)
     litellm_params:
       model: openai/qwen3-max
@@ -80,6 +70,31 @@ model_list:
     litellm_params:
       model: deepseek/deepseek-chat
       api_key: os.environ/DEEPSEEK_API_KEY
+  # NVIDIA build (integrate.api.nvidia.com) — API TRIAL grátis: protótipo/teste, ~40 RPM, sem SLA.
+  # (DeepSeek V4.1 Flash saiu do catálogo NVIDIA em 2026-11-16 → substituído pelo Nemotron 3 Ultra.)
+  - model_name: ext-nvidia-ultra     # Nemotron 3 Ultra 550B (raciocínio; ~2s e tool calling OK no teste de 2026-11-16)
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_key: os.environ/NVIDIA_API_KEY
+      timeout: 90
+  - model_name: ext-nvidia-mistral   # Mistral Large 4 (1T MoE; ~3-6s e tool calling OK no teste de 2026-11-16)
+    litellm_params:
+      model: nvidia_nim/mistralai/mistral-large-4-1t-a52b
+      api_key: os.environ/NVIDIA_API_KEY
+      timeout: 90
+  - model_name: ext-nvidia-lightning # Nemotron 3.5 Lightning 30B-A3B (rápido ~1.5s; raciocina antes de responder)
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_key: os.environ/NVIDIA_API_KEY
+      timeout: 60
+  - model_name: ext-nvidia-gemma     # Google Gemma 4 31B (endpoint grátis costuma ficar congestionado → fallback p/ Ultra)
+    litellm_params:
+      model: nvidia_nim/google/gemma-4-31b-it
+      api_key: os.environ/NVIDIA_API_KEY
+      timeout: 15
+      stream_timeout: 15
+      max_retries: 0          # sem re-tentar: se travar, vai direto ao fallback (Nemotron Ultra)
+      num_retries: 0
   - model_name: ext-kimi             # Moonshot Kimi (contexto gigante)
     litellm_params:
       model: openai/moonshot-v1-128k
@@ -92,6 +107,9 @@ litellm_settings:
   cache: true                 # cache de respostas: pergunta idêntica = instantânea
   cache_params:
     type: local
+
+router_settings:
+  fallbacks: [{"ext-nvidia-gemma": ["ext-nvidia-ultra"]}]   # Gemma 4 (NVIDIA trial) travado/fora → Nemotron Ultra
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

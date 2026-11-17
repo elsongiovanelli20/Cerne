@@ -12,9 +12,10 @@ Consolidação de 3 mapas do mercado contra o que o Cerne já tem:
 | LLM (da corrida global) | País | API grátis? | Status no Cerne |
 |---|---|---|---|
 | **GLM** (Zhipu) | 🇨🇳 | ✅ GLM-Flash grátis | ✅ `ext-glm` |
-| **Qwen** (Alibaba) | 🇨🇳 | ✅ DashScope trial / Groq | ✅ `ext-qwen`, `ext-qwen-max` |
+| **Qwen** (Alibaba) | 🇨🇳 | ✅ DashScope trial | ✅ `ext-qwen-max` (o Qwen3-32B saiu da Groq em nov/2026) |
 | **Gemini** (Google) | 🇺🇸 | ✅ 1500 req/dia | ✅ `ext-gemini` |
-| **Llama** (Meta) via Groq/Cerebras | 🇺🇸 | ✅ grátis | ✅ `ext-groq`, `ext-cerebras` |
+| **Llama** (Meta) via Groq/Cerebras | 🇺🇸 | ❌ saiu da Groq; Cerebras passou a cobrar (nov/2026) | ❌ removidos (`ext-groq`, `ext-cerebras`) |
+| **Nemotron / Mistral Large / Gemma** via NVIDIA build | 🇺🇸 | ✅ trial (protótipo/teste) | ✅ `ext-nvidia-ultra`, `ext-nvidia-mistral`, `ext-nvidia-lightning`, `ext-nvidia-gemma` |
 | **Mistral** | 🇪🇺 | ✅ free tier | ✅ `ext-mistral` |
 | **DeepSeek** (inclui R1 "reasoning") | 🇨🇳 | ✅ grátis via OpenRouter | 🟡 **adicionar `ext-deepseek`** |
 | **Kimi** (Moonshot, contexto gigante) | 🇨🇳 | 🟡 créditos grátis | 🟡 **adicionar `ext-kimi`** |

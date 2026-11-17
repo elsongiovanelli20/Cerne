@@ -72,10 +72,13 @@ def _graph_noise(v, t):
     return False
 
 # alias externo -> variável de ambiente da chave (para marcar quais estão prontos)
-PROV_KEY_ENV = {"ext-glm": "ZAI_API_KEY", "ext-gemini": "GEMINI_API_KEY", "ext-groq": "GROQ_API_KEY",
-                "ext-qwen": "GROQ_API_KEY", "ext-reason": "GROQ_API_KEY", "ext-cerebras": "CEREBRAS_API_KEY",
+# (2026-11-16) removidos: ext-groq/ext-qwen (Groq tirou Llama 3.3 70B e Qwen3-32B do ar → 404) e
+# ext-cerebras (free tier passou a exigir pagamento → 402).
+PROV_KEY_ENV = {"ext-glm": "ZAI_API_KEY", "ext-gemini": "GEMINI_API_KEY", "ext-reason": "GROQ_API_KEY",
                 "ext-mistral": "MISTRAL_API_KEY", "ext-qwen-max": "DASHSCOPE_API_KEY",
-                "ext-openrouter": "OPENROUTER_API_KEY", "ext-deepseek": "DEEPSEEK_API_KEY", "ext-kimi": "MOONSHOT_API_KEY"}
+                "ext-openrouter": "OPENROUTER_API_KEY", "ext-deepseek": "DEEPSEEK_API_KEY", "ext-kimi": "MOONSHOT_API_KEY",
+                "ext-nvidia-ultra": "NVIDIA_API_KEY", "ext-nvidia-gemma": "NVIDIA_API_KEY",
+                "ext-nvidia-mistral": "NVIDIA_API_KEY", "ext-nvidia-lightning": "NVIDIA_API_KEY"}
 
 # Provedores PAGOS (topo de linha) — configurados pela UI (chave cifrada, sem .env). Registrados no
 # gateway LiteLLM em runtime (/model/new, store_model_in_db). Entram nas regras de híbrido + PII mascarada.
@@ -102,7 +105,14 @@ def _all_provs():
     return sorted(set(PROV_KEY_ENV) | set(LLM_PAGAS))
 
 
+# Provedores que deixaram de existir no gateway: mesmo se ainda estiverem em provedores_habilitados de
+# alguma organização (estado salvo), nunca são roteados.
+PROV_REMOVIDOS = {"ext-groq", "ext-qwen", "ext-cerebras"}
+
+
 def _prov_ok(alias):
+    if alias in PROV_REMOVIDOS:
+        return False
     ev = PROV_KEY_ENV.get(alias)
     if ev:
         return bool((os.getenv(ev) or "").strip())
@@ -193,7 +203,7 @@ def _ext_permitidos(org=None):
 
 def _best_provider(org=None):
     perm = _ext_permitidos(org)
-    for pref in ("ext-reason", "ext-groq", "ext-qwen"):
+    for pref in ("ext-reason", "ext-nvidia-ultra", "ext-nvidia-lightning"):
         if pref in perm:
             return pref
     return perm[0] if perm else None
@@ -216,10 +226,10 @@ def _best_provider_for(msg, org=None):
     perm = _ext_permitidos(org)
     if not perm:
         return None
-    prefs = {"codigo": ["ext-mistral", "ext-deepseek", "ext-qwen", "ext-groq"],
-             "raciocinio": ["ext-reason", "ext-deepseek", "ext-cerebras", "ext-qwen"],
-             "longo": ["ext-kimi", "ext-gemini", "ext-reason", "ext-groq"],
-             "geral": ["ext-cerebras", "ext-reason", "ext-groq", "ext-qwen"]}.get(_task_kind(msg), [])
+    prefs = {"codigo": ["ext-mistral", "ext-deepseek", "ext-nvidia-mistral", "ext-reason"],
+             "raciocinio": ["ext-reason", "ext-deepseek", "ext-nvidia-ultra", "ext-nvidia-mistral"],
+             "longo": ["ext-kimi", "ext-gemini", "ext-reason", "ext-nvidia-mistral"],
+             "geral": ["ext-reason", "ext-nvidia-lightning", "ext-nvidia-ultra", "ext-openrouter", "ext-nvidia-gemma"]}.get(_task_kind(msg), [])
     for p in prefs:
         if p in perm:
             return p
@@ -236,10 +246,10 @@ def _task_needs_external(msg):
 
 
 def _resolve_provider(provider, msg):
-    """'ext-groq-auto' -> melhor modelo FREE do Groq por tarefa (mesma chave); demais passam direto."""
+    """'ext-groq-auto' -> modelo FREE do Groq (mesma chave); demais passam direto. Llama 3.3 70B e Qwen3-32B
+    saíram da Groq (2026-11-16), então hoje todo tipo de tarefa vai para o GPT-OSS 120B (ext-reason)."""
     if provider == "ext-groq-auto":
-        return {"codigo": "ext-qwen", "raciocinio": "ext-reason", "longo": "ext-reason",
-                "geral": "ext-groq"}.get(_task_kind(msg), "ext-groq")
+        return "ext-reason"
     return provider
 
 
@@ -2934,7 +2944,7 @@ def agent_stream(body: AgentReq):
         # --- ORQUESTRADOR: demandas grandes viram plano -> subtarefas em paralelo -> síntese ---
         if body.orquestrar or _needs_orchestration(body.message):
             org = _org(); pool = _ext_permitidos(org); strong = _best_provider(org) or lm
-            planner_m = next((p for p in ("ext-cerebras", "ext-groq", "ext-qwen", "ext-mistral") if p in pool), strong)
+            planner_m = next((p for p in ("ext-nvidia-lightning", "ext-reason", "ext-nvidia-ultra", "ext-mistral") if p in pool), strong)
             yield "[[STEP]]planejando: quebrando o pedido em subtarefas"
             plan = [{"role": "system", "content": "Você é um planejador. Quebre o pedido do usuário em 3 a 6 subtarefas objetivas, independentes e complementares que, somadas, entregam um resultado completo. Responda SOMENTE com um array JSON válido, sem markdown e sem texto ao redor, no formato: [{\"titulo\":\"curto\",\"prompt\":\"instrução completa e autossuficiente para uma IA executar essa subtarefa\"}]"},
                     {"role": "user", "content": body.message}]
@@ -3556,7 +3566,7 @@ def _orquestrar_sync(message: str, colls: list, skill_prompt: str = None):
     """Orquestrador NÃO-streaming (usado pela fila): plano → subtarefas em paralelo → síntese.
     Espelha o /agent-stream. Retorna (resposta_final, fontes)."""
     org = _org(); pool = _ext_permitidos(org); strong = _best_provider(org) or "chat"
-    planner_m = next((p for p in ("ext-cerebras", "ext-groq", "ext-qwen", "ext-mistral") if p in pool), strong)
+    planner_m = next((p for p in ("ext-nvidia-lightning", "ext-reason", "ext-nvidia-ultra", "ext-mistral") if p in pool), strong)
     plan = [{"role": "system", "content": "Você é um planejador. Quebre o pedido do usuário em 3 a 6 subtarefas objetivas, independentes e complementares que, somadas, entregam um resultado completo. Responda SOMENTE com um array JSON válido, sem markdown e sem texto ao redor, no formato: [{\"titulo\":\"curto\",\"prompt\":\"instrução completa e autossuficiente para uma IA executar essa subtarefa\"}]"},
             {"role": "user", "content": message}]
     subs = _parse_json_list(_strip_think(_chat_resiliente(planner_m, plan, max_tokens=1600) or "")) or [{"titulo": "Resposta", "prompt": message}]
@@ -10492,7 +10502,7 @@ async function run(btn,fn){btn.disabled=true;try{await fn()}catch(e){alert(e)}fi
 function coll(){return (document.getElementById('coll').value||'').trim()||'cerne_docs'}
 async function ingestText(){await run(event.target,async()=>{show('ingestOut',await post('/ingest',{text:document.getElementById('txt').value,source:'texto-colado',colecao:coll()}))})}
 async function ingestFile(){await run(event.target,async()=>{const f=document.getElementById('file').files[0];if(!f)return alert('Escolha um arquivo');const fd=new FormData();fd.append('file',f);const r=await fetch('/ingest-file?colecao='+encodeURIComponent(coll()),{method:'POST',body:fd});show('ingestOut',await r.json())})}
-const PROV_LABELS={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-qwen-max':'Alibaba · Qwen3-Max','ext-gemini':'Google · Gemini Flash','ext-cerebras':'Cerebras · gpt-oss-120b','ext-glm':'Z.ai · GLM-4.7-Flash','ext-mistral':'Mistral · Codestral','ext-reason':'Thinking · DeepSeek-R1 (Groq)','ext-openrouter':'OpenRouter · modelos :free','ext-deepseek':'DeepSeek · V3/R1','ext-kimi':'Moonshot · Kimi 128k','ext-claude':'Anthropic · Claude 💵','ext-openai':'OpenAI · GPT 💵','ext-gemini-pro':'Google · Gemini Pro 💵','ext-kimi-pro':'Moonshot · Kimi K3 💵'};
+const PROV_LABELS={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-qwen-max':'Alibaba · Qwen3-Max','ext-gemini':'Google · Gemini Flash','ext-cerebras':'Cerebras · gpt-oss-120b','ext-glm':'Z.ai · GLM-4.7-Flash','ext-mistral':'Mistral · Codestral','ext-reason':'Thinking · DeepSeek-R1 (Groq)','ext-openrouter':'OpenRouter · modelos :free','ext-deepseek':'DeepSeek · V3/R1','ext-kimi':'Moonshot · Kimi 128k','ext-nvidia-ultra':'NVIDIA · Nemotron 3 Ultra','ext-nvidia-gemma':'NVIDIA · Gemma 4 31B','ext-nvidia-mistral':'NVIDIA · Mistral Large 4','ext-nvidia-lightning':'NVIDIA · Nemotron 3.5 Lightning','ext-claude':'Anthropic · Claude 💵','ext-openai':'OpenAI · GPT 💵','ext-gemini-pro':'Google · Gemini Pro 💵','ext-kimi-pro':'Moonshot · Kimi K3 💵'};
 async function populateProviders(){try{const s=await(await fetch('/stats')).json();const sel=document.getElementById('prov');s.provedores.filter(p=>p.indexOf('ext-')===0).forEach(p=>{const o=document.createElement('option');o.value=p;const ic=p==='ext-reason'?'🧠 ':'🌐 ';o.textContent=ic+(PROV_LABELS[p]||p)+' (mascarado)';sel.appendChild(o)})}catch(e){}}
 async function populateSkills(){try{const d=await(await fetch('/skills')).json();const sel=document.getElementById('skill');(d.skills||[]).forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent='🎯 '+s.nome;sel.appendChild(o)})}catch(e){}}
 async function ask(){const btn=event.target;const prov=document.getElementById('prov').value;const q=document.getElementById('q').value;const out=document.getElementById('askOut');const note=document.getElementById('provnote');btn.disabled=true;out.style.display='block';note.style.display='none';
@@ -11522,7 +11532,7 @@ V.components=async()=>{const s=await J('/stats'),svc=s.servicos||{};
  ];
  return `<h1 class="h">Componentes</h1><div class="lead">A pilha do Cerne em <b>planos</b> — do núcleo à governança, cada um sobre software aberto e soberano.</div>
   <div class="planestack">${P.map(p=>`<div class="plane${p[4]?' new':(p[3]?'':' off')}"><div class="pl-rail"><span class="pl-tag">${p[4]?'NOVO':'PLANO'}</span><span class="pl-st"><span class="dot ${p[3]?'ok':'crit'}"></span>${p[4]?(p[3]?'no ar · novo':'novo'):(p[3]?'no ar':'—')}</span></div><div class="pl-body"><div class="pl-name">${p[0]}</div><div class="pl-role">${p[1]}</div><div class="pl-chips">${p[2].map(c=>`<b>${c}</b>`).join('')}</div></div></div>`).join('')}</div>`;};
-V.gateway=async()=>{const s=await J('/stats'),pr=(s.provedores||[]);const lab={'ext-reason':'🧠 Groq · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Google · Gemini','ext-glm':'Z.ai · GLM','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Moonshot Kimi','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Alibaba Qwen-Max'};
+V.gateway=async()=>{const s=await J('/stats'),pr=(s.provedores||[]);const lab={'ext-reason':'🧠 Groq · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Google · Gemini','ext-glm':'Z.ai · GLM','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Moonshot Kimi','ext-nvidia-ultra':'NVIDIA · Nemotron Ultra','ext-nvidia-gemma':'NVIDIA · Gemma 4','ext-nvidia-mistral':'NVIDIA · Mistral Large 4','ext-nvidia-lightning':'NVIDIA · Nemotron Lightning','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Alibaba Qwen-Max'};
  const rows=pr.map(p=>{const ext=p.indexOf('ext-')===0;return `<tr><td class="mono"><b>${p}</b></td><td>${ext?(lab[p]||'externo'):'local (Ollama)'}</td><td>${ext?'<span class="badge b-cyan">mascarado</span>':'<span class="badge b-ok">soberano</span>'}</td></tr>`;}).join('');
  return `<h1 class="h">Model Gateway</h1><div class="lead">Dispatcher OpenAI-compatível (LiteLLM). Operação completa em <a href="#ops">Model Ops →</a>. ${pr.length} modelos.</div><div class="panel pad0"><table class="tbl"><thead><tr><th>Alias</th><th>Backend</th><th>Modo</th></tr></thead><tbody>${rows}</tbody></table></div>`;};
 V.preflight=async()=>{const p=await J('/preflight');const rows=(p.checks||[]).map(c=>`<div class="kv"><span class="k"><span class="dot ${c.ok?'ok':'crit'}" style="margin-right:9px"></span>${c.check} ${c.detalhe?`<span class="mono faint">· ${c.detalhe}</span>`:''}</span><span class="badge ${c.ok?'b-ok':'b-crit'}">${c.ok?'OK':'FALHA'}</span></div>`).join('');
@@ -12084,7 +12094,7 @@ V.agentes=async()=>{const d=await J('/agentes'),ags=d.agentes||[],tools=d.ferram
        <details class="muted" style="font-size:11px;margin-top:8px"><summary style="cursor:pointer">instalação manual (avançado)</summary><div style="margin-top:6px">Baixe o <a href="/download/office-manifest" style="color:var(--iris)">manifesto (XML)</a> e no Office: <b>Inserir → Suplementos → Meus Suplementos → Carregar Meu Suplemento</b> → escolha o XML. Ou publique pela central de implantação do M365.</div></details></div>
      <div style="min-width:150px"><div class="kv" style="margin:0"><span class="k">Excel</span><span class="badge ${(ext.office||{}).excel?'b-ok':'b-plan'}">${(ext.office||{}).excel?'● conectado':'—'}</span></div><div class="kv" style="margin:0"><span class="k">Word</span><span class="badge ${(ext.office||{}).word?'b-ok':'b-plan'}">${(ext.office||{}).word?'● conectado':'—'}</span></div><div class="kv" style="margin:0"><span class="k">PowerPoint</span><span class="badge ${(ext.office||{}).ppt?'b-ok':'b-plan'}">${(ext.office||{}).ppt?'● conectado':'—'}</span></div></div>
    </div></div>`;
- const PL={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-reason':'Thinking · GPT-OSS','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Kimi','ext-openrouter':'OpenRouter','ext-glm':'GLM','ext-qwen-max':'Qwen-Max','ext-claude':'Anthropic Claude 💵','ext-openai':'OpenAI GPT 💵','ext-gemini-pro':'Gemini Pro 💵','ext-kimi-pro':'Kimi K3 💵'};
+ const PL={'ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-reason':'Thinking · GPT-OSS','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek','ext-kimi':'Kimi','ext-nvidia-ultra':'NVIDIA Nemotron','ext-nvidia-gemma':'NVIDIA Gemma','ext-nvidia-mistral':'NVIDIA Mistral','ext-nvidia-lightning':'NVIDIA Lightning','ext-openrouter':'OpenRouter','ext-glm':'GLM','ext-qwen-max':'Qwen-Max','ext-claude':'Anthropic Claude 💵','ext-openai':'OpenAI GPT 💵','ext-gemini-pro':'Gemini Pro 💵','ext-kimi-pro':'Kimi K3 💵'};
  const modelopts='<option value="agent">🔒 Soberano (local)</option>'+(hib?habs.map(p=>`<option value="${p}">🌐 Híbrido · ${esc(PL[p]||p)}</option>`).join(''):'');
  const PF={colaborador:'Colaborador',gestor:'Gestor',admin:'Administrador'};
  const instById={};INSTS.forEach(i=>instById[i.id]=i);
@@ -12321,18 +12331,19 @@ V.map=async()=>{const h=await V.components();return h.replace("Componentes","Map
 V.org=async()=>{const d=await J('/org');const o=d.org||{};const provs=d.provedores||{};const hib=o.soberania==='hibrido';const hab=o.provedores_habilitados||[];
  const PROV_INFO={
   'ext-reason':{m:'Groq · GPT-OSS 120B',best:'Raciocínio e análise passo a passo (modo Thinking)',tags:['🧠 raciocínio','⚡ muito rápido','💸 grátis','📏 128k']},
-  'ext-groq':{m:'Groq · Llama 3.3 70B',best:'Respostas gerais com ótima velocidade e qualidade',tags:['💬 geral','⚡ muito rápido','💸 grátis','📏 128k']},
-  'ext-qwen':{m:'Groq · Qwen3-32B',best:'Multilíngue, raciocínio e código',tags:['🌍 multilíngue','💻 código','⚡ rápido','💸 grátis']},
   'ext-gemini':{m:'Google · Gemini 2.5 Flash',best:'Contexto gigante e multimodal, muito rápido',tags:['📏 1M contexto','🖼️ multimodal','⚡ rápido','🎁 free tier']},
   'ext-glm':{m:'Z.ai · GLM-4.7-Flash',best:'Uso geral com bom custo-benefício',tags:['💬 geral','💸 grátis','📏 128k']},
-  'ext-cerebras':{m:'Cerebras · GPT-OSS 120B',best:'Velocidade extrema + raciocínio',tags:['🚀 ultra-rápido','🧠 raciocínio','🎁 free tier']},
   'ext-mistral':{m:'Mistral · Codestral',best:'Programação e geração de código',tags:['💻 código','⚡ rápido','🎁 free tier']},
   'ext-deepseek':{m:'DeepSeek · V3 / R1',best:'Raciocínio (R1) e código com custo baixíssimo',tags:['🧠 raciocínio','💻 código','💵 barato']},
   'ext-kimi':{m:'Moonshot · Kimi',best:'Documentos MUITO longos (contexto gigante)',tags:['📏 128k+','📚 docs longos']},
+  'ext-nvidia-ultra':{m:'NVIDIA · Nemotron 3 Ultra 550B',best:'Raciocínio e agentes com ferramentas (API trial NVIDIA: protótipo/teste)',tags:['🧠 raciocínio','🤖 ferramentas','⚡ rápido','🎁 trial grátis']},
+  'ext-nvidia-mistral':{m:'NVIDIA · Mistral Large 4',best:'Modelo grande de ponta: código, análise e agentes (API trial NVIDIA: protótipo/teste)',tags:['🏆 topo de linha','💻 código','🤖 ferramentas','🎁 trial grátis']},
+  'ext-nvidia-lightning':{m:'NVIDIA · Nemotron 3.5 Lightning',best:'Respostas rápidas do dia a dia (API trial NVIDIA: protótipo/teste)',tags:['⚡ muito rápido','💬 geral','🤖 ferramentas','🎁 trial grátis']},
+  'ext-nvidia-gemma':{m:'NVIDIA · Gemma 4 31B',best:'Uso geral multilíngue (trial NVIDIA; se congestionado, cai p/ Nemotron Ultra)',tags:['💬 geral','🌍 multilíngue','🎁 trial grátis']},
   'ext-kimi-pro':{m:'Moonshot · Kimi K3 💵',best:'Contexto de 1M tokens, agente e automação (pago)',tags:['📏 1M contexto','🤖 agente','💵 pago']},
   'ext-openrouter':{m:'OpenRouter (agregador)',best:'Acesso a dezenas de modelos :free com 1 chave',tags:['🔀 multi-modelo','🎁 modelos free']},
   'ext-qwen-max':{m:'Alibaba · Qwen3-Max',best:'Modelo grande de ponta, multilíngue e raciocínio',tags:['🏆 topo de linha','🌍 multilíngue','💵 pago']}};
- const permit=hab.filter(p=>provs[p]);const target=['ext-reason','ext-groq','ext-qwen'].find(p=>permit.indexOf(p)>=0)||permit[0]||null;
+ const permit=hab.filter(p=>provs[p]);const target=['ext-reason','ext-nvidia-ultra','ext-nvidia-lightning'].find(p=>permit.indexOf(p)>=0)||permit[0]||null;
  const TAG_TIPS={'🧠 raciocínio':'Pensa passo a passo: análises, comparações, decisões. Ex.: "compare 2 contratos e aponte riscos".','⚡ muito rápido':'Resposta quase instantânea (infra Groq).','⚡ rápido':'Boa velocidade de resposta.','🚀 ultra-rápido':'Velocidade extrema (infra Cerebras).','💸 grátis':'Sem custo — tier gratuito do provedor.','🎁 free tier':'Tem camada gratuita, com limites de uso.','💵 barato':'Custo muito baixo por uso.','💵 pago':'Cobra por uso (sem tier grátis relevante).','📏 128k':'~128 mil tokens de contexto (documentos médios/grandes).','📏 128k+':'Contexto grande, acima de 128k tokens.','📏 1M contexto':'Até ~1 milhão de tokens — livros/muitos documentos de uma vez.','📚 docs longos':'Ótimo p/ textos longos. Ex.: analisar um PDF de 200 páginas.','🌍 multilíngue':'Forte em vários idiomas, incl. português.','💻 código':'Bom em programação. Ex.: "gere um script Python que...".','🖼️ multimodal':'Entende imagens além de texto.','🔀 multi-modelo':'Vários modelos por 1 chave (OpenRouter).','🎁 modelos free':'Inclui modelos gratuitos.','💬 geral':'Bom para uso geral do dia a dia.','🏆 topo de linha':'Modelo grande, de ponta, mais capaz (e mais caro).'};
  const semchave=Object.keys(provs).filter(p=>!provs[p]);
  const provrows=Object.keys(provs).filter(p=>provs[p]).map(p=>{const key=provs[p];const on=hab.indexOf(p)>=0;const info=PROV_INFO[p]||{m:'',best:'—',tags:[]};
@@ -12423,11 +12434,11 @@ async function renderWork(){
  let files='',ndocs=0;for(const n of WS.colecoes){const a=await J('/acervo?colecao='+encodeURIComponent(n));(a.fontes||[]).forEach(f=>{files+=`<div class="file"><span class="fi">${ico('doc')}</span><div>${esc(f.source)}<div class="faint mono" style="font-size:10px">${n} · ${f.chunks} trechos</div></div></div>`;ndocs++;});}if(!files)files='<div class="muted" style="font-size:12px;padding:6px">'+(WS.colecoes.length?'coleção vazia':'chat livre — sem acervo')+'</div>';
  WSK_ALL=sks;
  const st=await J('/stats');const ext=(st.provedores||[]).filter(p=>p.indexOf('ext-')===0);
- const mlab={'ext-reason':'🧠 Thinking · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-glm':'GLM-Flash','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek R1','ext-kimi':'Kimi 128k','ext-kimi-pro':'Kimi K3 💵','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Qwen-Max'};
+ const mlab={'ext-reason':'🧠 Thinking · GPT-OSS 120B','ext-groq':'Groq · Llama 3.3 70B','ext-qwen':'Groq · Qwen3-32B','ext-gemini':'Gemini Flash','ext-glm':'GLM-Flash','ext-cerebras':'Cerebras','ext-mistral':'Mistral','ext-deepseek':'DeepSeek R1','ext-kimi':'Kimi 128k','ext-nvidia-ultra':'NVIDIA Nemotron Ultra','ext-nvidia-gemma':'NVIDIA Gemma 4','ext-nvidia-mistral':'NVIDIA Mistral Large 4','ext-nvidia-lightning':'NVIDIA Nemotron Lightning','ext-kimi-pro':'Kimi K3 💵','ext-openrouter':'OpenRouter :free','ext-qwen-max':'Qwen-Max'};
  const canExt=role!=='colaborador';const stt=st.provedores_status||{};
  const og=await J('/org');const orgg=og.org||{};const hib=orgg.soberania==='hibrido';const hab=orgg.provedores_habilitados||[];WS.hib=hib;WS.routing=!!(orgg.escalonamento||orgg.roteamento_adaptativo);
  function extState(p){if(!hib)return{dis:true,suf:' · modo soberano'};if(!canExt)return{dis:true,suf:' · requer Gestor/Admin'};if(stt[p]===false)return{dis:true,suf:' · colar chave'};if(hab.indexOf(p)<0)return{dis:true,suf:' · habilitar na Organização'};return{dis:false,suf:' (mascarado)'};}
- const GROQ=['ext-groq','ext-qwen','ext-reason'];const usable=p=>hib&&!extState(p).dis;
+ const GROQ=['ext-reason'];const usable=p=>hib&&!extState(p).dis;
  if(WS.model!=='local'&&WS.model!=='ext-groq-auto'&&extState(WS.model).dis)WS.model='local';
  if(WS.model==='ext-groq-auto'&&!GROQ.some(usable))WS.model='local';
  let modopt='<option value="local"'+(WS.model==='local'?' selected':'')+'>🔒 Local (soberano)</option>';

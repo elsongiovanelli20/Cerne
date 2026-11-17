@@ -87,6 +87,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
       - DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@litellm-db:5432/litellm
       - UI_USERNAME=${UI_USERNAME:-admin}
       - UI_PASSWORD=${UI_PASSWORD:-}
@@ -157,6 +158,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
       - SANDBOX_URL=http://sandbox:8090        # executor isolado de código dos agentes (container separado)
       - RENDER_URL=http://render:8091          # renderizador Chromium (HTML → PNG/PDF/MP4), container separado
     volumes:

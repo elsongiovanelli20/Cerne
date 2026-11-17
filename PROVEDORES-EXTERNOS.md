@@ -39,20 +39,27 @@ para esticar as cotas gratuitas — todos atrás da mesma camada de privacidade.
 **difíceis e de baixa sensibilidade**. Para dado de cliente regulado, continue no
 **modelo local** (`/ask`), que não sai da máquina.
 
-## Provedores gratuitos suportados (jul/2026)
+## Provedores gratuitos suportados (revisado em 16/nov/2026)
+
+> **Removidos em 16/nov/2026 por pararem de funcionar:** `ext-groq` e `ext-qwen` (a Groq tirou o Llama 3.3 70B e o
+> Qwen3-32B do ar — 404) e `ext-cerebras` (o free tier passou a exigir pagamento — 402). O DeepSeek V4.1 Flash da
+> NVIDIA também saiu do catálogo no mesmo dia.
 
 Todos configurados no gateway como aliases `ext-*`, todos passam pelo mascaramento.
 
 | Alias | Provedor | Modelo padrão | Free tier | Destaque | vs GLM-4.7-Flash |
 |---|---|---|---|---|---|
 | `ext-gemini` | Google Gemini | gemini-2.5-flash | **1.500 req/dia, sem cartão** | contexto 1M, multimodal | **mais forte** (geral) |
-| `ext-cerebras` | Cerebras | gpt-oss-120b | 1M tokens/dia | throughput altíssimo (~2000 tok/s); tem `zai-glm-4.7` | **mais forte** (120B) |
-| `ext-groq` | Groq | llama-3.3-70b-versatile | 30 req/min | mais rápido; tem gpt-oss-120b, qwen3-32b | **mais forte** (70B) |
+| `ext-reason` | Groq | gpt-oss-120b | 30 req/min | muito rápido, raciocínio | **mais forte** (120B) |
+| `ext-nvidia-ultra` | NVIDIA build | nemotron-3-ultra-550b-a55b | trial ~40 req/min (protótipo/teste) | raciocínio + ferramentas, ~2s | **mais forte** |
+| `ext-nvidia-mistral` | NVIDIA build | mistral-large-4-1t-a52b | trial ~40 req/min (protótipo/teste) | código/análise, ~3-6s | **mais forte** |
+| `ext-nvidia-lightning` | NVIDIA build | nemotron-3.5-lightning-30b-a3b | trial ~40 req/min (protótipo/teste) | muito rápido, ~1.5s | comparável |
+| `ext-nvidia-gemma` | NVIDIA build | gemma-4-31b-it | trial (endpoint congestionado) | cai p/ `ext-nvidia-ultra` se travar | comparável |
 | `ext-glm` | Z.ai | glm-4.7-flash | grátis, 1 concorrência | ótimo em código/agêntico p/ o tamanho | referência |
 | `ext-mistral` | Mistral | codestral-latest | free tier | Codestral/Devstral p/ código | comparável |
 
 **Resumo:** para **melhor qualidade grátis**, `ext-gemini` (cota enorme) ou
-`ext-cerebras`/`ext-groq` (modelos de 70–120B) superam o GLM-4.7-Flash. Para
+`ext-reason`/`ext-nvidia-ultra` (modelos de 120–550B) superam o GLM-4.7-Flash. Para
 **código**, GLM-4.7-Flash e Codestral são fortes. `ext-glm` é um bom padrão.
 
 ## Como ativar um provedor
@@ -84,7 +91,7 @@ $r.enviado_ao_provedor    # PROVA: exatamente o texto (mascarado) que saiu
 $r.pii_protegida          # tokens que foram mascarados
 ```
 
-Parâmetros: `provider` (`ext-glm`|`ext-gemini`|`ext-groq`|`ext-cerebras`|`ext-mistral`),
+Parâmetros: `provider` (`ext-glm`|`ext-gemini`|`ext-reason`|`ext-mistral`|`ext-nvidia-ultra`|…),
 `use_rag` (true = usa seus documentos; false = pergunta direta), `top_k`.
 
 Compare com o local: mesma pergunta em `/ask` (100% soberano, `qwen2.5:3b`) vs.
