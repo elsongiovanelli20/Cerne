@@ -200,7 +200,7 @@ services:
     container_name: cerne-sandbox
     read_only: true                            # rootfs somente-leitura
     tmpfs:
-      - /work:size=1536m,mode=1777            # área efêmera (frames de vídeo/imagens); some ao reiniciar
+      - /work:size=1536m,mode=1777,exec       # exec: pacotes com partes nativas (.so) instalados pelo agente; área efêmera (frames de vídeo/imagens); some ao reiniciar
       - /tmp:size=64m
     security_opt:
       - no-new-privileges:true

@@ -47,3 +47,9 @@ Enquanto o agente opera, a **moldura do Cerne** fica visível na aba. A moldura 
 
 A extensão só executa comandos vindos do **seu** Cerne, autenticados pelo **código de pareamento** do seu usuário.
 Nada é enviado a terceiros. Pause ou despareie quando quiser pelo popup.
+
+## Ações disponíveis para os agentes (v1.1.0)
+`abrir` (já devolve o mapa da página) · `mapa` (campos/botões/links visíveis com seletor estável `[data-cerne="…"]`)
+· `ler` · `clicar` · `clicar_texto` · `preencher` (compatível com React/Vue) · `selecionar` · `tecla` · `rolar`
+· `esperar_elemento` · `voltar` · `links` · `baixar` · `screenshot` · `esperar`.
+Extensão instalada como "sem pacote": após atualizar o zip, recarregue-a em `chrome://extensions`.

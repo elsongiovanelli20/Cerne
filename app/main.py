@@ -462,7 +462,9 @@ def _anexos_texto(sid, org=None):
     _anexos_cleanup()
     itens = [a for a in APPSTATE.get("anexos", []) if a.get("sid") == sid and a.get("org") == org]
     txt = "\n\n".join("[ANEXO: " + a.get("nome", "arquivo") + "]\n" + (a.get("texto") or "") for a in itens)
-    return txt[:6000], [a.get("nome", "arquivo") for a in itens]
+    # pasta local lida pelo Cerne Desktop (código de um projeto) precisa de muito mais espaço que um anexo comum
+    limite = 120000 if any(a.get("tipo") == "pasta" for a in itens) else 6000
+    return txt[:limite], [a.get("nome", "arquivo") for a in itens]
 
 
 def _anexo_loop():
@@ -611,7 +613,7 @@ def _sess_flush(force=False):
 # rotas públicas (sem sessão): shell da SPA (que exibe a tela de login), health e o próprio login
 _AUTH_PUBLIC = {"/", "/dashboard", "/health", "/auth/login", "/auth/me", "/favicon.ico", "/favicon.svg",
                 "/baixar", "/download/cerne-desktop", "/download/desktop-manifest",
-                "/ext/poll", "/ext/result", "/ext/hello", "/download/extensao",
+                "/ext/poll", "/ext/result", "/ext/hello", "/desktop/result", "/download/extensao",
                 "/desktop/poll", "/desktop/hello",
                 "/office/poll", "/office/result", "/office/hello", "/office/manifest.xml",
                 "/office/taskpane.html", "/office/taskpane.js", "/office/icon.png", "/download/office-manifest",
@@ -1425,9 +1427,9 @@ def health():
 
 
 # ---- Cerne Desktop (app instalável) ----
-_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.4.exe")
-_DESKTOP_VER = "1.0.4"
-_DESKTOP_SHA = "d25841420bdd3767727dfb131d94cc820bcc66f3dcb3972ee093e3d51e8d8695"
+_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.5.exe")
+_DESKTOP_VER = "1.0.5"
+_DESKTOP_SHA = "936bfe9510ceb1aa1165c72d87680185ca812576ca1879ad581033e80b5f6d3e"
 
 
 @app.get("/download/cerne-desktop")
@@ -4123,7 +4125,7 @@ def orgs_del(org: str):
 
 
 @app.post("/anexo")
-async def anexo_add(file: UploadFile = File(...), sid: str = ""):
+async def anexo_add(file: UploadFile = File(...), sid: str = "", tipo: str = ""):
     raw = await file.read()
     try:
         txt = extract_text(file.filename, raw)
@@ -4132,7 +4134,8 @@ async def anexo_add(file: UploadFile = File(...), sid: str = ""):
     masked = mask_pii(txt).get("masked_text", txt)   # anexo fica mascarado (soberano; seguro p/ externo)
     aid = uuid.uuid4().hex[:10]
     APPSTATE.setdefault("anexos", []).append({"id": aid, "org": _tenant(), "sid": sid,
-                                              "nome": file.filename, "texto": masked, "ts": time.time()})
+                                              "nome": file.filename, "texto": masked, "ts": time.time(),
+                                              "tipo": "pasta" if tipo == "pasta" else ""})
     _anexos_cleanup()
     _appstate_save(APPSTATE)
     _event("anexo de chat", f"{file.filename}")
@@ -4529,8 +4532,10 @@ AGENTE_TOOLS = {
     "acervo": "Busca no acervo (RAG + grafo, com fontes)",
     "web": "Rastrear/ler páginas da web (crawler)",
     "gerar_documento": "Gerar documento ou site",
-    "codigo": "Executar código + gerar Excel/Word/PPT (sandbox isolado)",
-    "navegador": "Operar o navegador do usuário (extensão Chrome/Edge)",
+    "codigo": "Executar código/terminal, instalar pacotes (pip/npm), testar + gerar Excel/Word/PPT (sandbox isolado)",
+    "navegador": "Operar o navegador do usuário (extensão Chrome/Edge): ver elementos, clicar, preencher, automações",
+    "computador": "Operar o computador do usuário via Cerne Desktop: pastas, arquivos, comandos e teclado (com permissão nativa)",
+    "github": "GitHub: clonar repositório, alterar, testar e abrir Pull Request (token do conector GitHub)",
     "office": "Operar Excel/Word/PPT abertos ao vivo (add-in Office.js)",
     "nuvem": "Enviar arquivos gerados ao OneDrive/SharePoint (Graph)",
     "comparar": "Comparar documentos e apontar diferenças/riscos",
@@ -4587,12 +4592,19 @@ def _mcp_custom():
     return APPSTATE.get("mcp_custom", [])
 
 
+# Conectores do catálogo com equivalente NATIVO no motor do Cerne: anexar o conector liga a ferramenta nativa.
+# Os demais só executam com o runtime NanoClaw (MCP via npx) — a UI marca isso para não parecer que funcionam.
+_MCP_NATIVO = {"github": "github", "playwright": "navegador", "puppeteer": "navegador", "desktop": "computador"}
+_NANOCLAW_ATIVO = bool(os.getenv("NANOCLAW_URL", "").strip())
+
+
 def _mcp_lib():
     """TIPOS de conector (templates/shapes): catálogo curado + tipos MCP custom do admin.
     Definem o formato (command/args + NOMES das credenciais). Não contêm credenciais."""
-    lib = {k: dict(v, id=k, tipo="catalogo") for k, v in MCP_CATALOGO.items()}
+    lib = {k: dict(v, id=k, tipo="catalogo", nativo=_MCP_NATIVO.get(k, ""),
+                   executa=bool(_MCP_NATIVO.get(k) or _NANOCLAW_ATIVO)) for k, v in MCP_CATALOGO.items()}
     for c in _mcp_custom():
-        lib[c["id"]] = dict(c, tipo="custom")
+        lib[c["id"]] = dict(c, tipo="custom", nativo="", executa=_NANOCLAW_ATIVO)
     return lib
 
 
@@ -5290,6 +5302,10 @@ def agentes_save(body: AgenteReq):
         raise HTTPException(status_code=400, detail="informe o nome do agente")
     perfil = body.perfil_minimo if body.perfil_minimo in _PERFIL_RANK else "colaborador"
     tools = [t for t in (body.ferramentas or []) if t in AGENTE_TOOLS]
+    for _iid in (body.mcp or []):                           # GitHub/Playwright/Desktop → ferramenta nativa equivalente
+        _nat = _MCP_NATIVO.get(((_conn_por_id(_iid) or {}).get("tipo")) or "")
+        if _nat and _nat not in tools:
+            tools.append(_nat)
     ids_ok = {c["id"] for c in _conn_instancias()}
     mcp = [m for m in (body.mcp or []) if m in ids_ok]      # agora são IDs de INSTÂNCIAS configuradas
     ags = _agentes()
@@ -5301,7 +5317,8 @@ def agentes_save(body: AgenteReq):
             "nome": body.nome.strip(), "descricao": (body.descricao or "").strip(),
             "persona": (body.persona or "").strip(), "skill_id": skill_id, "ferramentas": tools, "mcp": mcp,
             "colecao": (body.colecao or "").strip(), "modelo": body.modelo or "agent",
-            "perfil_minimo": perfil, "ativo": bool(body.ativo)}
+            "perfil_minimo": perfil, "ativo": bool(body.ativo),
+            "criado_por": (atual or {}).get("criado_por") or (_usuario_atual() or {}).get("id")}
     APPSTATE["agentes"] = [a for a in ags if a.get("id") != item["id"]] + [item]
     _appstate_save(APPSTATE)
     _event("agente " + ("atualizado" if atual else "criado"),
@@ -5467,7 +5484,7 @@ def _sb_write(run_id, nome, conteudo):
     if SANDBOX_URL:
         try:
             httpx.post(f"{SANDBOX_URL}/write", json={"workdir": run_id, "nome": nome, "conteudo": conteudo or ""}, timeout=15)
-            return f"(arquivo '{os.path.basename(nome or '')}' escrito no workspace)"
+            return f"(arquivo '{nome}' escrito no workspace)"
         except Exception as e:
             return f"(erro ao escrever: {str(e)[:100]})"
     p = os.path.join(_sb_localdir(run_id), os.path.basename(nome or "arquivo.txt"))
@@ -5490,10 +5507,121 @@ def _sb_read(run_id, nome):
         return f"(erro: {str(e)[:80]})"
 
 
+def _github_token():
+    """Token do GitHub da org: conector 'GitHub' configurado (cifrado) → env GITHUB_TOKEN."""
+    org = _tenant()
+    for inst in _conn_instancias():
+        if inst.get("tipo") == "github" and (inst.get("org") in (None, "", org)):
+            raw = ((inst.get("env") or {}).get("GITHUB_PERSONAL_ACCESS_TOKEN") or "").strip()
+            if raw:
+                try:
+                    return _dec(raw)
+                except Exception:
+                    pass
+    return os.getenv("GITHUB_TOKEN", "").strip()
+
+
+def _gh_headers(token):
+    h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cerne-agente"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+_GH_RUN = {}                                               # workdir -> {owner, repo, base}
+
+
+def _gh_repo(txt):
+    m = re.search(r"(?:github\.com[/:])?([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/#?].*)?$", (txt or "").strip())
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _github_tool(call, workdir):
+    import base64 as _b64
+    acao = (call.get("acao") or "status").lower()
+    token = _github_token()
+    H = _gh_headers(token)
+    api = "https://api.github.com"
+    if acao == "clonar":
+        owner, repo = _gh_repo(call.get("repo") or "")
+        if not owner:
+            return "(informe o repositório: https://github.com/dono/repo ou dono/repo)"
+        info = httpx.get(f"{api}/repos/{owner}/{repo}", headers=H, timeout=30)
+        if info.status_code != 200:
+            return (f"(GitHub {info.status_code}: não achei {owner}/{repo}"
+                    + ("" if token else " — repositório privado exige o conector GitHub com token") + ")")
+        base = call.get("ref") or info.json().get("default_branch") or "main"
+        tb = httpx.get(f"{api}/repos/{owner}/{repo}/tarball/{base}", headers=H, timeout=180, follow_redirects=True)
+        if tb.status_code != 200:
+            return f"(falha ao baixar {owner}/{repo}@{base}: HTTP {tb.status_code})"
+        if len(tb.content) > 80 * 1024 * 1024:
+            return "(repositório grande demais para o sandbox (>80MB compactado))"
+        r = httpx.post(f"{SANDBOX_URL}/extract", json={"workdir": workdir, "dest": "repo",
+                       "b64": _b64.b64encode(tb.content).decode()}, timeout=240).json()
+        if r.get("erro"):
+            return f"(falha ao extrair no sandbox: {r['erro']})"
+        _GH_RUN[workdir] = {"owner": owner, "repo": repo, "base": base}
+        return (f"(clonado {owner}/{repo}@{base} em ./repo — {r.get('arquivos', '?')} arquivos. Use terminal "
+                f"(cd repo && ...) para instalar dependências e rodar testes; 'status' mostra o que mudou.)")
+    st = _GH_RUN.get(workdir)
+    if not st:
+        return "(nenhum repositório clonado nesta execução — use acao 'clonar' primeiro)"
+    ch = httpx.post(f"{SANDBOX_URL}/git_changes", json={"workdir": workdir, "dir": "repo",
+                    "conteudo": acao == "abrir_pr"}, timeout=120).json()
+    if ch.get("erro"):
+        return f"(falha ao listar alterações: {ch['erro']})"
+    mud = ch.get("mudancas") or []
+    if acao == "status":
+        return "(sem alterações)" if not mud else "Alterações:\n" + "\n".join(
+            f"{'removido' if m.get('removido') else 'alterado/novo'}: {m['caminho']}" for m in mud[:200])
+    if acao != "abrir_pr":
+        return "(ação inválida: use clonar | status | abrir_pr)"
+    if not token:
+        return "(para abrir PR configure o conector GitHub (token com permissão de escrita no repositório) em Agentes → Ferramentas)"
+    if not mud:
+        return "(nada a enviar: nenhuma alteração no repositório)"
+    owner, repo, base = st["owner"], st["repo"], st["base"]
+    branch = re.sub(r"[^\w./-]+", "-", (call.get("branch") or f"cerne/{uuid.uuid4().hex[:8]}").strip())[:100]
+    titulo = (call.get("titulo") or "Alterações propostas pelo agente do Cerne")[:200]
+    corpo = (call.get("descricao") or "") + "\n\n— aberto por um agente do Cerne"
+    try:
+        ref = httpx.get(f"{api}/repos/{owner}/{repo}/git/ref/heads/{base}", headers=H, timeout=30); ref.raise_for_status()
+        base_sha = ref.json()["object"]["sha"]
+        cm = httpx.get(f"{api}/repos/{owner}/{repo}/git/commits/{base_sha}", headers=H, timeout=30); cm.raise_for_status()
+        arvore = []
+        for m in mud[:300]:
+            if m.get("removido"):
+                arvore.append({"path": m["caminho"], "mode": "100644", "type": "blob", "sha": None})
+                continue
+            bl = httpx.post(f"{api}/repos/{owner}/{repo}/git/blobs", headers=H, timeout=60,
+                            json={"content": m.get("b64") or "", "encoding": "base64"}); bl.raise_for_status()
+            arvore.append({"path": m["caminho"], "mode": m.get("modo") or "100644", "type": "blob", "sha": bl.json()["sha"]})
+        tr = httpx.post(f"{api}/repos/{owner}/{repo}/git/trees", headers=H, timeout=60,
+                        json={"base_tree": cm.json()["tree"]["sha"], "tree": arvore}); tr.raise_for_status()
+        nc = httpx.post(f"{api}/repos/{owner}/{repo}/git/commits", headers=H, timeout=60,
+                        json={"message": titulo, "tree": tr.json()["sha"], "parents": [base_sha]}); nc.raise_for_status()
+        nr = httpx.post(f"{api}/repos/{owner}/{repo}/git/refs", headers=H, timeout=30,
+                        json={"ref": f"refs/heads/{branch}", "sha": nc.json()["sha"]}); nr.raise_for_status()
+        pr = httpx.post(f"{api}/repos/{owner}/{repo}/pulls", headers=H, timeout=30,
+                        json={"title": titulo, "head": branch, "base": base, "body": corpo}); pr.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        det = ""
+        try:
+            det = e.response.json().get("message", "")
+        except Exception:
+            pass
+        return (f"(GitHub recusou: HTTP {e.response.status_code} {det} — o token precisa de permissão de escrita "
+                f"(contents + pull requests) em {owner}/{repo})")
+    url = pr.json().get("html_url")
+    _event("PR aberto por agente", f"{owner}/{repo} · {branch} · {len(mud)} arquivo(s)")
+    return f"(PR aberto: {url} — branch {branch} → {base}, {len(mud)} arquivo(s))"
+
+
 def _sb_reset(run_id):
     if SANDBOX_URL:
         try:
             httpx.post(f"{SANDBOX_URL}/reset", json={"workdir": run_id}, timeout=10)
+            _GH_RUN.pop(run_id, None)
         except Exception:
             pass
     else:
@@ -5780,7 +5908,8 @@ def _ext_channel(uid):
         ch = _EXT_CH.get(uid)
         if not ch:
             ch = {"q": queue.Queue(), "res": {}, "ev": {}, "last_hello": 0.0, "info": {},
-                  "desktop_q": queue.Queue(), "desktop_hello": 0.0, "office": {}}
+                  "desktop_q": queue.Queue(), "desktop_hello": 0.0, "office": {},
+                  "dres": {}, "dev": {}, "desktop_ver": ""}
             _EXT_CH[uid] = ch
         return ch
 
@@ -5869,6 +5998,45 @@ def _browser_exec(uid, cmd, timeout=45):
     return (res or {}) if isinstance(res, dict) else {"erro": "resposta vazia"}
 
 
+_DESKTOP_ACOES = ("listar", "ler", "gravar", "rodar", "digitar", "tecla", "abrir")
+
+
+def _desktop_exec(uid, cmd, timeout=150):
+    """Envia uma ação ao Cerne Desktop do usuário e espera o resultado (o desktop pede permissão NATIVA)."""
+    ch = _ext_channel(uid)
+    cid = uuid.uuid4().hex[:10]
+    ev = threading.Event(); ch["dev"][cid] = ev
+    ch["desktop_q"].put(dict(cmd, id=cid))
+    if not ev.wait(timeout):
+        ch["dev"].pop(cid, None)
+        return {"erro": "sem resposta do Cerne Desktop (o usuário não respondeu à permissão, ou o app está desatualizado — "
+                        "bandeja → Verificar atualização)"}
+    res = ch["dres"].pop(cid, None); ch["dev"].pop(cid, None)
+    return res if isinstance(res, dict) else {"erro": "resposta vazia"}
+
+
+def _computador_exec_atual(call):
+    """Ferramenta 'computador': opera o PC do usuário pelo Cerne Desktop pareado. Cada pasta/comando/digitação
+    passa por um diálogo nativo de permissão no próprio computador — o servidor nunca age sozinho."""
+    u = _usuario_atual()
+    if not u:
+        return "(sem usuário na execução — computador indisponível)"
+    uid = u.get("id")
+    if not _desktop_conectado(uid):
+        return ("(o Cerne Desktop do usuário NÃO está conectado. Abra o Cerne Desktop e pareie em bandeja → "
+                "'Conectar navegador…' com o código de Agentes → Navegador do usuário.)")
+    acao = (call.get("acao") or "listar").lower()
+    if acao not in _DESKTOP_ACOES:
+        return f"(ação '{acao}' inválida; use: {', '.join(_DESKTOP_ACOES)})"
+    cmd = {"acao": "computador", "op": acao, "caminho": call.get("caminho") or "", "conteudo": call.get("conteudo"),
+           "programa": call.get("programa") or "", "args": [str(x) for x in (call.get("args") or [])][:40],
+           "texto": call.get("texto") or "", "tecla": call.get("tecla") or "", "pasta": call.get("pasta") or ""}
+    r = _desktop_exec(uid, cmd)
+    if r.get("erro"):
+        return f"(computador: {r['erro']})"
+    return json.dumps(r, ensure_ascii=False)[:4000]
+
+
 def _browser_exec_atual(call):
     """Usado pelo loop do agente: opera o navegador do usuário logado e resume o resultado p/ o raciocínio."""
     u = _usuario_atual()
@@ -5888,11 +6056,21 @@ def _browser_exec_atual(call):
                     "Agentes → Navegador do usuário; com o Cerne Desktop aberto, o navegador é iniciado automaticamente. "
                     "Enquanto isso, é possível usar a ferramenta web/código.)")
     cmd = {"acao": (call.get("acao") or "ler"), "url": call.get("url"), "seletor": call.get("seletor"),
-           "valor": call.get("valor"), "termo": call.get("termo"), "rotulo": "Cerne (agente) operando este navegador"}
+           "valor": call.get("valor"), "termo": call.get("termo"), "texto": call.get("texto"),
+           "tecla": call.get("tecla"), "direcao": call.get("direcao"), "ms": call.get("ms"),
+           "rotulo": "Cerne (agente) operando este navegador"}
     r = _browser_exec(uid, cmd)
     if isinstance(r, dict):
         if r.get("erro"):
             return f"(navegador: {r['erro']})"
+        if "elementos" in r:                               # mapa: lista compacta de elementos interativos
+            linhas = [f"[{r.get('titulo', '')}] {r.get('url', '')}"]
+            for e in r.get("elementos") or []:
+                linhas.append(f"{e.get('sel')} · {e.get('tipo')} · {(e.get('rotulo') or '')[:80]}"
+                              + (f" = {e.get('valor')[:40]}" if e.get("valor") else ""))
+            if r.get("texto"):
+                linhas.append("--- texto ---\n" + (r.get("texto") or "")[:1200])
+            return "\n".join(linhas)[:5000]
         if "texto" in r:
             return f"[{r.get('titulo', '')}] {r.get('url', '')}\n{(r.get('texto') or '')[:2500]}"
         return json.dumps(r, ensure_ascii=False)[:1500]
@@ -5997,8 +6175,25 @@ async def desktop_hello(request: Request):
     m = _ext_tokens().get(tok)
     if not m:
         raise HTTPException(status_code=401, detail="código de pareamento inválido")
-    _ext_channel(m["user_id"])["desktop_hello"] = time.time()
+    ch = _ext_channel(m["user_id"]); ch["desktop_hello"] = time.time()
+    ch["desktop_ver"] = (await _ext_body(request)).get("versao") or ch.get("desktop_ver") or ""
     return {"ok": True, "usuario": m.get("nome")}
+
+
+@app.post("/desktop/result")
+async def desktop_result(request: Request):
+    tok = request.headers.get("x-ext-token", "")
+    m = _ext_tokens().get(tok)
+    if not m:
+        raise HTTPException(status_code=401, detail="código de pareamento inválido")
+    body = await _ext_body(request)
+    cid = body.get("id"); ch = _ext_channel(m["user_id"])
+    if cid:
+        ch["dres"][cid] = body.get("resultado") or {}
+        ev = ch["dev"].get(cid)
+        if ev:
+            ev.set()
+    return {"ok": True}
 
 
 @app.post("/desktop/poll")
@@ -6396,7 +6591,26 @@ def _sub_agente(papel, tarefa):
         return f"(sub-agente falhou: {str(e)[:120]})"
 
 
-def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
+def _precisa_workdir(ferramentas):
+    return "codigo" in (ferramentas or []) or "github" in (ferramentas or [])
+
+
+def _loop_model(modelo_cfg, permitidos):
+    """Quem DECIDE as ferramentas: o modelo externo do agente (com PII mascarada) quando permitido —
+    modelos locais pequenos erram muito em automações longas; senão o local soberano."""
+    m = str(modelo_cfg or "")
+    return _resolve_provider(m, "") if (m.startswith("ext-") and m in (permitidos or [])) else None
+
+
+def _rel_seguro(nome):
+    n = (nome or "").replace("\\", "/").strip().lstrip("/")
+    partes = [p for p in n.split("/") if p not in ("", ".")]
+    if not partes or any(p == ".." for p in partes):
+        return None
+    return "/".join(partes)
+
+
+def _agente_loop_gen(task, tools, colls, model, workdir, hint="", loop_model=None):
     """Loop agêntico SOBERANO como GERADOR: decide e EXECUTA ferramentas de verdade
     (acervo/web/planilha/documento/apresentacao/codigo/arquivo/navegador/sub_agente). Yield ('step', txt) a cada
     ação p/ streaming; termina com ('result', {evid, fontes, usadas, arquivos}). Fecha o gap vs Codex/Cowork."""
@@ -6405,15 +6619,20 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
         disp.append('acervo — {"ferramenta":"acervo","consulta":"..."}')
     if "web" in tools and _org().get("busca_web"):
         disp.append('web — {"ferramenta":"web","consulta":"..."}')
-    code_on = "codigo" in tools and _AGENT_CODE_EXEC
+    code_on = ("codigo" in tools or "github" in tools) and _AGENT_CODE_EXEC
     if code_on:
         disp.append('planilha (GERA um .xlsx REAL) — {"ferramenta":"planilha","nome":"vendas.xlsx","abas":[{"nome":"Vendas","colunas":["Produto","Qtd","Preço"],"linhas":[["Cadeira",12,150]],"totais":{"Qtd":"soma","Preço":"soma"}}]}')
         disp.append('documento (GERA um .docx REAL) — {"ferramenta":"documento","nome":"relatorio.docx","titulo":"Título","secoes":[{"titulo":"Seção","paragrafos":["texto..."],"tabela":{"colunas":["A","B"],"linhas":[[1,2]]}}]}')
         disp.append('apresentacao (GERA um .pptx REAL) — {"ferramenta":"apresentacao","nome":"deck.pptx","titulo":"Título","subtitulo":"...","slides":[{"titulo":"Slide","topicos":["ponto 1","ponto 2"]}]}')
         disp.append('codigo (Python/bash avançado no workspace isolado, p/ cálculos/análises) — {"ferramenta":"codigo","linguagem":"python","codigo":"..."}')
-        disp.append('arquivo — {"ferramenta":"arquivo","acao":"escrever|ler","nome":"x.txt","conteudo":"..."}')
+        disp.append('terminal (bash no workspace isolado COM internet: instale o que precisar — pip install X, npm install X —, rode testes — python -m pytest -q —, git; repita até passar) — {"ferramenta":"terminal","comando":"pip install requests && python -m pytest -q","timeout":180}')
+        disp.append('arquivo (ler/escrever arquivo do workspace; aceita subpastas) — {"ferramenta":"arquivo","acao":"escrever|ler","nome":"src/app.py","conteudo":"..."}')
+    if "github" in tools and workdir and _AGENT_CODE_EXEC:
+        disp.append('github — clonar: {"ferramenta":"github","acao":"clonar","repo":"https://github.com/dono/repo","ref":"main"} (fica em ./repo; depois use terminal/arquivo p/ alterar e testar) · ver alterações: {"ferramenta":"github","acao":"status"} · abrir PR: {"ferramenta":"github","acao":"abrir_pr","titulo":"...","descricao":"...","branch":"cerne/minha-mudanca"}')
     if "navegador" in tools:
-        disp.append('navegador (opera o navegador do usuário: abrir/ler/clicar/preencher/baixar) — {"ferramenta":"navegador","acao":"abrir|ler|clicar|preencher|baixar|links","url":"...","seletor":"...","valor":"..."}')
+        disp.append('navegador (opera o navegador REAL do usuário) — {"ferramenta":"navegador","acao":"...","url":"...","seletor":"...","valor":"...","texto":"..."}. Ações: abrir(url) · mapa (lista campos/botões/links com SELETORES prontos — use antes de clicar/preencher) · ler · clicar(seletor) · clicar_texto(texto do botão/link) · preencher(seletor,valor) · selecionar(seletor,valor da opção) · tecla(tecla: Enter|Tab|Escape|ArrowDown, seletor opcional) · rolar(direcao: baixo|cima) · esperar_elemento(seletor) · voltar · links(termo) · baixar(url) · screenshot')
+    if "computador" in tools:
+        disp.append('computador (PC do usuário via Cerne Desktop; cada ação pede permissão a ele) — {"ferramenta":"computador","acao":"listar|ler|gravar|rodar|digitar|tecla|abrir","caminho":"C:/pasta/arq.txt","conteudo":"...","programa":"python","args":["script.py"],"pasta":"C:/projeto","texto":"...","tecla":"enter"}')
     if "office" in tools:
         disp.append('office (opera o Excel/Word/PPT ABERTO ao vivo) — {"ferramenta":"office","app":"excel|word|ppt","acao":"...","celula":"B2","valor":"...","intervalo":"A1:C3","valores":[[...]],"formula":"=SUM(...)","texto":"...","titulo":"...","topicos":["..."]}. Ações Excel: ler_selecao/escrever_celula/escrever_intervalo/ler_intervalo/formula/adicionar_linha/nova_aba/ler_planilha; Word: ler_documento/ler_selecao/inserir_texto/substituir_selecao/adicionar_paragrafo/adicionar_titulo; PPT: ler_slides/adicionar_slide/inserir_texto.')
     if "nuvem" in tools:
@@ -6423,12 +6642,19 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
     if code_on:
         regras = ('\nREGRA: se o pedido é ENTREGAR uma planilha, documento ou apresentação, use planilha/documento/'
                   'apresentacao com os DADOS reais preenchidos — NÃO apenas descreva, GERE o arquivo. Nunca use '
-                  'sub_agente para produzir arquivos.')
+                  'sub_agente para produzir arquivos.'
+                  '\nREGRA DE CÓDIGO: crie/edite arquivos com a ferramenta arquivo (nome com subpastas); rode os testes '
+                  'com o comando PADRÃO (python -m pytest -q, npm test) sem inventar opções; LEIA o erro e corrija o '
+                  'CÓDIGO ou instale o pacote que faltar; nunca repita um comando que já falhou do mesmo jeito.')
     ctx = (f"\nContexto do agente: {hint[:500]}" if hint else "")
+    max_passos = 25 if any(t in tools for t in ("navegador", "computador", "github", "codigo")) else 8
     sysp = ("Você é um agente que USA ferramentas antes de responder. Para chamar uma, responda SOMENTE com uma "
             "linha JSON (sem texto em volta). Ferramentas:\n- " + "\n- ".join(disp) + regras + ctx +
-            '\nQuando já tiver o necessário, responda {"ferramenta":"pronto"}. No máximo 5 chamadas, sem repetir.')
+            f'\nQuando já tiver o necessário, responda {{"ferramenta":"pronto"}}. Até {max_passos} chamadas: pode repetir '
+            'ferramentas (vários cliques, instalar → testar → corrigir → testar). Em automações de navegador, use "mapa" '
+            'para descobrir os seletores antes de clicar/preencher e confira o resultado depois.')
     msgs = [{"role": "user", "content": task}]
+    mapa_pii = {}
     evid, fontes, usadas, arquivos = [], [], [], []
     decidiu = False
 
@@ -6480,14 +6706,40 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             yield ("result", {"evid": "\n\n".join(evid), "fontes": fontes, "usadas": usadas, "arquivos": arquivos})
             return
 
-    for _ in range(5):
+    ultimas = []
+    ultimo_res, repet_res = None, 0
+    nao_validado, cobrou_validacao = False, False
+    t_inicio, max_segundos = time.time(), int(os.getenv("AGENT_MAX_SECONDS", "600"))
+    for _ in range(max_passos):
+        janela = msgs[:1] + msgs[-16:] if len(msgs) > 17 else msgs     # mantém o pedido + o histórico recente
         try:
-            raw = _strip_think(chat_model(model, [{"role": "system", "content": sysp}] + msgs, max_tokens=1400) or "")
+            if loop_model:                                  # externo: PII mascarada na ida, restaurada na volta
+                mm, mapa_pii = _mask_conv([{"role": "system", "content": sysp}] + janela, mapa_pii)
+                raw = demask(_strip_think(chat_model(loop_model, mm, max_tokens=4000) or ""), mapa_pii)
+            else:
+                raw = _strip_think(chat_model(model, [{"role": "system", "content": sysp}] + janela, max_tokens=2400) or "")
         except Exception:
+            if loop_model:                                  # provedor externo falhou → segue no local soberano
+                loop_model = None
+                continue
             break
         call = _parse_tool_call(raw)
         if call:
+            assinatura = json.dumps(call, sort_keys=True, ensure_ascii=False)
+            ultimas = (ultimas + [assinatura])[-3:]
+            if len(ultimas) == 3 and len(set(ultimas)) == 1:   # mesma chamada 3x seguidas → travou
+                yield ("step", "⚠️ o agente repetiu a mesma ação 3 vezes — encerrando o loop")
+                break
+        if call:
             decidiu = True
+        if call and call.get("ferramenta") == "pronto" and nao_validado and not cobrou_validacao \
+                and re.search(r"test|rod[ae]|execut|valid|funcion", task or "", re.I):
+            cobrou_validacao = True                         # alterou arquivos e não rodou depois → cobra 1 vez
+            yield ("step", "🔁 ainda não validou as últimas alterações — pedindo para rodar antes de finalizar")
+            msgs.append({"role": "assistant", "content": raw})
+            msgs.append({"role": "user", "content": "Você alterou arquivos e NÃO executou/testou depois disso. Rode os "
+                         "testes (ou execute o código) com a ferramenta terminal e só finalize se passarem."})
+            continue
         if not call or call.get("ferramenta") == "pronto":
             break
         nome = call.get("ferramenta")
@@ -6522,6 +6774,22 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             acao = (call.get("acao") or "ler")
             yield ("step", f"🧭 navegador: {acao} {(call.get('url') or call.get('seletor') or '')[:50]}")
             res = _browser_exec_atual(call); usadas.append("navegador")
+        elif nome == "computador" and "computador" in tools:
+            yield ("step", f"🖥️ computador: {(call.get('acao') or '')} {(call.get('caminho') or call.get('programa') or call.get('tecla') or '')[:50]}")
+            res = _computador_exec_atual(call); usadas.append("computador")
+        elif nome == "terminal" and workdir and _AGENT_CODE_EXEC:
+            cmd_t = (call.get("comando") or "")[:20000]
+            yield ("step", f"⌨️ terminal: {cmd_t.splitlines()[0][:70] if cmd_t else ''}")
+            try:
+                to = min(max(int(call.get("timeout") or 120), 5), 600)
+            except Exception:
+                to = 120
+            res = _sandbox_exec(cmd_t, "bash", workdir, timeout=to); usadas.append("terminal")
+            nao_validado = False
+        elif nome == "github" and "github" in tools and workdir and _AGENT_CODE_EXEC:
+            acao = (call.get("acao") or "status")
+            yield ("step", f"🐙 github: {acao} {(call.get('repo') or call.get('titulo') or '')[:50]}")
+            res = _github_tool(call, workdir); usadas.append("github")
         elif nome == "office" and "office" in tools:
             app_ = (call.get("app") or ""); acao = (call.get("acao") or "ler")
             emoji = {"excel": "📊", "word": "📄", "ppt": "📽️"}.get(app_, "🗂️")
@@ -6535,10 +6803,11 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             yield ("step", f"💻 executando código ({lang})")
             res = _sandbox_exec(call.get("codigo", ""), lang, workdir); usadas.append("codigo")
         elif nome == "arquivo" and workdir:
-            acao = call.get("acao", "ler"); nomearq = os.path.basename(call.get("nome", "arquivo.txt") or "arquivo.txt")
+            acao = call.get("acao", "ler"); nomearq = _rel_seguro(call.get("nome") or "") or "arquivo.txt"
             if acao == "escrever":
                 yield ("step", f"📝 escreveu arquivo {nomearq}")
                 res = _sb_write(workdir, nomearq, call.get("conteudo", "")); arquivos.append(nomearq)
+                nao_validado = True
             else:
                 yield ("step", f"📄 leu arquivo {nomearq}")
                 res = _sb_read(workdir, nomearq)
@@ -6548,7 +6817,20 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             res = _sub_agente(papel, call.get("tarefa") or task); usadas.append("sub_agente")
         evid.append(f"[{nome}]\n{res[:1500]}")
         msgs.append({"role": "assistant", "content": raw})
-        msgs.append({"role": "user", "content": f"Resultado:\n{res[:1500]}\n\nUse outra ferramenta ou responda {{\"ferramenta\":\"pronto\"}}."})
+        # mesmo RESULTADO (ex.: o mesmo erro) seguidas vezes → avisa para mudar de estratégia; na 3ª, encerra
+        _sig_res = (nome or "") + "|" + re.sub(r"/work/\w+|\d+(\.\d+)?s\b", "", (res or "")[-600:])
+        _falhou = bool(re.search(r"erro|error|falha|traceback|não achei|retorno [1-9]|exception", (res or "")[-600:], re.I))
+        repet_res = (repet_res + 1) if (_falhou and _sig_res == ultimo_res) else 0
+        ultimo_res = _sig_res
+        if repet_res >= 2:
+            yield ("step", "⚠️ o mesmo resultado se repetiu 3 vezes — encerrando para não gastar à toa")
+            break
+        aviso = ("\n\nATENÇÃO: este é EXATAMENTE o mesmo resultado da tentativa anterior. Mude de estratégia "
+                 "(corrija o código, use outro comando ou outra abordagem) — não repita." if repet_res == 1 else "")
+        if time.time() - t_inicio > max_segundos:
+            yield ("step", f"⏱️ limite de {max_segundos // 60} min do agente atingido — encerrando com o que já foi feito")
+            break
+        msgs.append({"role": "user", "content": f"Resultado:\n{res[:5000]}{aviso}\n\nUse outra ferramenta ou responda {{\"ferramenta\":\"pronto\"}}."})
     if not usadas and not decidiu:                         # modelo local fraco não decidiu -> executa 1x direto
         if "web" in tools and _org().get("busca_web"):
             yield ("step", "🌐 buscando na web")
@@ -6673,15 +6955,16 @@ def agentes_run(aid: str, body: AgenteRunReq):
         persona += "\n\nFerramentas declaradas: " + ", ".join(AGENTE_TOOLS.get(t, t) for t in a["ferramentas"]) + "."
     if a.get("mcp"):
         nomes = [(_conn_por_id(m) or {}).get("nome", m) for m in a["mcp"]]
-        persona += "\n\nConectores disponíveis: " + ", ".join(nomes) + " — executados pelo runtime NanoClaw."
+        persona += "\n\nConectores anexados: " + ", ".join(nomes) + "."
     modelo_cfg = a.get("modelo") or "agent"
     permitidos = _ext_permitidos(_org())
     ferramentas = a.get("ferramentas") or []
     # LOOP REAL DE FERRAMENTAS (soberano): o agente decide e EXECUTA acervo/web/código/arquivo/sub-agente.
-    workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+    workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
     steps, loop, artefatos = [], {"evid": "", "fontes": [], "usadas": [], "arquivos": []}, []
     try:
-        for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona):
+        for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona,
+                                          loop_model=_loop_model(modelo_cfg, permitidos)):
             if kind == "step":
                 steps.append(val)
             else:
@@ -6744,10 +7027,11 @@ def agentes_run_stream(aid: str, body: AgenteRunReq):
             permitidos = _ext_permitidos(_org())
             ferramentas = a.get("ferramentas") or []
             yield "[[STEP]]interpretando o pedido"
-            workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+            workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
             loop, artefatos = {"evid": "", "fontes": [], "usadas": [], "arquivos": []}, []
             try:
-                for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona):
+                for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona,
+                                                  loop_model=_loop_model(modelo_cfg, permitidos)):
                     if kind == "step":
                         yield "[[STEP]]" + val
                     else:
@@ -6808,11 +7092,12 @@ def _agente_exec_headless(a, instrucao, origem="agendado"):
     modelo_cfg = a.get("modelo") or "agent"
     permitidos = _ext_permitidos(_org())
     ferramentas = a.get("ferramentas") or []
-    workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+    workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
     sess = _session("sched-" + a["id"])
     loop = {"evid": "", "fontes": [], "usadas": [], "arquivos": []}; artefatos = []
     try:
-        for kind, val in _agente_loop_gen(instrucao, ferramentas, colls, "chat", workdir, hint=persona):
+        for kind, val in _agente_loop_gen(instrucao, ferramentas, colls, "chat", workdir, hint=persona,
+                                          loop_model=_loop_model(modelo_cfg, permitidos)):
             if kind == "result":
                 loop = val
         ans, pii, fontes_ans, soberano, rebaixado = _agente_answer(a, instrucao, persona, colls,
@@ -6834,6 +7119,21 @@ def _sched_registrar_run(s, gatilho, ok, resumo, artefatos):
     s["ultima_exec"] = time.strftime("%Y-%m-%dT%H:%M:%S"); s["ultima_status"] = "ok" if ok else "erro"
 
 
+def _sched_usuario(s, a):
+    """Usuário em nome de quem o agendamento roda: quem criou o agendamento → quem criou o agente →
+    (legado, sem dono) único usuário da org com navegador/desktop pareado."""
+    for uid in (s.get("criado_por"), a.get("criado_por")):
+        u = _usuario_por_id(uid) if uid else None
+        if u:
+            return u
+    org = s.get("org") or DEFAULT_ORG
+    uids = {m.get("user_id") for m in _ext_tokens().values() if (m.get("org") or DEFAULT_ORG) == org}
+    uids.discard(None)
+    if len(uids) == 1:
+        return _usuario_por_id(next(iter(uids)))
+    return None
+
+
 def _sched_disparar(s, gatilho, instrucao_extra=""):
     a = _agente_por_id(s.get("agente_id"))
     if not a:
@@ -6843,6 +7143,7 @@ def _sched_disparar(s, gatilho, instrucao_extra=""):
         instr = (instr + "\n\n" + instrucao_extra).strip() if instr else instrucao_extra
     try:
         _ORG_CTX.set(s.get("org") or DEFAULT_ORG)
+        _USER_CTX.set(_sched_usuario(s, a))                   # sem isso, navegador/computador ficam indisponíveis
         ans, arts, usadas, sob = _agente_exec_headless(a, instr or "Execute a tarefa configurada.")
         _sched_registrar_run(s, gatilho, True, ans, arts)
         _event("agente agendado", f"{a['nome']} · {gatilho} · {'+'.join(usadas) or 'sem ferramentas'}"
@@ -7207,6 +7508,8 @@ def agendamentos_save(body: SchedReq):
     item = atual or {"id": "sch" + uuid.uuid4().hex[:10], "org": _tenant(), "runs": []}
     item.update({"agente_id": body.agente_id, "nome": (body.nome or "").strip(),
                  "instrucao": (body.instrucao or "").strip(), "ativo": bool(body.ativo)})
+    if not item.get("criado_por"):
+        item["criado_por"] = (_usuario_atual() or {}).get("id")
     novos = _sched_norm_triggers(body.triggers)
     # preserva o estado interno (_ultima, _vistos, _last_uid…) dos gatilhos que continuam iguais, por índice/tipo
     antigos = (atual or {}).get("triggers") or []
@@ -10431,6 +10734,7 @@ class CodigoReq(BaseModel):
     instrucao: str
     colecao: str = COLLECTION
     colecoes: list | None = None
+    sid: str = ""                                    # anexos da conversa (ex.: pasta local lida pelo Cerne Desktop)
 
 
 @app.post("/codigo")
@@ -10464,6 +10768,9 @@ def codigo(body: CodigoReq):
                 "CODIGO:\n```python\n<código completo>\n```\n"
                 "(troque 'python' pela linguagem real que você usou)")
     base = (f"Contexto do acervo (use como referência técnica se ajudar):\n{ctx}\n\n" if ctx else "")
+    axtxt, _axn = _anexos_texto(body.sid)
+    if axtxt:                                        # código do projeto anexado na conversa = base real do pedido
+        base = "[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n" + base
     try:
         if prov:
             mq, mapping = mask_reversible(instr)
@@ -12470,7 +12777,7 @@ async function navUnpair(){if(!confirm('Desparear o navegador? A extensão perde
 let AGMCP=new Set(),MCPFCAT='';
 // ---- card por TIPO: mostra quantas CONTAS existem e quantas estão anexadas a este agente ----
 function mcpTypeCard(m){const insts=INSTS.filter(i=>i.tipo===m.id);const anex=insts.filter(i=>AGMCP.has(i.id)).length;
- return `<button type="button" class="mcpcard${anex?' on':''}" data-tipo="${m.id}" data-cat="${escq(m.cat||'Outros')}" data-name="${escq((m.nome+' '+(m.acoes||'')+' '+(m.cat||'')).toLowerCase())}" onclick="mcpTypeOpen('${m.id}')" title="${escq(m.acoes||'')}">${anex?`<span class="mcpbadge">${anex}</span>`:''}<div class="mcphd"><span class="mcpico">${m.icon||'🔌'}</span><span class="mcpnm">${esc(m.nome)}</span></div><div class="mcpdesc">${esc(m.acoes||'ferramenta de ação via MCP')}</div><div class="mcpfoot"><span class="mcptag">${m.tipo==='custom'?'★ custom':esc(m.cat||'Outros')}</span><span class="mcpcred">${insts.length?insts.length+' conta(s)':'configurar'}</span></div></button>`;}
+ return `<button type="button" class="mcpcard${anex?' on':''}" data-tipo="${m.id}" data-cat="${escq(m.cat||'Outros')}" data-name="${escq((m.nome+' '+(m.acoes||'')+' '+(m.cat||'')).toLowerCase())}" onclick="mcpTypeOpen('${m.id}')" title="${escq(m.acoes||'')}">${anex?`<span class="mcpbadge">${anex}</span>`:''}<div class="mcphd"><span class="mcpico">${m.icon||'🔌'}</span><span class="mcpnm">${esc(m.nome)}</span></div><div class="mcpdesc">${esc(m.acoes||'ferramenta de ação via MCP')}</div><div class="mcpfoot"><span class="mcptag">${m.tipo==='custom'?'★ custom':esc(m.cat||'Outros')}</span>${m.nativo?'<span class="mcptag" style="color:var(--cyan)" title="executa no motor do Cerne">⚡ nativo</span>':(m.executa===false?'<span class="mcptag" style="opacity:.7" title="só executa com o runtime NanoClaw ativo">⏸ requer runtime</span>':'')}<span class="mcpcred">${insts.length?insts.length+' conta(s)':'configurar'}</span></div></button>`;}
 function mcpTypeRefresh(){const g=document.getElementById('mcpgrid');if(!g)return;g.innerHTML=Object.values(MCPLIB).map(mcpTypeCard).join('');mcpApplyFilter();}
 function mcpFilter(btn,cat){MCPFCAT=cat;document.querySelectorAll('.mcpfchip').forEach(c=>c.classList.toggle('on',c===btn));mcpApplyFilter();}
 function mcpApplyFilter(){const qi=document.getElementById('mcpq');const q=(qi?qi.value:'').trim().toLowerCase();let shown=0;document.querySelectorAll('.mcpcard').forEach(el=>{const okc=!MCPFCAT||el.dataset.cat===MCPFCAT;const okq=!q||(el.dataset.name||'').indexOf(q)>=0;const vis=okc&&okq;el.style.display=vis?'':'none';if(vis)shown++;});const g=document.getElementById('mcpgrid');if(!g)return;let e=document.getElementById('mcpempty');if(!shown){if(!e){e=document.createElement('div');e.id='mcpempty';e.className='mcpempty';e.textContent='nenhum conector encontrado';g.appendChild(e);}}else if(e){e.remove();}}
@@ -12811,7 +13118,28 @@ async function streamLocal(th,msg){const bub=th.querySelector('.bub');bub.innerH
  const sealB='<div class="trace" style="margin-bottom:3px">'+provSeal('local')+'</div>';
  renderAns(bub,ans||'(sem resposta)',sealB+orqB+cacheB+stepsHtml,WS.task||'Resultado');if(meta.fontes)showSources(meta.fontes);}
 function detectIntent(m){m=(m||'').toLowerCase();const gen=/(ger[ea]r?|cri[ea]r?|fa[çc]a|elabor|redij|monte|escrev|desenh|prepar)/;const site=/(site|p[aá]gina|landing|portal|html|web ?site)/;const doc=/(documento|relat[oó]rio|resumo|contrato|memorando|of[ií]cio|minuta|parecer|ata|planilha|carta|proposta|laudo)/;if(gen.test(m)&&site.test(m))return 'site';if(gen.test(m)&&doc.test(m))return 'documento';return 'perguntar';}
-async function wSend(){const inp=document.getElementById("amsg"),msg=inp.value.trim();if(!msg)return;ensureSid();inp.value="";inp.placeholder="Peça algo — Enter envia, Shift+Enter quebra linha…";WS._lastMsg=msg;bubble("u",esc(msg));const th=bubble("a","");const tk=startThink(th,'interpretando pedido');await wRun(msg,th,tk);}
+async function wSend(){const inp=document.getElementById("amsg"),msg=inp.value.trim();if(!msg)return;ensureSid();inp.value="";inp.placeholder="Peça algo — Enter envia, Shift+Enter quebra linha…";WS._lastMsg=msg;bubble("u",esc(msg));const th=bubble("a","");const tk=startThink(th,'interpretando pedido');await lerPastaLocal(msg,th,tk);await wRun(msg,th,tk);}
+// ===== Pasta local citada no chat (Cerne Desktop): pede permissão nativa, lê e anexa; depois oferece gravar =====
+const LOCAL_PATH_RE=/(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\)[^\n<>|?*]*/;
+function tauriInvoke(){try{const T=window.__TAURI__;if(T&&T.core&&T.core.invoke)return T.core.invoke;const I=window.__TAURI_INTERNALS__;if(I&&I.invoke)return I.invoke.bind(I);}catch(e){}return null;}
+function noteBefore(th,html){const n=document.createElement('div');n.className='msg a';n.innerHTML='<span class="who">CERNE DESKTOP</span><div class="bub">'+html+'</div>';th.parentNode.insertBefore(n,th);return n;}
+async function lerPastaLocal(msg,th,tk){const m=(msg||'').match(LOCAL_PATH_RE);if(!m)return;
+ if(!isDesk()){noteBefore(th,'📁 Você citou um caminho do seu computador (<code>'+esc(m[0].trim())+'</code>). Pelo navegador eu não tenho acesso ao seu disco — abra no <b>Cerne Desktop</b> (ele pede sua permissão e lê a pasta) ou anexe os arquivos com 📎.');return;}
+ const inv=tauriInvoke();if(!inv){noteBefore(th,'📁 Para eu ler <code>'+esc(m[0].trim())+'</code>, atualize o Cerne Desktop (ícone na bandeja → <b>Verificar atualização</b>) e reinicie.');return;}
+ relabel(tk,'aguardando sua permissão para ler a pasta');
+ try{const r=await inv('ler_pasta_projeto',{candidato:m[0]});relabel(tk,'anexando a pasta à conversa');
+  const fd=new FormData();fd.append('file',new Blob([r.texto],{type:'text/plain'}),'pasta-'+(r.nome||'local').replace(/[^\w.-]+/g,'_')+'.txt');
+  const a=await(await fetch('/anexo?tipo=pasta&sid='+encodeURIComponent(ensureSid()),{method:'POST',body:fd})).json();
+  if(a&&a.id){WS.anexos=WS.anexos||[];WS.anexos.push({id:a.id,nome:a.nome});WS.pastaLocal=r.pasta;const t=curTask();if(t){t.anexos=WS.anexos;t.pastaLocal=r.pasta;saveTasks();}renderAxChips();}
+  noteBefore(th,'📁 Li <b>'+esc(r.pasta)+'</b> com sua permissão — '+r.arquivos_lidos+' arquivo(s) de código/texto de '+r.total_arquivos+(r.truncado?' (parte truncada por tamanho)':'')+'. Anexado só a esta conversa.');relabel(tk,'interpretando pedido');}
+ catch(e){noteBefore(th,'📁 Não li a pasta: '+esc(String(e&&e.message||e)));relabel(tk,'interpretando pedido');}}
+const PROJ_PEND={};
+function arquivosPropostos(ans){const re=/<<<ARQUIVO:\s*([^>\n]+?)\s*>>>\r?\n([\s\S]*?)\r?\n?<<<FIM>>>/g;const out=[];let m;while((m=re.exec(ans||''))){out.push({caminho:m[1].trim(),conteudo:m[2]});}return out;}
+function gravarBar(ans){const arqs=arquivosPropostos(ans);const t=curTask&&curTask();const pasta=(t&&t.pastaLocal)||WS.pastaLocal;if(!arqs.length||!pasta||!isDesk()||!tauriInvoke())return '';const id='gp'+Math.random().toString(36).slice(2,9);PROJ_PEND[id]={pasta:pasta,arquivos:arqs};
+ return '<div class="trace" id="'+id+'" style="margin-top:8px"><button class="btn" onclick="gravarProjeto(\''+id+'\')">💾 Gravar '+arqs.length+' arquivo(s) em '+esc(pasta)+'</button> <span class="faint">'+arqs.map(a=>esc(a.caminho)).join(' · ')+'</span></div>';}
+async function gravarProjeto(id){const p=PROJ_PEND[id];const el=document.getElementById(id);if(!p||!el)return;const inv=tauriInvoke();
+ try{const r=await inv('gravar_arquivos_projeto',{pasta:p.pasta,arquivos:p.arquivos});el.innerHTML='✅ Gravado: '+r.gravados.map(esc).join(' · ')+(r.backup?' <span class="faint">· originais em '+esc(r.backup)+'</span>':'');}
+ catch(e){el.insertAdjacentHTML('beforeend',' <span style="color:var(--crit)">'+esc(String(e&&e.message||e))+'</span>');}}
 async function wRun(msg,th,tk){
  if(/^\s*(lembr|guard[ae]|anot[ae]|memoriz)/i.test(msg)){try{await P('/memoria',{texto:msg});}catch(e){}const s=stopThink(tk);th.querySelector('.bub').innerHTML='🧠 <b>Anotado na memória.</b> Vou lembrar disso nas próximas conversas. <span class="faint">Gerencie em 🧠 Memória.</span><div class="trace">↳ memória · '+s+'s</div>';return;}
  if(WS.orquestrar){stopThink(tk);await streamLocal(th,msg);return;}
@@ -12849,7 +13177,7 @@ function longDocBubble(bub,ans,traceHtml){const k='d'+Date.now().toString(36)+Ma
    +'<div class="row" style="gap:7px;margin:9px 0 0"><button class="sel" onclick="cvOpen();cvTab(\'prev\')">▢ Abrir prévia</button><button class="sel" onclick="docExpand(\''+k+'\',this)">▾ ler no chat</button></div>'
    +traceHtml+fbBar();}
 function docExpand(k,btn){const ans=_DOCS[k];if(!ans)return;const bub=btn.closest('.bub');const tr=bub.querySelector('.trace');const trh=tr?tr.outerHTML:'';bub.innerHTML=mdToHtml(ans)+trh+fbBar();scrollTh();}
-function renderAns(bub,ans,traceHtml,title){ans=ans||'(sem resposta)';if(isLongDoc(ans)){answerDoc(ans,title);longDocBubble(bub,ans,traceHtml);}else{bub.innerHTML=mdToHtml(ans)+traceHtml+fbBar();}scrollTh();}
+function renderAns(bub,ans,traceHtml,title){ans=ans||'(sem resposta)';if(isLongDoc(ans)){answerDoc(ans,title);longDocBubble(bub,ans,traceHtml);}else{bub.innerHTML=mdToHtml(ans)+traceHtml+fbBar();}const gb=gravarBar(ans);if(gb)bub.insertAdjacentHTML('beforeend',gb);scrollTh();}
 function mdInline(s){
  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
  s=s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
@@ -12880,7 +13208,7 @@ let LAST={ext:'md',content:''};
 function showArtifact(kind,content){cvOpen();cvTab('prev');LAST={ext:kind==="site"?"html":"md",content:content};document.getElementById("cvTitle").innerHTML=kind==="site"?"◐ Site gerado":"▤ Documento gerado";const el=document.getElementById("cvPreview");
  if(kind==="site"){el.innerHTML=`<iframe class="iframe" sandbox="allow-same-origin"></iframe>`;const f=el.querySelector('iframe');f.srcdoc=content;}else{el.innerHTML=`<div class="paper">${mdToHtml(content)}</div>`;}}
 function showActionResult(fmt,content){cvOpen();cvTab('prev');LAST={ext:fmt==='json'?'json':'md',content:content};document.getElementById('cvTitle').innerHTML='▤ Resultado';const el=document.getElementById('cvPreview');if(fmt==='json'){el.innerHTML='<div class="paper"><pre style="white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:#111826;margin:0">'+esc(content)+'</pre></div>';}else{el.innerHTML='<div class="paper">'+mdToHtml(content)+'</div>';}}
-function isCodeRequest(m){if(/```|(^|\n)\s*(def |class |import |function |const |let |#include)/.test(m))return true;const s=(m||'').toLowerCase();const verbo=/(cri[ae]|ger[ae]|monte|montar|escrev|fa[çc]a|implement|desenvolv|corrig|ajust|melhor|refator|otimiz|conserta|debug|revis)/;const alvo=/(c[oó]digo|script|programa|fun[çc][aã]o|classe|\bapi\b|\bbot\b|scraper|crawler|automa|playwright|selenium|puppeteer|python|javascript|typescript|\bnode\b|\bsql\b|regex|\bhtml\b|\bcss\b|\bcli\b|endpoint|comando)/;return verbo.test(s)&&alvo.test(s);}
+function isCodeRequest(m){if(/```|(^|\n)\s*(def |class |import |function |const |let |#include)/.test(m))return true;const s=(m||'').toLowerCase();if(/(analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|entend|descrev|resum|arquitetura|avalie)/.test(s)&&!/^\s*(cri[ae]|ger[ae]|escrev|implement|corrij|corrig|refator|fa[çc]a)/.test(s))return false;const verbo=/(cri[ae]|ger[ae]|monte|montar|escrev|fa[çc]a|implement|desenvolv|corrig|corrij|ajust|melhor|refator|otimiz|conserta|debug|revis)/;const alvo=/(c[oó]digo|script|programa|fun[çc][aã]o|classe|\bapi\b|\bbot\b|scraper|crawler|automa|playwright|selenium|puppeteer|python|javascript|typescript|\bnode\b|\bsql\b|regex|\bhtml\b|\bcss\b|\bcli\b|endpoint|comando)/;return verbo.test(s)&&alvo.test(s);}
 const CODE_EXT={python:'py',py:'py',javascript:'js',js:'js',typescript:'ts',ts:'ts',bash:'sh',sh:'sh',shell:'sh',sql:'sql',html:'html',css:'css',json:'json',java:'java',go:'go',rust:'rs',c:'c','c++':'cpp',cpp:'cpp',ruby:'rb',php:'php',yaml:'yaml'};
 function codeHtml(code,lang){return '<div class="codewrap"><div class="codehead"><span>'+esc(lang||'code')+'</span><button class="codecopy" onclick="copyCode(this)">copiar</button></div><pre class="codeblk"><code>'+esc(code||'')+'</code></pre></div>';}
 function copyCode(b){const c=b.closest('.codewrap').querySelector('code');try{navigator.clipboard.writeText(c.textContent);}catch(e){}b.textContent='copiado ✓';setTimeout(()=>{b.textContent='copiar';},1500);}
@@ -12894,7 +13222,7 @@ function showCode(d){cvOpen();cvTab('prev');const lang=(d.linguagem||'python').t
  }else{LAST={ext:(CODE_EXT[lang]||'txt'),content:(d.codigo||'')};document.getElementById('cvTitle').innerHTML='💻 Código gerado';
   el.innerHTML='<div class="codepane">'+(d.explicacao?('<div class="codemsg codeexpl"><b>ℹ Sobre este código</b><div>'+esc(d.explicacao)+'</div></div>'):'')+codeHtml(d.codigo||'',lang)+'</div>';}}
 async function codeFlow(msg,th,tk){relabel(tk,'escrevendo o código');
- try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes})).json();const s=stopThink(tk);
+ try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes,sid:WS.sid||''})).json();const s=stopThink(tk);
   if(r.error){th.querySelector('.bub').innerHTML=friendlyErr(r.error);return;}
   if(r.modo==='sem_codigo'){th.querySelector('.bub').innerHTML=esc(r.mensagem||'O modelo não retornou código para este pedido.').replace(/\n/g,'<br>')+'<div class="trace">↳ '+esc(r.modelo||'')+' · não gerou código · '+s+'s</div>';return;}
   showCode(r);const mod=r.modo==='ajuste'?'Analisei e ajustei o código':'Gerei o código';

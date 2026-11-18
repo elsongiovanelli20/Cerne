@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ingerir-pasta"
+description = "Enables the ingerir_pasta command without any pre-configured scope."
+commands.allow = ["ingerir_pasta"]
+
+[[permission]]
+identifier = "deny-ingerir-pasta"
+description = "Denies the ingerir_pasta command without any pre-configured scope."
+commands.deny = ["ingerir_pasta"]

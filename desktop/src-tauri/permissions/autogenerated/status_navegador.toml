@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-status-navegador"
+description = "Enables the status_navegador command without any pre-configured scope."
+commands.allow = ["status_navegador"]
+
+[[permission]]
+identifier = "deny-status-navegador"
+description = "Denies the status_navegador command without any pre-configured scope."
+commands.deny = ["status_navegador"]

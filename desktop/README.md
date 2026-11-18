@@ -48,3 +48,14 @@ Para gerar o thumbprint de um certificado já instalado: `Get-ChildItem Cert:\Cu
 ## Segurança / soberania
 - A ingestão e o auto-update usam a sessão da sua organização (login por e-mail/senha).
 - O agente local só age quando **você** aciona (abrir pasta, rodar comando, digitar). É uma ferramenta de automação assistida, instalada e governada pela sua organização.
+
+## Agentes operando o computador (v1.0.5)
+Com o desktop pareado (bandeja → *Conectar navegador…*), agentes com a ferramenta **computador** podem
+listar/ler/gravar arquivos, executar programas, digitar e pressionar teclas. O servidor só **pede**; o desktop decide:
+- **pastas**: diálogo nativo "Permitir leitura" (vale até fechar o app);
+- **gravar**: diálogo *Sobrescrever / Criar novo / Cancelar*; o original vai para `<pasta>/.cerne-backup/<timestamp>/`;
+- **executar / digitar / teclas / abrir**: diálogo *Permitir uma vez / Permitir por 15 min / Negar*;
+- enquanto controla um app, uma **moldura esfumaçada azul** envolve a janela controlada ("Cerne está controlando esta janela").
+
+O chat do Cerne (página remota) só consegue chamar `ler_pasta_projeto` e `gravar_arquivos_projeto`
+(`capabilities/remote.json`); os demais comandos ficam restritos às janelas locais do app.

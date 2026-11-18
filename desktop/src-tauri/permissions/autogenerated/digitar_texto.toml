@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-digitar-texto"
+description = "Enables the digitar_texto command without any pre-configured scope."
+commands.allow = ["digitar_texto"]
+
+[[permission]]
+identifier = "deny-digitar-texto"
+description = "Denies the digitar_texto command without any pre-configured scope."
+commands.deny = ["digitar_texto"]

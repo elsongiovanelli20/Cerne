@@ -387,6 +387,198 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the abrir_caminho command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-abrir-caminho",
+          "markdownDescription": "Enables the abrir_caminho command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the abrir_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-abrir-navegador",
+          "markdownDescription": "Enables the abrir_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the conectar command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-conectar",
+          "markdownDescription": "Enables the conectar command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the configurar_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-configurar-navegador",
+          "markdownDescription": "Enables the configurar_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the digitar_texto command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-digitar-texto",
+          "markdownDescription": "Enables the digitar_texto command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the escolher_pasta command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-escolher-pasta",
+          "markdownDescription": "Enables the escolher_pasta command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the escrever_arquivo command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-escrever-arquivo",
+          "markdownDescription": "Enables the escrever_arquivo command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the gravar_arquivos_projeto command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-gravar-arquivos-projeto",
+          "markdownDescription": "Enables the gravar_arquivos_projeto command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ingerir_pasta command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ingerir-pasta",
+          "markdownDescription": "Enables the ingerir_pasta command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ler_arquivo command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ler-arquivo",
+          "markdownDescription": "Enables the ler_arquivo command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ler_pasta_projeto command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ler-pasta-projeto",
+          "markdownDescription": "Enables the ler_pasta_projeto command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the listar_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-listar-dir",
+          "markdownDescription": "Enables the listar_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pressionar_tecla command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pressionar-tecla",
+          "markdownDescription": "Enables the pressionar_tecla command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rodar_comando command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rodar-comando",
+          "markdownDescription": "Enables the rodar_comando command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the status_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-status-navegador",
+          "markdownDescription": "Enables the status_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the verificar_atualizacao command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-verificar-atualizacao",
+          "markdownDescription": "Enables the verificar_atualizacao command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the abrir_caminho command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-abrir-caminho",
+          "markdownDescription": "Denies the abrir_caminho command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the abrir_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-abrir-navegador",
+          "markdownDescription": "Denies the abrir_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the conectar command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-conectar",
+          "markdownDescription": "Denies the conectar command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the configurar_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-configurar-navegador",
+          "markdownDescription": "Denies the configurar_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the digitar_texto command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-digitar-texto",
+          "markdownDescription": "Denies the digitar_texto command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the escolher_pasta command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-escolher-pasta",
+          "markdownDescription": "Denies the escolher_pasta command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the escrever_arquivo command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-escrever-arquivo",
+          "markdownDescription": "Denies the escrever_arquivo command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the gravar_arquivos_projeto command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-gravar-arquivos-projeto",
+          "markdownDescription": "Denies the gravar_arquivos_projeto command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ingerir_pasta command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ingerir-pasta",
+          "markdownDescription": "Denies the ingerir_pasta command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ler_arquivo command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ler-arquivo",
+          "markdownDescription": "Denies the ler_arquivo command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ler_pasta_projeto command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ler-pasta-projeto",
+          "markdownDescription": "Denies the ler_pasta_projeto command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the listar_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-listar-dir",
+          "markdownDescription": "Denies the listar_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pressionar_tecla command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pressionar-tecla",
+          "markdownDescription": "Denies the pressionar_tecla command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rodar_comando command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rodar-comando",
+          "markdownDescription": "Denies the rodar_comando command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the status_navegador command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-status-navegador",
+          "markdownDescription": "Denies the status_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the verificar_atualizacao command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-verificar-atualizacao",
+          "markdownDescription": "Denies the verificar_atualizacao command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

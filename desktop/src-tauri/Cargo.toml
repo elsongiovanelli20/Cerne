@@ -1,6 +1,6 @@
 [package]
 name = "cerne-desktop"
-version = "1.0.4"
+version = "1.0.5"
 description = "Cerne Desktop"
 authors = ["Orqion"]
 edition = "2021"
@@ -26,3 +26,6 @@ enigo = "0.2"
 opt-level = "s"
 lto = true
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rodar-comando"
+description = "Enables the rodar_comando command without any pre-configured scope."
+commands.allow = ["rodar_comando"]
+
+[[permission]]
+identifier = "deny-rodar-comando"
+description = "Denies the rodar_comando command without any pre-configured scope."
+commands.deny = ["rodar_comando"]
