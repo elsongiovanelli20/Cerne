@@ -1579,9 +1579,9 @@ def health():
 
 
 # ---- Cerne Desktop (app instalável) ----
-_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.5.exe")
-_DESKTOP_VER = "1.0.5"
-_DESKTOP_SHA = "936bfe9510ceb1aa1165c72d87680185ca812576ca1879ad581033e80b5f6d3e"
+_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.6.exe")
+_DESKTOP_VER = "1.0.6"
+_DESKTOP_SHA = "710329d6d041c0bb481e91bdc1868746dced8ef21a58f5b53b01f6761a8dbf7c"
 
 
 @app.get("/download/cerne-desktop")
