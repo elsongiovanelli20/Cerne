@@ -419,7 +419,7 @@ fn main() {
             listar_dir, ler_arquivo, escrever_arquivo, abrir_caminho, rodar_comando,
             digitar_texto, pressionar_tecla, verificar_atualizacao,
             abrir_navegador, configurar_navegador, status_navegador,
-            projeto::ler_pasta_projeto, projeto::gravar_arquivos_projeto
+            projeto::ler_pasta_projeto, projeto::gravar_arquivos_projeto, computador::computador_chat
         ])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Abrir Cerne", true, None::<&str>)?;

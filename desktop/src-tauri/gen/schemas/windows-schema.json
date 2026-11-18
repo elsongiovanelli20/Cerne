@@ -399,6 +399,12 @@
           "markdownDescription": "Enables the abrir_navegador command without any pre-configured scope."
         },
         {
+          "description": "Enables the computador_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-computador-chat",
+          "markdownDescription": "Enables the computador_chat command without any pre-configured scope."
+        },
+        {
           "description": "Enables the conectar command without any pre-configured scope.",
           "type": "string",
           "const": "allow-conectar",
@@ -493,6 +499,12 @@
           "type": "string",
           "const": "deny-abrir-navegador",
           "markdownDescription": "Denies the abrir_navegador command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the computador_chat command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-computador-chat",
+          "markdownDescription": "Denies the computador_chat command without any pre-configured scope."
         },
         {
           "description": "Denies the conectar command without any pre-configured scope.",

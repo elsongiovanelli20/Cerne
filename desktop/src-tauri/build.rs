@@ -6,7 +6,7 @@ const COMANDOS: &[&str] = &[
     "listar_dir", "ler_arquivo", "escrever_arquivo", "abrir_caminho", "rodar_comando",
     "digitar_texto", "pressionar_tecla", "verificar_atualizacao",
     "abrir_navegador", "configurar_navegador", "status_navegador",
-    "ler_pasta_projeto", "gravar_arquivos_projeto",
+    "ler_pasta_projeto", "gravar_arquivos_projeto", "computador_chat",
 ];
 
 fn main() {

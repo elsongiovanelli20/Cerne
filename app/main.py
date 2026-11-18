@@ -1617,9 +1617,9 @@ def health():
 
 
 # ---- Cerne Desktop (app instalável) ----
-_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.6.exe")
-_DESKTOP_VER = "1.0.6"
-_DESKTOP_SHA = "710329d6d041c0bb481e91bdc1868746dced8ef21a58f5b53b01f6761a8dbf7c"
+_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.7.exe")
+_DESKTOP_VER = "1.0.7"
+_DESKTOP_SHA = "e7acd2e6aed0f543c43cda35f6cfd72c8ec43787f6ab1eefad98608dda5345fe"
 
 
 @app.get("/download/cerne-desktop")
@@ -11074,24 +11074,32 @@ _DEV_RUNS = {}
 _DEV_MAX_PASSOS = int(os.getenv("DEV_MAX_PASSOS", "45"))
 _DEV_MAX_SEG = int(os.getenv("DEV_MAX_SEGUNDOS", "1800"))
 _DEV_SYS = """Você é um ENGENHEIRO DE SOFTWARE SÊNIOR implementando uma alteração REAL no projeto do usuário.
-Você trabalha numa CÓPIA do projeto (o original NÃO é tocado). Pasta da cópia: <<COPIA>>
+Você trabalha numa CÓPIA do projeto (o original NÃO é tocado). Raiz da cópia: <<COPIA>>
+TODOS os caminhos são RELATIVOS à raiz da cópia (ex.: "apps/solicitacoes/src/app.module.ts"; "." = a raiz).
 Responda SEMPRE com UMA linha JSON, sem nenhum texto em volta. Ferramentas:
-- {"ferramenta":"listar","caminho":"<pasta absoluta>"}
-- {"ferramenta":"buscar","caminho":"<pasta absoluta>","termo":"texto exato"}   → linhas arquivo:linha onde aparece
-- {"ferramenta":"ler","caminho":"<arquivo absoluto>","linha_inicio":1,"linha_fim":250}
-- {"ferramenta":"gravar","caminho":"<arquivo absoluto DENTRO da cópia>","conteudo":"<o arquivo COMPLETO>"}
-- {"ferramenta":"rodar","programa":"npm|npx|node|python|pytest|dotnet|go|mvn…","args":["…"],"pasta":"<pasta da cópia>","timeout":600}
+- {"ferramenta":"listar","caminho":"apps/solicitacoes"}
+- {"ferramenta":"buscar","caminho":".","termo":"texto exato"}   → linhas arquivo:linha onde aparece (caminhos relativos)
+- {"ferramenta":"ler","caminho":"apps/x/src/arquivo.ts","linha_inicio":1,"linha_fim":250}
+- {"ferramenta":"gravar","caminho":"apps/x/src/novo.ts","conteudo":"<o arquivo COMPLETO>"}   → SÓ para arquivo NOVO
+- {"ferramenta":"editar","caminho":"apps/x/src/app.module.ts","trocar":"<trecho EXATO e único copiado do arquivo>","por":"<novo trecho>"}   → alterar arquivo EXISTENTE
+- {"ferramenta":"rodar","programa":"npm|npx|node|python|pytest|dotnet|go|mvn…","args":["…"],"pasta":"apps/x","timeout":600}
 - {"ferramenta":"diff"}   → arquivos alterados/novos na cópia
 - {"ferramenta":"pronto","resumo":"o que foi feito, arquivos, como testar e o que ficou pendente"}
 MÉTODO (siga nesta ordem):
-1. ENTENDA antes de mudar: use o resumo do projeto abaixo, BUSQUE onde fica a funcionalidade relacionada e LEIA os
-   arquivos vizinhos para copiar as CONVENÇÕES do projeto (módulos, decorators, DTOs, entidades, testes, nomes).
+1. ENTENDA antes de mudar, de forma OBJETIVA (no máximo ~10 ações): use o resumo do projeto abaixo, BUSQUE onde fica a
+   funcionalidade relacionada e LEIA os arquivos vizinhos para copiar as CONVENÇÕES (módulos, decorators, DTOs,
+   entidades, testes, nomes). Arquivos grandes: leia por FAIXA de linhas. Nunca repita uma busca/leitura já feita.
+   Se o pedido for amplo, escolha a menor implementação ÚTIL e coerente com o projeto e siga com ela.
 2. NUNCA invente métodos, imports, decorators ou caminhos: confirme com buscar/ler antes de usar.
 3. Respeite a arquitetura (ex.: serviços separados não importam código uns dos outros; registre módulos novos onde
    o projeto registra; no frontend siga o padrão de chamadas autenticadas do projeto).
-4. Grave arquivos COMPLETOS, só dentro da cópia. Prefira estender o que existe a criar estruturas paralelas.
+4. ARQUIVO NOVO → gravar (completo). ARQUIVO EXISTENTE → editar (troque só o trecho exato; NUNCA reescreva um arquivo
+   existente inteiro de memória — isso apaga partes dele). Prefira estender o que existe a criar estruturas paralelas.
+   Todo import que você usar precisa existir (confirme com buscar); importe tudo o que referenciar.
 5. VALIDE: rode o build/typecheck/testes do que você mudou (se não houver node_modules, rode a instalação uma vez com
-   timeout alto). LEIA o erro e CORRIJA o código; não repita o mesmo comando que falhou do mesmo jeito.
+   timeout alto). Em MONOREPO, compile antes os pacotes internos de que o app depende (ex.: npm run build -w <pacote>)
+   — erro "Cannot find module '@org/pacote'" geralmente é isso, não o seu código. LEIA o erro, separe o que é dos
+   arquivos que VOCÊ mexeu e CORRIJA; rode de novo até passar. Não repita o mesmo comando que falhou do mesmo jeito.
 6. Termine com "pronto" e um resumo HONESTO: o que passou, o que não foi possível validar e por quê.
 Pedido do usuário: <<PEDIDO>>"""
 
@@ -11114,7 +11122,7 @@ def _dev_limpar():
         _DEV_RUNS.pop(k, None)
 
 
-def _dev_res_txt(res, limite=12000):
+def _dev_res_txt(res, limite=8000):
     if isinstance(res, dict):
         if res.get("erro"):
             return "ERRO: " + str(res["erro"])[:2000]
@@ -11132,16 +11140,26 @@ def _dev_res_txt(res, limite=12000):
 
 
 def _dev_caminho(run, c):
-    """Caminho que o modelo citou → dentro da cópia (ele às vezes usa o caminho do ORIGINAL ou relativo)."""
-    c = (c or "").strip().replace("/", "\\") if ":" in (c or "") else (c or "").strip()
-    cop, orig = run.get("copia") or "", run.get("original") or ""
-    if not c:
+    """Caminho que o modelo citou → caminho ABSOLUTO dentro da cópia. O agente é orientado a usar caminhos
+    RELATIVOS (modelos erram ao copiar caminhos longos); absolutos do original/cópia são reconhecidos pelo nome
+    da pasta. Nunca devolve algo fora da cópia."""
+    cop, orig = (run.get("copia") or "").rstrip("\\/"), (run.get("original") or "").rstrip("\\/")
+    c = (c or "").strip().strip('"').replace("/", "\\")
+    if not c or c in (".", "\\", "<cópia>", "<copia>"):
         return cop
-    if orig and c.lower().startswith(orig.lower()):
-        return cop + c[len(orig):]
-    if len(c) > 2 and c[1] == ":":
-        return c
-    return cop.rstrip("\\/") + "\\" + c.replace("/", "\\").lstrip("\\")
+    low, sep = c.lower(), "\\"
+    for raiz in (cop, orig):                         # cópia primeiro: o nome dela COMEÇA com o nome do original
+        if raiz and (low == raiz.lower() or low.startswith(raiz.lower() + sep)):
+            return cop + c[len(raiz):]
+    if len(c) > 2 and c[1] == ":":                   # absoluto "quase certo": recorta a partir do nome da pasta
+        for nome in (os.path.basename(cop), os.path.basename(orig)):
+            k = low.rfind(sep + nome.lower() + sep)
+            if nome and k >= 0:
+                return cop + c[k + len(nome) + 1:]
+            if nome and low.endswith(sep + nome.lower()):
+                return cop
+        return cop                                   # absoluto fora do projeto → raiz da cópia (nunca sai dela)
+    return cop + sep + c.lstrip("\\")
 
 
 def _dev_proximo(run):
@@ -11149,23 +11167,44 @@ def _dev_proximo(run):
     if run["passos"] >= _DEV_MAX_PASSOS or time.time() - run["t0"] > _DEV_MAX_SEG:
         run["msgs"].append({"role": "user", "content": "Limite de passos/tempo atingido. Responda AGORA com pronto e um resumo honesto do estado."})
         run["forcar_fim"] = True
-    janela = run["msgs"][:2] + run["msgs"][-18:] if len(run["msgs"]) > 20 else run["msgs"]
+    # histórico maior (o agente esquecia o que já leu e relia); resultados ANTIGOS resumidos p/ caber
+    hist = run["msgs"][2:]
+    hist = hist[-34:]
+    antigos = len(hist) - 10
+    hist = [dict(m, content=(m["content"][:700] + "\n…[resultado antigo resumido]") if (i < antigos and m["role"] == "user"
+            and len(m["content"]) > 900) else m["content"]) for i, m in enumerate(hist)]
+    janela = run["msgs"][:2] + hist
     sysp = _DEV_SYS.replace("<<COPIA>>", run.get("copia") or "?").replace("<<PEDIDO>>", run["pedido"])
-    raw, usado = None, None
+    raw, usado, falhas = None, None, []
     for prov in ([run["modelo"]] if run.get("modelo") else []) + [p for p in run["cadeia"] if p != run.get("modelo")]:
-        try:
-            if prov == "local":
-                raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp}] + janela, max_tokens=3500) or "")
-            else:
-                mm, run["mapa"] = _mask_conv([{"role": "system", "content": sysp}] + janela, run["mapa"])
-                raw = demask(_strip_think(chat_model(prov, mm, max_tokens=8000) or ""), run["mapa"])
-            usado = prov
+        if prov == "local" and run.get("modelo") != "local":
+            continue                                    # o local (3B, janela de 4k) não conduz uma implementação
+        for espera in (0, 8, 15, 25, 40):               # 429 (limite de taxa) é passageiro: espera e tenta o MESMO modelo
+            if espera:
+                time.sleep(espera)
+            try:
+                if prov == "local":
+                    raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp}] + janela, max_tokens=3500) or "")
+                else:
+                    mm, run["mapa"] = _mask_conv([{"role": "system", "content": sysp}] + janela, run["mapa"])
+                    raw = demask(_strip_think(chat_model(prov, mm, max_tokens=8000) or ""), run["mapa"])
+                usado = prov
+                break
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "Too Many" in msg:
+                    continue
+                falhas.append(f"{prov}: {msg[:90]}")
+                _event("dev · provedor falhou", falhas[-1])
+                break
+        else:
+            falhas.append(f"{prov}: limite de taxa (429) mesmo após aguardar")
+        if raw is not None:
             break
-        except Exception as e:
-            _event("dev · provedor falhou", f"{prov}: {str(e)[:120]}")
     if raw is None:
-        return {"fim": True, "run": run["id"], "resposta": "⚠️ Nenhum modelo respondeu (limite/erro dos provedores). Tente de novo em instantes.",
-                "copia": run.get("copia")}
+        return {"fim": True, "run": run["id"], "copia": run.get("copia"),
+                "resposta": "⚠️ Parei: nenhum modelo externo conseguiu responder agora (" + "; ".join(falhas)[:400] +
+                            "). Nada foi alterado no original. Tente de novo em alguns minutos ou configure outro provedor em Model Ops."}
     if usado != run.get("modelo"):
         run["modelo"] = usado
     run["passos"] += 1
@@ -11184,10 +11223,37 @@ def _dev_proximo(run):
     if len(run["ultimas"]) == 3 and len(set(run["ultimas"])) == 1:
         return _dev_finalizar(run, "O agente repetiu a mesma ação 3 vezes e foi interrompido.")
     run["msgs"].append({"role": "assistant", "content": raw[:6000]})
+    # ---- ação JÁ feita (mesma busca/leitura/listagem, mesmo que intercalada) → não repete; empurra p/ frente ----
+    if nome in ("listar", "buscar", "ler"):
+        chave = json.dumps({k: v for k, v in call.items() if k != "ferramenta"}, sort_keys=True, ensure_ascii=False) + nome
+        feitos = run.setdefault("feitos", {})
+        if chave in feitos:
+            run["repetidas"] = run.get("repetidas", 0) + 1
+            if run["repetidas"] >= 4:
+                return _dev_finalizar(run, "Interrompi: o agente ficou repetindo buscas/leituras já feitas sem avançar para a implementação.")
+            run["msgs"].append({"role": "user", "content": "Você JÁ executou exatamente essa ação antes (o resultado está no histórico). "
+                                "NÃO repita. Avance: leia um arquivo DIFERENTE e específico, ou comece a GRAVAR a implementação."})
+            return _dev_proximo(run)
+        feitos[chave] = run["passos"]
+        run["explorou"] = run.get("explorou", 0) + 1
+        if run["explorou"] == 12 and not run.get("gravados"):
+            run["msgs"].append({"role": "user", "content": "Você já explorou o suficiente (12 ações). A partir de agora DECIDA e IMPLEMENTE: "
+                                "no máximo 3 leituras pontuais e então GRAVE os arquivos (completos) da solução."})
+        if run["explorou"] >= 24 and not run.get("gravados"):
+            return _dev_finalizar(run, "Interrompi: depois de 24 ações de exploração o agente ainda não tinha começado a implementar. "
+                                       "Tente um pedido mais específico (ex.: em qual app/tela e o que o chatbot deve responder).")
+    elif nome == "gravar":
+        run["explorou"] = 0
     if nome == "pronto" or run.get("forcar_fim"):
         if run.get("gravou_sem_validar") and not run.get("cobrou") and not run.get("forcar_fim"):
             run["cobrou"] = True
             run["msgs"].append({"role": "user", "content": "Você gravou arquivos e NÃO rodou build/typecheck/testes depois. Valide com a ferramenta rodar antes de finalizar."})
+            return _dev_proximo(run)
+        if run.get("rodar_falhou") and run.get("cobrou_falha", 0) < 2 and not run.get("forcar_fim"):
+            run["cobrou_falha"] = run.get("cobrou_falha", 0) + 1
+            run["msgs"].append({"role": "user", "content": "O último build/teste FALHOU. Não finalize ainda: separe os erros dos arquivos que "
+                                "VOCÊ criou/editou e corrija-os com editar/gravar; se o erro for de pacote interno não compilado "
+                                "(ex.: Cannot find module '@org/pacote'), compile esse pacote primeiro. Depois rode de novo."})
             return _dev_proximo(run)
         run["resumo"] = call.get("resumo") or raw
         return {"run": run["id"], "passo": "📋 conferindo o que mudou na cópia", "acao": {"op": "diff", "copia": run["copia"]}, "etapa": "diff_final"}
@@ -11214,11 +11280,16 @@ def _dev_proximo(run):
                 "pasta": _dev_caminho(run, call.get("pasta")), "timeout": min(max(int(call.get("timeout") or 300), 10), 900)}
         run["gravou_sem_validar"] = False
         rot = f"⌨️ {acao['programa']} {' '.join(acao['args'])[:60]}"
+    elif nome == "editar":
+        acao = {"op": "editar", "caminho": _dev_caminho(run, call.get("caminho")), "trocar": call.get("trocar") or "", "por": call.get("por") or ""}
+        run["gravou_sem_validar"] = True; run.setdefault("gravados", set()).add(acao["caminho"]); run["explorou"] = 0
+        rot = f"✏️ editando {acao['caminho'].split(chr(92))[-1]} (na cópia)"
     elif nome == "diff":
         acao = {"op": "diff", "copia": run["copia"]}; rot = "📋 vendo o que mudou"
     else:
-        run["msgs"].append({"role": "user", "content": f"Ferramenta '{nome}' não existe. Use listar, buscar, ler, gravar, rodar, diff ou pronto."})
+        run["msgs"].append({"role": "user", "content": f"Ferramenta '{nome}' não existe. Use listar, buscar, ler, gravar, editar, rodar, diff ou pronto."})
         return _dev_proximo(run)
+    run["ultima_op"] = acao["op"]
     return {"run": run["id"], "passo": rot, "acao": acao, "modelo": run["modelo"]}
 
 
@@ -11245,10 +11316,11 @@ def dev_iniciar(body: DevIniciarReq):
     ok, why = guard_input(body.mensagem)
     if not ok:
         return {"fim": True, "resposta": f"⛔ Bloqueado pelo guardrail: {why}."}
-    cad = _cadeia_provedores(body.modelo, forcar=True)
+    # implementação precisa de janela grande: fora os provedores pequenos (ex.: Groq 8k tokens/min)
+    cad = [p for p in _cadeia_provedores(body.modelo, forcar=True) if _anexo_limite(p) >= 60000]
     modelo = cad[0] if cad else "local"
     rid = "dev" + uuid.uuid4().hex[:10]
-    ax, _ = _anexos_texto(body.session_id or "", limite=min(_anexo_limite(modelo), 30000), consulta=body.mensagem)
+    ax, _ = _anexos_texto(body.session_id or "", limite=min(_anexo_limite(modelo), 15000), consulta=body.mensagem)
     run = {"id": rid, "t0": time.time(), "pedido": body.mensagem[:2000], "modelo": modelo, "cadeia": cad + ["local"],
            "mapa": {}, "passos": 0, "original": body.pasta, "copia": None, "user": (_usuario_atual() or {}).get("id"),
            "msgs": [{"role": "user", "content": "RESUMO DO PROJETO (pasta lida pelo Cerne Desktop, arquivos mais relevantes):\n"
@@ -11278,6 +11350,8 @@ def dev_passo(body: DevPassoReq):
                 (str(res.get("erro")) if isinstance(res, dict) and res.get("erro") else "a cópia de trabalho não foi criada") + "."}
     if run.get("resumo") is not None and isinstance(res, dict) and ("alterados" in res or "novos" in res):
         return _dev_finalizar(run, run["resumo"], res)
+    if run.get("ultima_op") == "rodar" and isinstance(res, dict):
+        run["rodar_falhou"] = bool(res.get("erro") or res.get("tempo_esgotado") or (res.get("codigo") not in (0, None)))
     run["msgs"].append({"role": "user", "content": "Resultado:\n" + _dev_res_txt(res)})
     return _dev_proximo(run)
 

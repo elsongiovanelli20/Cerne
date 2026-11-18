@@ -1,6 +1,6 @@
 [package]
 name = "cerne-desktop"
-version = "1.0.6"
+version = "1.0.7"
 description = "Cerne Desktop"
 authors = ["Orqion"]
 edition = "2021"

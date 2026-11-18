@@ -15,9 +15,9 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 
 #[derive(Default)]
-pub struct Liberadas(Mutex<HashSet<PathBuf>>);
+pub struct Liberadas(pub(crate) Mutex<HashSet<PathBuf>>);
 
-const IGNORAR_DIRS: &[&str] = &[
+pub(crate) const IGNORAR_DIRS: &[&str] = &[
     ".git", "node_modules", "target", "dist", "build", "out", "__pycache__", ".venv", "venv",
     "env", ".next", ".nuxt", "bin", "obj", ".idea", ".vscode", ".cerne-backup", "coverage",
     ".gradle", ".dart_tool", "Pods", "vendor",
@@ -131,7 +131,7 @@ fn resolver(candidato: &str) -> Option<PathBuf> {
     None
 }
 
-fn eh_texto(p: &Path) -> bool {
+pub(crate) fn eh_texto(p: &Path) -> bool {
     let nome = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if NOMES_TEXTO.iter().any(|n| nome.eq_ignore_ascii_case(n)) {
         return true;
@@ -142,7 +142,7 @@ fn eh_texto(p: &Path) -> bool {
     }
 }
 
-fn exibir(p: &Path) -> String {
+pub(crate) fn exibir(p: &Path) -> String {
     // canonicalize no Windows gera "\\?\C:\..." — esconde o prefixo nas mensagens.
     p.to_string_lossy().trim_start_matches(r"\\?\").to_string()
 }
