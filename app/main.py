@@ -463,6 +463,22 @@ _PASTA_SEC_RE = re.compile(r"\n\n===== ARQUIVO: (.+?) =====\n")
 _PASTA_LOCKS = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "cargo.lock", "composer.lock", "gemfile.lock")
 
 
+def _cadeia_provedores(escolhido="", forcar=False):
+    """Ordem de tentativa dos modelos externos: o ESCOLHIDO no chat primeiro, depois o melhor da org e os demais.
+    Vazia quando a org é soberana e nada externo foi escolhido (fica no local)."""
+    org = _org()
+    perm = _ext_permitidos(org)
+    cad = []
+    if str(escolhido or "").startswith("ext-") and escolhido in perm:
+        cad.append(escolhido)
+    if cad or forcar or org.get("soberania") == "hibrido":
+        bp = _best_provider(org)
+        for p in ([bp] if bp else []) + [x for x in ("ext-mistral", "ext-claude", "ext-nvidia-ultra", "ext-openrouter", "ext-reason") if x in perm]:
+            if p and p not in cad:
+                cad.append(p)
+    return cad
+
+
 def _anexo_limite(modelo):
     """Orçamento de caracteres de anexo que o MODELO aguenta (janela + limites do provedor)."""
     m = str(modelo or "")
@@ -5573,7 +5589,7 @@ def _extract_json(text, need_key=None):
                 depth -= 1
                 if depth == 0:
                     try:
-                        o = json.loads(text[i:j + 1])
+                        o = json.loads(text[i:j + 1], strict=False)   # tolera quebras de linha cruas (arquivo inteiro em "conteudo")
                         if isinstance(o, dict) and (need_key is None or o.get(need_key) is not None):
                             return o
                     except Exception:
@@ -10965,6 +10981,7 @@ class CodigoReq(BaseModel):
     colecao: str = COLLECTION
     colecoes: list | None = None
     sid: str = ""                                    # anexos da conversa (ex.: pasta local lida pelo Cerne Desktop)
+    modelo: str = ""                                 # modelo escolhido no chat (ex.: ext-mistral) — tem prioridade
 
 
 @app.post("/codigo")
@@ -10998,19 +11015,29 @@ def codigo(body: CodigoReq):
                 "CODIGO:\n```python\n<código completo>\n```\n"
                 "(troque 'python' pela linguagem real que você usou)")
     base = (f"Contexto do acervo (use como referência técnica se ajudar):\n{ctx}\n\n" if ctx else "")
-    axtxt, _axn = _anexos_texto(body.sid, limite=(_ANEXO_LIMITE_EXTERNO if prov else _ANEXO_LIMITE_LOCAL))
-    if axtxt:                                        # código do projeto anexado na conversa = base real do pedido
-        base = "[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n" + base
-    try:
-        if prov:
+    cadeia = _cadeia_provedores(body.modelo, forcar=bool(prov))
+    raw, prov, erros = None, None, []
+    for _p in cadeia:                                # cada externo com o anexo do tamanho que ele aguenta
+        try:
+            axtxt, _axn = _anexos_texto(body.sid, limite=_anexo_limite(_p), consulta=instr)
+            b2 = (("[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n") if axtxt else "") + base
             mq, mapping = mask_reversible(instr)
-            raw = demask(_strip_think(chat_model(prov, [{"role": "system", "content": sysp},
-                        {"role": "user", "content": base + "Pedido:\n" + mq}], max_tokens=2800) or ""), mapping)
-        else:
+            raw = demask(_strip_think(chat_model(_p, [{"role": "system", "content": sysp},
+                        {"role": "user", "content": b2 + "Pedido:\n" + mq}], max_tokens=4000) or ""), mapping)
+            prov = _p
+            break
+        except Exception as e:
+            erros.append(f"{_p}: {str(e)[:120]}")
+            _event("código · provedor falhou", erros[-1])
+    if raw is None:
+        try:                                         # local soberano com o anexo resumido p/ caber na janela dele
+            axtxt, _axn = _anexos_texto(body.sid, limite=_ANEXO_LIMITE_LOCAL, consulta=instr)
+            b2 = (("[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n") if axtxt else "") + base
             raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp},
-                        {"role": "user", "content": base + "Pedido:\n" + instr}], max_tokens=2800) or "")
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": "falha ao gerar o código", "detail": str(e)[:200]})
+                        {"role": "user", "content": b2 + "Pedido:\n" + instr}], max_tokens=2800) or "")
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": "falha ao gerar o código",
+                                                          "detail": "; ".join(erros + [str(e)[:200]])[:600]})
     blocks = [b.strip() for b in _code_blocks(raw) if b.strip()]
     ml = re.search(r"```([a-zA-Z0-9_+.\-]+)", raw)
     lang = (ml.group(1) if ml else "python")
@@ -11037,6 +11064,255 @@ def codigo(body: CodigoReq):
     _event("código · novo", instr[:50])
     return {"modo": "novo", "linguagem": lang, "codigo": codigo,
             "explicacao": _code_field(raw, "EXPLICACAO"), "fontes": fontes, "modelo": modelo}
+
+
+# ================= AGENTE DE IMPLEMENTAÇÃO (dev no projeto do usuário, via Cerne Desktop) =================
+# O chat reconhece um pedido de desenvolvimento sobre uma pasta anexada e entra neste fluxo SOZINHO (sem botão).
+# O servidor decide o próximo passo (modelo escolhido, PII mascarada) e o DESKTOP executa — numa CÓPIA de
+# trabalho autorizada por diálogo nativo; o original só muda se o usuário pedir "aplicar" (diálogo + backup).
+_DEV_RUNS = {}
+_DEV_MAX_PASSOS = int(os.getenv("DEV_MAX_PASSOS", "45"))
+_DEV_MAX_SEG = int(os.getenv("DEV_MAX_SEGUNDOS", "1800"))
+_DEV_SYS = """Você é um ENGENHEIRO DE SOFTWARE SÊNIOR implementando uma alteração REAL no projeto do usuário.
+Você trabalha numa CÓPIA do projeto (o original NÃO é tocado). Pasta da cópia: <<COPIA>>
+Responda SEMPRE com UMA linha JSON, sem nenhum texto em volta. Ferramentas:
+- {"ferramenta":"listar","caminho":"<pasta absoluta>"}
+- {"ferramenta":"buscar","caminho":"<pasta absoluta>","termo":"texto exato"}   → linhas arquivo:linha onde aparece
+- {"ferramenta":"ler","caminho":"<arquivo absoluto>","linha_inicio":1,"linha_fim":250}
+- {"ferramenta":"gravar","caminho":"<arquivo absoluto DENTRO da cópia>","conteudo":"<o arquivo COMPLETO>"}
+- {"ferramenta":"rodar","programa":"npm|npx|node|python|pytest|dotnet|go|mvn…","args":["…"],"pasta":"<pasta da cópia>","timeout":600}
+- {"ferramenta":"diff"}   → arquivos alterados/novos na cópia
+- {"ferramenta":"pronto","resumo":"o que foi feito, arquivos, como testar e o que ficou pendente"}
+MÉTODO (siga nesta ordem):
+1. ENTENDA antes de mudar: use o resumo do projeto abaixo, BUSQUE onde fica a funcionalidade relacionada e LEIA os
+   arquivos vizinhos para copiar as CONVENÇÕES do projeto (módulos, decorators, DTOs, entidades, testes, nomes).
+2. NUNCA invente métodos, imports, decorators ou caminhos: confirme com buscar/ler antes de usar.
+3. Respeite a arquitetura (ex.: serviços separados não importam código uns dos outros; registre módulos novos onde
+   o projeto registra; no frontend siga o padrão de chamadas autenticadas do projeto).
+4. Grave arquivos COMPLETOS, só dentro da cópia. Prefira estender o que existe a criar estruturas paralelas.
+5. VALIDE: rode o build/typecheck/testes do que você mudou (se não houver node_modules, rode a instalação uma vez com
+   timeout alto). LEIA o erro e CORRIJA o código; não repita o mesmo comando que falhou do mesmo jeito.
+6. Termine com "pronto" e um resumo HONESTO: o que passou, o que não foi possível validar e por quê.
+Pedido do usuário: <<PEDIDO>>"""
+
+
+class DevIniciarReq(BaseModel):
+    mensagem: str
+    session_id: str = ""
+    modelo: str = ""
+    pasta: str = ""
+
+
+class DevPassoReq(BaseModel):
+    run: str
+    resultado: dict | list | str | None = None
+
+
+def _dev_limpar():
+    agora = time.time()
+    for k in [k for k, r in _DEV_RUNS.items() if agora - r.get("t0", agora) > 7200]:
+        _DEV_RUNS.pop(k, None)
+
+
+def _dev_res_txt(res, limite=12000):
+    if isinstance(res, dict):
+        if res.get("erro"):
+            return "ERRO: " + str(res["erro"])[:2000]
+        if "conteudo" in res:
+            c = res.get("conteudo") or ""
+            return (f"[{res.get('caminho', '')} · linhas {res.get('linhas', '')} de {res.get('linhas_total', '?')}]\n"
+                    + (c if len(c) <= limite else c[:limite] + "\n…[cortado — leia por faixa de linhas]"))
+        if "achados" in res:
+            a = res.get("achados") or []
+            return f"{len(a)} ocorrência(s):\n" + "\n".join(a)[:limite] if a else "nenhuma ocorrência"
+        if "saida" in res or "tempo_esgotado" in res:
+            return f"código de saída {res.get('codigo')}\n" + (res.get("saida") or res.get("nota") or "")[-limite:]
+        return json.dumps(res, ensure_ascii=False)[:limite]
+    return str(res)[:limite]
+
+
+def _dev_caminho(run, c):
+    """Caminho que o modelo citou → dentro da cópia (ele às vezes usa o caminho do ORIGINAL ou relativo)."""
+    c = (c or "").strip().replace("/", "\\") if ":" in (c or "") else (c or "").strip()
+    cop, orig = run.get("copia") or "", run.get("original") or ""
+    if not c:
+        return cop
+    if orig and c.lower().startswith(orig.lower()):
+        return cop + c[len(orig):]
+    if len(c) > 2 and c[1] == ":":
+        return c
+    return cop.rstrip("\\/") + "\\" + c.replace("/", "\\").lstrip("\\")
+
+
+def _dev_proximo(run):
+    """Chama o modelo e devolve a próxima AÇÃO para o desktop (ou o fim)."""
+    if run["passos"] >= _DEV_MAX_PASSOS or time.time() - run["t0"] > _DEV_MAX_SEG:
+        run["msgs"].append({"role": "user", "content": "Limite de passos/tempo atingido. Responda AGORA com pronto e um resumo honesto do estado."})
+        run["forcar_fim"] = True
+    janela = run["msgs"][:2] + run["msgs"][-18:] if len(run["msgs"]) > 20 else run["msgs"]
+    sysp = _DEV_SYS.replace("<<COPIA>>", run.get("copia") or "?").replace("<<PEDIDO>>", run["pedido"])
+    raw, usado = None, None
+    for prov in ([run["modelo"]] if run.get("modelo") else []) + [p for p in run["cadeia"] if p != run.get("modelo")]:
+        try:
+            if prov == "local":
+                raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp}] + janela, max_tokens=3500) or "")
+            else:
+                mm, run["mapa"] = _mask_conv([{"role": "system", "content": sysp}] + janela, run["mapa"])
+                raw = demask(_strip_think(chat_model(prov, mm, max_tokens=8000) or ""), run["mapa"])
+            usado = prov
+            break
+        except Exception as e:
+            _event("dev · provedor falhou", f"{prov}: {str(e)[:120]}")
+    if raw is None:
+        return {"fim": True, "run": run["id"], "resposta": "⚠️ Nenhum modelo respondeu (limite/erro dos provedores). Tente de novo em instantes.",
+                "copia": run.get("copia")}
+    if usado != run.get("modelo"):
+        run["modelo"] = usado
+    run["passos"] += 1
+    call = _parse_tool_call(raw)
+    if not call:
+        if run.get("sem_json"):
+            return _dev_finalizar(run, raw)
+        run["sem_json"] = True
+        run["msgs"] += [{"role": "assistant", "content": raw[:3000]},
+                        {"role": "user", "content": 'Responda com UMA linha JSON de ferramenta (ex.: {"ferramenta":"buscar",...}) ou {"ferramenta":"pronto","resumo":"..."}.'}]
+        return _dev_proximo(run)
+    run["sem_json"] = False
+    nome = (call.get("ferramenta") or "").lower()
+    assin = json.dumps(call, sort_keys=True, ensure_ascii=False)[:2000]
+    run["ultimas"] = (run.get("ultimas", []) + [assin])[-3:]
+    if len(run["ultimas"]) == 3 and len(set(run["ultimas"])) == 1:
+        return _dev_finalizar(run, "O agente repetiu a mesma ação 3 vezes e foi interrompido.")
+    run["msgs"].append({"role": "assistant", "content": raw[:6000]})
+    if nome == "pronto" or run.get("forcar_fim"):
+        if run.get("gravou_sem_validar") and not run.get("cobrou") and not run.get("forcar_fim"):
+            run["cobrou"] = True
+            run["msgs"].append({"role": "user", "content": "Você gravou arquivos e NÃO rodou build/typecheck/testes depois. Valide com a ferramenta rodar antes de finalizar."})
+            return _dev_proximo(run)
+        run["resumo"] = call.get("resumo") or raw
+        return {"run": run["id"], "passo": "📋 conferindo o que mudou na cópia", "acao": {"op": "diff", "copia": run["copia"]}, "etapa": "diff_final"}
+    if nome == "listar":
+        acao = {"op": "listar", "caminho": _dev_caminho(run, call.get("caminho"))}; rot = f"📂 listando {acao['caminho'][-60:]}"
+    elif nome == "buscar":
+        acao = {"op": "buscar", "caminho": _dev_caminho(run, call.get("caminho")), "termo": call.get("termo") or ""}
+        rot = f"🔎 buscando \"{(call.get('termo') or '')[:40]}\""
+    elif nome == "ler":
+        acao = {"op": "ler", "caminho": _dev_caminho(run, call.get("caminho"))}
+        for k in ("linha_inicio", "linha_fim"):
+            if call.get(k):
+                try:
+                    acao[k] = int(call[k])
+                except Exception:
+                    pass
+        rot = f"📖 lendo {acao['caminho'].split(chr(92))[-1]}"
+    elif nome == "gravar":
+        acao = {"op": "gravar", "caminho": _dev_caminho(run, call.get("caminho")), "conteudo": call.get("conteudo") or ""}
+        run["gravou_sem_validar"] = True; run.setdefault("gravados", set()).add(acao["caminho"])
+        rot = f"✍️ gravando {acao['caminho'].split(chr(92))[-1]} (na cópia)"
+    elif nome == "rodar":
+        acao = {"op": "rodar", "programa": call.get("programa") or "", "args": [str(a) for a in (call.get("args") or [])][:60],
+                "pasta": _dev_caminho(run, call.get("pasta")), "timeout": min(max(int(call.get("timeout") or 300), 10), 900)}
+        run["gravou_sem_validar"] = False
+        rot = f"⌨️ {acao['programa']} {' '.join(acao['args'])[:60]}"
+    elif nome == "diff":
+        acao = {"op": "diff", "copia": run["copia"]}; rot = "📋 vendo o que mudou"
+    else:
+        run["msgs"].append({"role": "user", "content": f"Ferramenta '{nome}' não existe. Use listar, buscar, ler, gravar, rodar, diff ou pronto."})
+        return _dev_proximo(run)
+    return {"run": run["id"], "passo": rot, "acao": acao, "modelo": run["modelo"]}
+
+
+def _dev_finalizar(run, resumo, diff=None):
+    alt = (diff or {}).get("alterados") or []
+    nov = (diff or {}).get("novos") or []
+    partes = [resumo.strip() if isinstance(resumo, str) else str(resumo)]
+    if alt or nov:
+        partes.append("\n\n**Na cópia de trabalho** `" + (run.get("copia") or "") + "`:\n"
+                      + "".join(f"\n- ✎ `{a}`" for a in alt[:60]) + "".join(f"\n- ＋ `{n}`" for n in nov[:60]))
+        partes.append("\n\nO **original não foi alterado**. Para levar isso ao projeto, diga *\"aplique as alterações no original\"* "
+                      "(vou pedir confirmação no seu computador e guardar backup).")
+    elif diff is not None:
+        partes.append("\n\n(Nenhum arquivo foi alterado na cópia.)")
+    _event("dev · implementação", f"{run['pedido'][:50]} · {run['passos']} passos · {len(alt) + len(nov)} arquivo(s) · {run.get('modelo')}")
+    return {"fim": True, "run": run["id"], "resposta": "".join(partes), "copia": run.get("copia"),
+            "original": run.get("original"), "alterados": alt, "novos": nov, "modelo": run.get("modelo"), "passos": run["passos"]}
+
+
+@app.post("/dev/iniciar")
+def dev_iniciar(body: DevIniciarReq):
+    _quota_consumir(externa=True)
+    _dev_limpar()
+    ok, why = guard_input(body.mensagem)
+    if not ok:
+        return {"fim": True, "resposta": f"⛔ Bloqueado pelo guardrail: {why}."}
+    cad = _cadeia_provedores(body.modelo, forcar=True)
+    modelo = cad[0] if cad else "local"
+    rid = "dev" + uuid.uuid4().hex[:10]
+    ax, _ = _anexos_texto(body.session_id or "", limite=min(_anexo_limite(modelo), 30000), consulta=body.mensagem)
+    run = {"id": rid, "t0": time.time(), "pedido": body.mensagem[:2000], "modelo": modelo, "cadeia": cad + ["local"],
+           "mapa": {}, "passos": 0, "original": body.pasta, "copia": None, "user": (_usuario_atual() or {}).get("id"),
+           "msgs": [{"role": "user", "content": "RESUMO DO PROJETO (pasta lida pelo Cerne Desktop, arquivos mais relevantes):\n"
+                     + (ax or "(sem resumo — explore com listar/buscar)")},
+                    {"role": "assistant", "content": '{"ferramenta":"listar","caminho":"<cópia>"}'}]}
+    _DEV_RUNS[rid] = run
+    return {"run": rid, "passo": "🗂️ criando a cópia de trabalho (o original não será alterado)", "modelo": modelo,
+            "acao": {"op": "preparar_copia", "pasta": body.pasta, "pedido": body.mensagem[:240]}, "etapa": "copia"}
+
+
+@app.post("/dev/passo")
+def dev_passo(body: DevPassoReq):
+    run = _DEV_RUNS.get(body.run)
+    if not run:
+        raise HTTPException(status_code=404, detail="execução não encontrada ou expirada")
+    if run.get("user") and run["user"] != (_usuario_atual() or {}).get("id"):
+        raise HTTPException(status_code=403, detail="execução de outro usuário")
+    res = body.resultado if body.resultado is not None else {}
+    if not run.get("copia"):
+        if isinstance(res, dict) and res.get("copia"):
+            run["copia"] = res["copia"]; run["original"] = res.get("original") or run["original"]
+            run["msgs"].append({"role": "user", "content": f"Cópia de trabalho criada em {run['copia']} "
+                                f"({res.get('arquivos', '?')} arquivos; {res.get('nota', '')}). Comece."})
+            return _dev_proximo(run)
+        _DEV_RUNS.pop(run["id"], None)
+        return {"fim": True, "run": run["id"], "resposta": "Não comecei a implementação: " +
+                (str(res.get("erro")) if isinstance(res, dict) and res.get("erro") else "a cópia de trabalho não foi criada") + "."}
+    if run.get("resumo") is not None and isinstance(res, dict) and ("alterados" in res or "novos" in res):
+        return _dev_finalizar(run, run["resumo"], res)
+    run["msgs"].append({"role": "user", "content": "Resultado:\n" + _dev_res_txt(res)})
+    return _dev_proximo(run)
+
+
+class DevProporReq(BaseModel):
+    mensagem: str
+    session_id: str = ""
+    modelo: str = ""
+
+
+@app.post("/dev/propor")
+def dev_propor(body: DevProporReq):
+    """Sem o desktop novo (sem execução local): pede a implementação em ARQUIVOS COMPLETOS no formato gravável;
+    se o modelo devolver só trechos/explicação, pede de novo uma vez."""
+    _quota_consumir(externa=True)
+    cad = _cadeia_provedores(body.modelo, forcar=True) or ["local"]
+    sysp = ("Você é engenheiro de software sênior. IMPLEMENTE o pedido no projeto do anexo seguindo as convenções e a "
+            "arquitetura dele (não invente métodos/imports: use só o que aparece no código). Explique em poucas linhas e "
+            "devolva CADA arquivo criado/alterado COMPLETO neste formato exato (caminho relativo à pasta do projeto):\n"
+            "<<<ARQUIVO: caminho/relativo.ext>>>\n(conteúdo completo)\n<<<FIM>>>")
+    for prov in cad:
+        try:
+            ax, _ = _anexos_texto(body.session_id or "", limite=_anexo_limite(prov), consulta=body.mensagem)
+            msgs = [{"role": "system", "content": sysp}, {"role": "user", "content": f"Projeto:\n{ax}\n\nPedido: {body.mensagem}"}]
+            mm, mapa = _mask_conv(msgs, {}) if prov != "local" else (msgs, {})
+            fazer = (lambda m: chat_model("chat" if prov == "local" else prov, m, max_tokens=8000))
+            raw = demask(_strip_think(fazer(mm) or ""), mapa)
+            if "<<<ARQUIVO:" not in raw:
+                mm2 = mm + [{"role": "assistant", "content": raw[:4000]},
+                            {"role": "user", "content": "Agora devolva os ARQUIVOS COMPLETOS no formato <<<ARQUIVO: caminho>>> … <<<FIM>>>."}]
+                raw = demask(_strip_think(fazer(mm2) or ""), mapa)
+            return {"resposta": raw, "modelo": prov, "arquivos": len(re.findall(r"<<<ARQUIVO:", raw))}
+        except Exception as e:
+            _event("dev · propor falhou", f"{prov}: {str(e)[:120]}")
+    return JSONResponse(status_code=502, content={"error": "nenhum modelo respondeu"})
 
 
 # ---- ações prontas sobre o acervo (resumir / riscos / extrair) ----
@@ -13375,11 +13651,48 @@ const PROJ_PEND={};
 function arquivosPropostos(ans){const re=/<<<ARQUIVO:\s*([^>\n]+?)\s*>>>\r?\n([\s\S]*?)\r?\n?<<<FIM>>>/g;const out=[];let m;while((m=re.exec(ans||''))){out.push({caminho:m[1].trim(),conteudo:m[2]});}return out;}
 function gravarBar(ans){const arqs=arquivosPropostos(ans);const t=curTask&&curTask();const pasta=(t&&t.pastaLocal)||WS.pastaLocal;if(!arqs.length||!pasta||!isDesk()||!tauriInvoke())return '';const id='gp'+Math.random().toString(36).slice(2,9);PROJ_PEND[id]={pasta:pasta,arquivos:arqs};
  return '<div class="trace" id="'+id+'" style="margin-top:8px"><button class="btn" onclick="gravarProjeto(\''+id+'\')">💾 Gravar '+arqs.length+' arquivo(s) em '+esc(pasta)+'</button> <span class="faint">'+arqs.map(a=>esc(a.caminho)).join(' · ')+'</span></div>';}
+// ===== Agente de IMPLEMENTAÇÃO: o chat reconhece pedido de dev sobre a pasta e segue sozinho este caminho =====
+function isDevRequest(m){const s=(m||'').toLowerCase();
+ if(isAplicarRequest(s))return false;
+ if(/^\s*(analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|qual|quais|como funciona|resum)/.test(s))return false;
+ return /\b(implement\w*|adicion\w*|acrescent\w*|cri[ae]r?|desenvolv[ae]\w*|ajust\w*|corrij\w*|corrig\w*|refator\w*|alter[ae]\w*|modifi\w*|inclu[ai]\w*|remov\w*|integr[ae]\w*|migr[ae]\w*|atualiz\w*|conserte|consert\w*|mude|mudar|troque|trocar|otimiz\w*|escrev\w* (os )?testes?)\b/.test(s)
+   && !/\b(documento|relat[oó]rio|apresenta[cç][aã]o|planilha|pdf|docx|slides?)\b/.test(s);}
+function isAplicarRequest(m){return /\b(aplic\w*|apliqu\w*|pode aplicar|leve|levar|passe|passar|copi\w*)\b[\s\S]{0,60}\b(original|projeto|altera[cç][oõ]es|mudan[cç]as)\b/i.test(m||'');}
+async function devTemDesktop(inv){if(!inv)return false;try{await inv('computador_chat',{op:'ping',args:{}});return true;}catch(e){return false;}}
+async function devFlow(msg,th,tk,pasta){const inv=tauriInvoke();const bub=th.querySelector('.bub');
+ if(!(await devTemDesktop(inv))){relabel(tk,'implementando (proposta em arquivos)');
+  try{const r=await(await P('/dev/propor',{mensagem:msg,session_id:WS.sid,modelo:WS.model||''})).json();stopThink(tk);
+   if(r.error){bub.innerHTML=friendlyErr(r.error);return;}
+   renderAns(bub,(r.resposta||'')+'\n\n_(Para eu aplicar, compilar e testar sozinho na sua máquina, atualize o Cerne Desktop: bandeja → Verificar atualização.)_','<div class="trace">↳ '+esc(r.modelo||'')+' · '+(r.arquivos||0)+' arquivo(s)</div>',WS.task||'Implementação');}
+  catch(e){stopThink(tk);bub.innerHTML=friendlyErr(e);}return;}
+ stopThink(tk);const feitos=[];const t0=Date.now();
+ const pinta=(atual,modelo)=>{bub.innerHTML='<div class="faint" style="margin-bottom:6px">🛠️ Implementando no projeto'+(modelo?' · '+esc(String(modelo).replace('ext-',''))+'':'')+' — passos ao vivo</div><div class="steps">'+feitos.slice(-14).map(p=>'<div class="stp done"><span class="ck">✓</span> '+esc(p)+'</div>').join('')+(atual?'<div class="stp on"><span class="spin"></span> '+esc(atual)+' <span class="faint">· '+Math.round((Date.now()-t0)/1000)+'s</span></div>':'')+'</div>';scrollTh();};
+ let r;try{r=await(await P('/dev/iniciar',{mensagem:msg,session_id:WS.sid,modelo:WS.model||'',pasta:pasta})).json();}catch(e){bub.innerHTML=friendlyErr(e);return;}
+ let modelo=r.modelo||'';
+ while(r&&!r.fim&&r.acao){pinta(r.passo,modelo);let res;
+  try{res=await inv('computador_chat',{op:r.acao.op,args:r.acao});}catch(e){res={erro:String(e&&e.message||e)};}
+  feitos.push(r.passo+(res&&res.erro?' — ⚠️ '+String(res.erro).slice(0,90):(res&&res.codigo!==undefined&&r.acao.op==='rodar'?(' — saída '+res.codigo):'')));
+  try{r=await(await P('/dev/passo',{run:r.run,resultado:res||{}})).json();if(r.modelo)modelo=r.modelo;}catch(e){bub.innerHTML=friendlyErr(e);return;}}
+ if(!r){return;}
+ const t=curTask&&curTask();if(r.copia){WS.devCopia=r.copia;if(t){t.devCopia=r.copia;saveTasks();}}
+ const passosHtml='<details class="stepsx"><summary>↳ '+feitos.length+' passos · '+Math.round((Date.now()-t0)/1000)+'s'+(modelo?' · '+esc(String(modelo).replace('ext-','')):'')+'</summary>'+feitos.map(p=>'<div class="stp done"><span class="ck">✓</span> '+esc(p)+'</div>').join('')+'</details>';
+ bub.innerHTML=mdToHtml(r.resposta||'(sem resposta)')+passosHtml+fbBar();scrollTh();}
+async function devAplicar(th,copia){const bub=th.querySelector('.bub');const inv=tauriInvoke();
+ if(!inv){bub.innerHTML='Só consigo aplicar pelo Cerne Desktop.';return;}
+ bub.innerHTML=thinkHTML('aguardando sua confirmação no computador');
+ try{const r=await inv('computador_chat',{op:'aplicar',args:{copia:copia}});
+  if(r&&r.erro){bub.innerHTML='Não apliquei: '+esc(r.erro);return;}
+  bub.innerHTML='✅ Apliquei no original <b>'+esc(r.original||'')+'</b>: '+((r.gravados||[]).map(x=>'<code>'+esc(x)+'</code>').join(' · ')||'nenhuma diferença')+(r.backup?'<div class="faint" style="margin-top:4px">Originais guardados em '+esc(r.backup)+'</div>':'');}
+ catch(e){bub.innerHTML='Não apliquei: '+esc(String(e&&e.message||e));}}
 async function gravarProjeto(id){const p=PROJ_PEND[id];const el=document.getElementById(id);if(!p||!el)return;const inv=tauriInvoke();
  try{const r=await inv('gravar_arquivos_projeto',{pasta:p.pasta,arquivos:p.arquivos});el.innerHTML='✅ Gravado: '+r.gravados.map(esc).join(' · ')+(r.backup?' <span class="faint">· originais em '+esc(r.backup)+'</span>':'');}
  catch(e){el.insertAdjacentHTML('beforeend',' <span style="color:var(--crit)">'+esc(String(e&&e.message||e))+'</span>');}}
 async function wRun(msg,th,tk){
  if(/^\s*(lembr|guard[ae]|anot[ae]|memoriz)/i.test(msg)){try{await P('/memoria',{texto:msg});}catch(e){}const s=stopThink(tk);th.querySelector('.bub').innerHTML='🧠 <b>Anotado na memória.</b> Vou lembrar disso nas próximas conversas. <span class="faint">Gerencie em 🧠 Memória.</span><div class="trace">↳ memória · '+s+'s</div>';return;}
+ // pedido de DESENVOLVIMENTO sobre a pasta do projeto → agente de implementação (decisão do próprio chat, sem botão)
+ {const _t=curTask&&curTask();const _pasta=(_t&&_t.pastaLocal)||WS.pastaLocal;const _cop=(_t&&_t.devCopia)||WS.devCopia;
+  if(_cop&&isAplicarRequest(msg)){stopThink(tk);await devAplicar(th,_cop);return;}
+  if(_pasta&&isDevRequest(msg)){await devFlow(msg,th,tk,_pasta);return;}}
  if(WS.orquestrar){stopThink(tk);await streamLocal(th,msg);return;}
  if(isCodeRequest(msg)){await codeFlow(msg,th,tk);return;}
  let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice,session_id:WS.sid})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
@@ -13460,7 +13773,7 @@ function showCode(d){cvOpen();cvTab('prev');const lang=(d.linguagem||'python').t
  }else{LAST={ext:(CODE_EXT[lang]||'txt'),content:(d.codigo||'')};document.getElementById('cvTitle').innerHTML='💻 Código gerado';
   el.innerHTML='<div class="codepane">'+(d.explicacao?('<div class="codemsg codeexpl"><b>ℹ Sobre este código</b><div>'+esc(d.explicacao)+'</div></div>'):'')+codeHtml(d.codigo||'',lang)+'</div>';}}
 async function codeFlow(msg,th,tk){relabel(tk,'escrevendo o código');
- try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes,sid:WS.sid||''})).json();const s=stopThink(tk);
+ try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes,sid:WS.sid||'',modelo:WS.model||''})).json();const s=stopThink(tk);
   if(r.error){th.querySelector('.bub').innerHTML=friendlyErr(r.error);return;}
   if(r.modo==='sem_codigo'){th.querySelector('.bub').innerHTML=esc(r.mensagem||'O modelo não retornou código para este pedido.').replace(/\n/g,'<br>')+'<div class="trace">↳ '+esc(r.modelo||'')+' · não gerou código · '+s+'s</div>';return;}
   showCode(r);const mod=r.modo==='ajuste'?'Analisei e ajustei o código':'Gerei o código';
