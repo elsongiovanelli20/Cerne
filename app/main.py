@@ -541,6 +541,7 @@ def _pasta_compactar(texto, limite, consulta=""):
 
     def _sa(x):                                        # sem acento: "classificação" casa com "classificacao.ts"
         return _ud.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+    consulta = re.sub(r"(?:[A-Za-z]:[\\/]|\\\\)[^\n\"'<>|?*]*?(?=\s+(?:e|para|com|e me|que)\s|$)", " ", consulta or "")  # sem o caminho
     termos = {t[:8] for t in re.findall(r"[a-z0-9_]{4,}", _sa(consulta)) if t not in _PT_STOP}
 
     def chave(sec):
@@ -980,6 +981,27 @@ def mask_pii(text: str) -> dict:
     r = httpx.post(f"{PII_URL}/mask", json={"text": text}, timeout=120)
     r.raise_for_status()
     return r.json()
+
+
+def _mask_texto_grande(text: str, bloco: int = 40000) -> str:
+    """Mascara textos GRANDES (ex.: pasta de projeto do Cerne Desktop, 300k+ caracteres) em blocos cortados em
+    quebra de linha. Um único pedido de 370k derrubava o serviço de PII (limite de memória do spaCy)."""
+    if len(text) <= bloco:
+        return mask_pii(text).get("masked_text", text)
+    partes, i = [], 0
+    while i < len(text):
+        j = min(len(text), i + bloco)
+        if j < len(text):
+            k = text.rfind("\n", i + bloco // 2, j)
+            j = k + 1 if k > 0 else j
+        trecho = text[i:j]
+        try:
+            partes.append(mask_pii(trecho).get("masked_text", trecho))
+        except Exception:
+            partes.append(trecho if not re.search(r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}|@", trecho) else
+                          re.sub(r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}", "<BR_CPF>", re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "<EMAIL_ADDRESS>", trecho)))
+        i = j
+    return "".join(partes)
 
 
 # Siglas/termos de domínio que o NER pt marca erroneamente como PERSON — NÃO devem ser mascarados
@@ -4318,7 +4340,7 @@ async def anexo_add(file: UploadFile = File(...), sid: str = "", tipo: str = "")
         txt = extract_text(file.filename, raw)
     except Exception:
         txt = raw.decode("utf-8", errors="ignore")
-    masked = mask_pii(txt).get("masked_text", txt)   # anexo fica mascarado (soberano; seguro p/ externo)
+    masked = _mask_texto_grande(txt)                 # anexo fica mascarado (soberano; seguro p/ externo), em blocos
     aid = uuid.uuid4().hex[:10]
     APPSTATE.setdefault("anexos", []).append({"id": aid, "org": _tenant(), "sid": sid,
                                               "nome": file.filename, "texto": masked, "ts": time.time(),
@@ -13343,7 +13365,7 @@ async function lerPastaLocal(msg,th,tk){const m=(msg||'').match(LOCAL_PATH_RE);i
  if(!isDesk()){noteBefore(th,'📁 Você citou um caminho do seu computador (<code>'+esc(m[0].trim())+'</code>). Pelo navegador eu não tenho acesso ao seu disco — abra no <b>Cerne Desktop</b> (ele pede sua permissão e lê a pasta) ou anexe os arquivos com 📎.');return;}
  const inv=tauriInvoke();if(!inv){noteBefore(th,'📁 Para eu ler <code>'+esc(m[0].trim())+'</code>, atualize o Cerne Desktop (ícone na bandeja → <b>Verificar atualização</b>) e reinicie.');return;}
  relabel(tk,'aguardando sua permissão para ler a pasta');
- try{const r=await inv('ler_pasta_projeto',{candidato:m[0],consulta:msg});relabel(tk,'anexando a pasta à conversa');
+ try{const r=await inv('ler_pasta_projeto',{candidato:m[0],consulta:msg.replace(m[0],' ')});relabel(tk,'anexando a pasta à conversa');
   const fd=new FormData();fd.append('file',new Blob([r.texto],{type:'text/plain'}),'pasta-'+(r.nome||'local').replace(/[^\w.-]+/g,'_')+'.txt');
   const a=await(await fetch('/anexo?tipo=pasta&sid='+encodeURIComponent(ensureSid()),{method:'POST',body:fd})).json();
   if(a&&a.id){WS.anexos=WS.anexos||[];WS.anexos.push({id:a.id,nome:a.nome});WS.pastaLocal=r.pasta;const t=curTask();if(t){t.anexos=WS.anexos;t.pastaLocal=r.pasta;saveTasks();}renderAxChips();}
