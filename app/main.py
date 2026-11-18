@@ -1478,12 +1478,25 @@ def download_extensao():
     return FileResponse(_EXT_ZIP, media_type="application/zip", filename="cerne-extensao-navegador.zip")
 
 
+def _ext_versao():
+    """Versão da extensão lida do manifest.json dentro do zip publicado (sempre bate com o download)."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(_EXT_ZIP) as z:
+            return json.loads(z.read("manifest.json").decode("utf-8")).get("version", "?")
+    except Exception:
+        return "?"
+
+
 @app.get("/baixar", response_class=HTMLResponse)
 def baixar_desktop():
     tem = os.path.exists(_DESKTOP_EXE)
     mb = f"{os.path.getsize(_DESKTOP_EXE)/1048576:.1f}" if tem else "—"
+    tem_ext = os.path.exists(_EXT_ZIP)
+    ext_kb = f"{os.path.getsize(_EXT_ZIP)/1024:.0f}" if tem_ext else "—"
+    ext_ver = _ext_versao() if tem_ext else "—"
     return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Cerne Desktop — download</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Cerne — downloads</title>
 <style>*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
 font-family:'Segoe UI',system-ui,sans-serif;background:radial-gradient(900px 500px at 80% -10%,rgba(108,140,255,.12),transparent 60%),#0a0e17;color:#e9eef8;padding:24px}}
 .card{{max-width:520px;width:100%;background:#121826;border:1px solid #22314a;border-radius:18px;padding:34px;box-shadow:0 24px 60px rgba(0,0,0,.5)}}
@@ -1499,7 +1512,9 @@ ul{{color:#c3cee1;font-size:13.5px;line-height:1.7;margin:22px 0 0;padding-left:
 .warn{{margin-top:18px;font-size:12px;color:#93a4bf;border-top:1px solid #22314a;padding-top:14px;line-height:1.6}}
 .sha{{font-family:ui-monospace,Consolas,monospace;font-size:9.5px;color:#63728e;word-break:break-all}}
 a.link{{color:#6c8cff}}</style></head>
-<body><div class="card">
+<style>body{{gap:22px;flex-wrap:wrap;align-items:flex-start}}.card:target{{border-color:#35e0e6;box-shadow:0 0 0 1px #35e0e6,0 24px 60px rgba(0,0,0,.5)}}
+ol{{color:#c3cee1;font-size:13.5px;line-height:1.7;margin:22px 0 0;padding-left:20px}}code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#35e0e6}}</style>
+<body><div class="card" id="desktop">
 <div class="d"></div>
 <h1>Cerne Desktop</h1>
 <p class="sub">O app soberano do Cerne para Windows — roda o Workspace e ingere pastas do seu computador direto no acervo.</p>
@@ -1513,6 +1528,21 @@ a.link{{color:#6c8cff}}</style></head>
 <div class="warn">Instalador ainda <b>não assinado digitalmente</b>: o Windows SmartScreen pode avisar — clique em <i>“Mais informações → Executar assim mesmo”</i>. Assinatura de código pode ser adicionada depois.
 <div class="sha" style="margin-top:8px">SHA-256: {_DESKTOP_SHA}</div></div>
 <p style="text-align:center;margin:18px 0 0"><a class="link" href="/">← voltar ao Cerne Web</a></p>
+</div>
+<div class="card" id="extensao">
+<div class="d" style="border-color:#8a7cff;box-shadow:0 0 26px rgba(138,124,255,.5)"></div>
+<h1>Extensão do navegador</h1>
+<p class="sub">Deixa os agentes do Cerne operarem, <b>com a sua permissão</b>, o Chrome ou Edge que você já usa — abrir páginas, preencher formulários, clicar e baixar, com uma moldura visível enquanto atuam.</p>
+<a class="btn {'' if tem_ext else 'off'}" href="/download/extensao" download>⬇ Baixar extensão &nbsp;·&nbsp; {ext_kb} KB</a>
+<div class="meta"><span class="pill">v{ext_ver}</span><span class="pill">Chrome · Edge</span><span class="pill">.zip</span></div>
+<ol>
+<li>Extraia o <b>.zip</b> numa pasta fixa (ex.: <code>Documentos\\Cerne\\extensao</code>).</li>
+<li>Abra <code>chrome://extensions</code> (ou <code>edge://extensions</code>) e ligue o <b>Modo do desenvolvedor</b>.</li>
+<li>Clique em <b>Carregar sem compactação</b> e escolha a pasta extraída.</li>
+<li>No Cerne: <b>Agentes → Integrações → Gerar código de pareamento</b>; cole o código no ícone da extensão.</li>
+</ol>
+<div class="warn"><b>Para atualizar:</b> baixe de novo, extraia <b>por cima da mesma pasta</b> e clique em <b>↻ Recarregar</b> no card da extensão em <code>chrome://extensions</code> — o pareamento continua valendo.
+Com o <b>Cerne Desktop</b> pareado, o navegador é aberto sozinho quando um agente precisar dele.</div>
 </div></body></html>"""
 
 
@@ -11805,6 +11835,7 @@ button:focus-visible,a:focus-visible,[role=button]:focus-visible,.sel:focus-visi
   <span class="pill" id="statuspill"><span class="dot ok pulse" style="color:var(--ok)"></span>NOMINAL</span>
   <span class="clock" id="clk">--:--:--</span>
   <button class="themebtn" onclick="window.open('/baixar','_blank')" title="Baixar o app Cerne Desktop (Windows)" style="border-color:var(--cyan);color:var(--cyan)">⬇ Desktop</button>
+  <button class="themebtn" onclick="window.open('/baixar#extensao','_blank')" title="Baixar a extensão do navegador (Chrome/Edge) — deixa os agentes operarem o seu navegador" style="border-color:var(--cyan);color:var(--cyan)">⬇ Extensão</button>
   <button class="themebtn" id="themebtn" onclick="cycleTheme()">◐ Orqion</button>
   <div class="rolebox" id="rolebox" style="display:none"><span class="rl">VER COMO</span><select class="rolesel" id="rolesel" onchange="setRole(this.value)"><option value="admin">Administrador</option><option value="gestor">Gestor</option><option value="colaborador">Colaborador</option></select></div>
   <div class="userbox" id="userbox" style="display:none"></div>
@@ -11853,7 +11884,7 @@ function setRole(r){role=r;const fb=ROLES[role][0];location.hash=(fb==="work"?"w
 const THEMES=[["orqion","Orqion"],["dark","Dark"],["normal","Normal"],["jarvis","Jarvis"]];let ti=1;
 function applyTheme(){document.body.setAttribute("data-theme",THEMES[ti][0]);const b=document.getElementById("themebtn");if(b)b.textContent="◐ "+THEMES[ti][1];try{localStorage.setItem("cerne_theme",ti)}catch(e){}}
 function cycleTheme(){ti=(ti+1)%THEMES.length;applyTheme();}
-const NAV=[{sec:"OPERAR"},{v:"overview",ic:"grid",l:"Visão geral"},{v:"projects",ic:"folder",l:"Projetos & Coleções"},{v:"acervo",ic:"archive",l:"Acervo"},{sec:"CONHECIMENTO"},{v:"graph",ic:"graph",l:"Grafo de conhecimento"},{v:"skills",ic:"spark",l:"Skills & Instruções"},{v:"runtime",ic:"cpu",l:"Runtime de Agentes"},{v:"conectores",ic:"plug",l:"Conectores"},{sec:"INFRAESTRUTURA"},{v:"components",ic:"layers",l:"Componentes"},{v:"gateway",ic:"route",l:"Model Gateway"},{v:"preflight",ic:"check",l:"Preflight"},{v:"environments",ic:"server",l:"Ambientes"},{sec:"GOVERNANÇA"},{v:"observability",ic:"activity",l:"Observabilidade"},{v:"events",ic:"list",l:"Eventos"},{v:"guardrails",ic:"shield",l:"Guardrails"},{v:"audit",ic:"link",l:"Auditoria"},{v:"users",ic:"key",l:"Acessos"},{sec:"SISTEMA"},{v:"setup",ic:"play",l:"Setup guiado"},{v:"org",ic:"building",l:"Organização"},{v:"settings",ic:"gear",l:"Configurações"},{v:"baixar",ic:"server",l:"Baixar App Desktop",href:"/baixar"},{v:"map",ic:"map",l:"Mapa da plataforma"}];
+const NAV=[{sec:"OPERAR"},{v:"overview",ic:"grid",l:"Visão geral"},{v:"projects",ic:"folder",l:"Projetos & Coleções"},{v:"acervo",ic:"archive",l:"Acervo"},{sec:"CONHECIMENTO"},{v:"graph",ic:"graph",l:"Grafo de conhecimento"},{v:"skills",ic:"spark",l:"Skills & Instruções"},{v:"runtime",ic:"cpu",l:"Runtime de Agentes"},{v:"conectores",ic:"plug",l:"Conectores"},{sec:"INFRAESTRUTURA"},{v:"components",ic:"layers",l:"Componentes"},{v:"gateway",ic:"route",l:"Model Gateway"},{v:"preflight",ic:"check",l:"Preflight"},{v:"environments",ic:"server",l:"Ambientes"},{sec:"GOVERNANÇA"},{v:"observability",ic:"activity",l:"Observabilidade"},{v:"events",ic:"list",l:"Eventos"},{v:"guardrails",ic:"shield",l:"Guardrails"},{v:"audit",ic:"link",l:"Auditoria"},{v:"users",ic:"key",l:"Acessos"},{sec:"SISTEMA"},{v:"setup",ic:"play",l:"Setup guiado"},{v:"org",ic:"building",l:"Organização"},{v:"settings",ic:"gear",l:"Configurações"},{v:"baixar",ic:"server",l:"Baixar App Desktop",href:"/baixar"},{v:"baixarext",ic:"link",l:"Baixar Extensão",href:"/baixar#extensao"},{v:"map",ic:"map",l:"Mapa da plataforma"}];
 const CRUMB={overview:"OPERAR / VISÃO GERAL",projects:"OPERAR / PROJETOS",acervo:"OPERAR / ACERVO",graph:"CONHECIMENTO / GRAFO",skills:"CONHECIMENTO / SKILLS",agentes:"CONHECIMENTO / AGENTES",runtime:"CONHECIMENTO / RUNTIME",conectores:"CONHECIMENTO / CONECTORES",marca:"MARKETING / STUDIO DE MARCA",components:"INFRA / COMPONENTES",gateway:"INFRA / MODEL GATEWAY",preflight:"INFRA / PREFLIGHT",environments:"INFRA / AMBIENTES",observability:"GOVERNANÇA / OBSERVABILIDADE",events:"GOVERNANÇA / EVENTOS",guardrails:"GOVERNANÇA / GUARDRAILS",audit:"GOVERNANÇA / AUDITORIA",users:"GOVERNANÇA / ACESSOS",setup:"SISTEMA / SETUP GUIADO",settings:"SISTEMA / CONFIGURAÇÕES",map:"SISTEMA / MAPA",org:"SISTEMA / ORGANIZAÇÃO"};
 const met=(c,n,s,cl)=>`<div class="panel metric"><div class="cap">${c}</div><div class="num ${cl||''}">${n}</div>${s?`<div class="sub">${s}</div>`:""}</div>`;
 const eye=t=>`<div class="eyebrow">${t}</div>`;
