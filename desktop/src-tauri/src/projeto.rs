@@ -30,9 +30,83 @@ const EXT_TEXTO: &[&str] = &[
     "r", "m", "lua", "pl", "ex", "exs", "erl", "scala", "graphql", "proto", "tf", "dockerfile",
 ];
 const NOMES_TEXTO: &[&str] = &["Dockerfile", "Makefile", "Procfile", "README", "LICENSE", ".gitignore", ".env.example"];
-const MAX_POR_ARQUIVO: usize = 40_000;
-const MAX_TOTAL: usize = 160_000;
-const MAX_ARVORE: usize = 500;
+const MAX_POR_ARQUIVO: usize = 20_000;
+const MAX_TOTAL: usize = 350_000;
+const MAX_ARVORE: usize = 300;
+
+fn sem_acento(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            x => x,
+        })
+        .collect()
+}
+
+/// Termos úteis da pergunta (sem acento, ≥4 letras, sem palavras genéricas), cortados em 8 letras
+/// para casar variações ("classificação" ~ "classificacao.ts", "regras" ~ "regra").
+fn termos_da_consulta(q: &str) -> Vec<String> {
+    let stop = ["para", "com", "que", "uma", "por", "como", "mais", "sobre", "esse", "essa", "este", "esta", "isso",
+                "qual", "quais", "onde", "quando", "sendo", "seja", "analise", "analisar", "codigo", "pasta", "programa",
+                "projeto", "fale", "diga", "desenvolvido", "arquitetura", "users", "user", "documents", "chatgpt"];
+    let mut v: Vec<String> = sem_acento(q)
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.chars().count() >= 4 && !stop.contains(w))
+        .map(|w| w.chars().take(8).collect::<String>())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Importância de um arquivo para ENTENDER o projeto (menor = antes). Espelha `_pasta_prioridade` do servidor.
+fn prioridade(rel: &str) -> u32 {
+    let c = rel.to_lowercase();
+    let nome = c.rsplit('/').next().unwrap_or("").to_string();
+    let prof = c.matches('/').count() as u32;
+    let locks = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "cargo.lock", "composer.lock", "gemfile.lock"];
+    if locks.contains(&nome.as_str()) || nome.ends_with(".min.js") || nome.ends_with(".map") || nome.ends_with(".svg") {
+        return 999;
+    }
+    if nome.contains(".spec.") || nome.contains(".test.") || c.contains("/test/") || c.contains("/tests/")
+        || c.contains("/e2e/") || c.contains("__tests__") || c.contains("__golden__") || c.starts_with("e2e/") {
+        return 700 + prof.min(9);
+    }
+    if nome.starts_with("readme") || nome.starts_with("leia-me") || nome.contains("arquitetura") || nome.contains("architecture") {
+        return prof.min(9);
+    }
+    let manifestos = ["package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod", "pom.xml",
+                      "build.gradle", "composer.json", "gemfile", "pnpm-workspace.yaml", "turbo.json", "setup.py"];
+    if manifestos.contains(&nome.as_str()) || nome.ends_with(".csproj") {
+        return 100 + prof.min(9);
+    }
+    let exts = [".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".kt", ".cs", ".go", ".rs", ".rb", ".php", ".sql", ".vue", ".dart"];
+    let codigo = exts.iter().any(|e| nome.ends_with(e));
+    let dominio = ["regra", "rule", "valid", "classific", "elegib", "habilit", "polic", "calc", "status", "fluxo",
+                   "workflow", "prazo", "edital", "service", "controller", "entity", "entidade", "model", "domain",
+                   "dominio", "usecase"];
+    let entrada = ["main.", "app.", "index.", "server.", "settings.", "urls.", "routes."];
+    if codigo && !nome.ends_with(".sql") && (dominio.iter().any(|d| nome.contains(d)) || entrada.iter().any(|e| nome.starts_with(e))) {
+        return 200 + prof.min(9);
+    }
+    if c.starts_with("docs/") || c.contains("/docs/") || (nome.ends_with(".md") && prof <= 1) {
+        return 250 + prof.min(9);
+    }
+    if codigo {
+        return 350 + prof.min(9);
+    }
+    if nome.starts_with("dockerfile") || nome.starts_with("docker-compose") || nome.starts_with("cloudbuild")
+        || c.contains("/workflows/") || nome.ends_with(".tf") || nome.ends_with(".yml") || nome.ends_with(".yaml") {
+        return 400 + prof.min(9);
+    }
+    500 + prof.min(9)
+}
 
 /// Acha o caminho real dentro de um trecho de texto com espaços
 /// ("C:\Users\X\M-Tech mas retornou…" → "C:\Users\X\M-Tech").
@@ -114,7 +188,13 @@ Permitir?",
 
 /// Lê (somente leitura) uma pasta ou arquivo citado no chat, após permissão nativa.
 #[tauri::command]
-pub async fn ler_pasta_projeto(app: AppHandle, lib: State<'_, Liberadas>, candidato: String) -> Result<Pacote, String> {
+pub async fn ler_pasta_projeto(
+    app: AppHandle,
+    lib: State<'_, Liberadas>,
+    candidato: String,
+    consulta: Option<String>,
+) -> Result<Pacote, String> {
+    let termos = termos_da_consulta(consulta.as_deref().unwrap_or(""));
     let raiz = resolver(&candidato).ok_or_else(|| format!("não encontrei no seu computador o caminho \"{}\"", candidato.trim()))?;
     garantir_leitura(&app, &lib, &raiz, "O chat do Cerne")?;
 
@@ -138,16 +218,82 @@ pub async fn ler_pasta_projeto(app: AppHandle, lib: State<'_, Liberadas>, candid
     };
     let base = if raiz.is_file() { raiz.parent().unwrap_or(&raiz).to_path_buf() } else { raiz.clone() };
 
+    // 1ª passada: árvore + estrutura por diretório + candidatos de texto com PRIORIDADE (o que explica o projeto
+    // e suas REGRAS vem antes; ordem alfabética enchia o limite com .github/ e o primeiro app)
+    let mut dirs: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut candidatos: Vec<(u32, String, &PathBuf)> = Vec::new();
     for p in &arquivos {
         total += 1;
         let rel = p.strip_prefix(&base).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        let partes: Vec<&str> = rel.split('/').collect();
+        let d = if partes.len() >= 3 { format!("{}/{}", partes[0], partes[1]) } else if partes.len() == 2 { partes[0].to_string() } else { "(raiz)".into() };
+        *dirs.entry(d).or_insert(0) += 1;
         if arvore.len() < MAX_ARVORE {
             arvore.push(rel.clone());
         }
-        if !eh_texto(p) {
+        if eh_texto(p) {
+            let pr = prioridade(&rel);
+            if pr < 990 {
+                candidatos.push((pr, rel, p));
+            }
+        }
+    }
+    // relevância à PERGUNTA dentro do código (domínio 2xx e demais fontes 3xx): termos no caminho e no início do
+    // arquivo puxam para cima — projetos grandes têm centenas de controllers/services e o pacote não cabe todos
+    let mut relev: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    if !termos.is_empty() {
+        for (pr, rel, p) in &candidatos {
+            if (200..400).contains(pr) {
+                let mut alvo = sem_acento(rel);
+                if let Ok(b) = std::fs::read(p) {
+                    alvo.push(' ');
+                    alvo.push_str(&sem_acento(&String::from_utf8_lossy(&b[..b.len().min(4096)])));
+                }
+                let h = termos.iter().filter(|t| alvo.contains(t.as_str())).count().min(4) as u32;
+                relev.insert(rel.clone(), h);
+            }
+        }
+    }
+    let catg = |pr: u32| -> u32 { if (250..300).contains(&pr) { 3 } else if pr >= 300 { pr / 100 + 1 } else { pr / 100 } };
+    candidatos.sort_by(|a, b| {
+        catg(a.0).cmp(&catg(b.0))
+            .then_with(|| relev.get(&b.1).unwrap_or(&0).cmp(relev.get(&a.1).unwrap_or(&0)))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    // diversidade: intercala o código por MÓDULO (ex.: apps/auth, apps/solicitacoes…) — o 1º de cada módulo,
+    // depois o 2º… assim uma pergunta geral vê o sistema todo, não só o primeiro app em ordem alfabética
+    let grupo = |rel: &str| rel.split('/').take(3).collect::<Vec<_>>().join("/");
+    let mut cont: std::collections::HashMap<(u32, String), u32> = std::collections::HashMap::new();
+    let mut ordem_grupo: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (pr, rel, _) in &candidatos {
+        let c = catg(*pr);
+        let r = cont.entry((c, grupo(rel))).or_insert(0);
+        ordem_grupo.insert(rel.clone(), *r);
+        *r += 1;
+    }
+    candidatos.sort_by(|a, b| {
+        catg(a.0).cmp(&catg(b.0))
+            .then_with(|| relev.get(&b.1).unwrap_or(&0).cmp(relev.get(&a.1).unwrap_or(&0)))
+            .then_with(|| ordem_grupo.get(&a.1).unwrap_or(&0).cmp(ordem_grupo.get(&b.1).unwrap_or(&0)))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let estrutura = dirs.iter().map(|(d, n)| format!("{}: {}", d, n)).collect::<Vec<_>>().join(", ");
+
+    // cota por categoria (READMEs de subpasta são dezenas e engoliam o pacote); o resto fica para o CÓDIGO
+    let cota = |cat: u32| -> usize {
+        match cat { 0 => 50_000, 1 => 20_000, 2 => usize::MAX, 3 => usize::MAX, 4 => 15_000, 5 => 10_000, 7 => 10_000, _ => 40_000 }
+    };
+    let mut usado_cat: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (pr, rel, p) in candidatos {
+        if corpo.len() >= MAX_TOTAL {
+            truncado = true;
             continue;
         }
-        if corpo.len() >= MAX_TOTAL {
+        let cat = if pr >= 250 && pr < 300 { 6 } else { pr / 100 };   // docs (250+) têm cota própria
+        let ja = *usado_cat.get(&cat).unwrap_or(&0);
+        if ja >= cota(cat) {
             truncado = true;
             continue;
         }
@@ -159,8 +305,10 @@ pub async fn ler_pasta_projeto(app: AppHandle, lib: State<'_, Liberadas>, candid
             continue; // binário disfarçado
         }
         let mut txt = String::from_utf8_lossy(&bytes).to_string();
-        if txt.len() > MAX_POR_ARQUIVO {
-            let mut corte = MAX_POR_ARQUIVO;
+        // README/docs de subpasta: trecho menor; README da raiz e código: até MAX_POR_ARQUIVO
+        let max_arq = if (cat == 0 && pr > 1) || cat == 6 { 6_000 } else { MAX_POR_ARQUIVO };
+        if txt.len() > max_arq {
+            let mut corte = max_arq;
             while !txt.is_char_boundary(corte) {
                 corte -= 1;
             }
@@ -168,6 +316,7 @@ pub async fn ler_pasta_projeto(app: AppHandle, lib: State<'_, Liberadas>, candid
             txt.push_str("\n…[arquivo truncado]");
             truncado = true;
         }
+        *usado_cat.entry(cat).or_insert(0) += txt.len();
         corpo.push_str(&format!("\n\n===== ARQUIVO: {} =====\n{}", rel, txt));
         lidos += 1;
     }
@@ -178,7 +327,10 @@ INSTRUÇÕES: este é o código-fonte real do projeto do usuário; analise-o dir
 Se o usuário pedir alterações, além de explicar, devolva cada arquivo alterado COMPLETO neste formato exato, \
 com caminho relativo à pasta:\n<<<ARQUIVO: caminho/relativo.ext>>>\n(conteúdo completo do arquivo)\n<<<FIM>>>\n\
 O Cerne Desktop oferecerá ao usuário um botão para gravar (com backup automático).\n\n\
+ESTRUTURA COMPLETA (diretório: nº de arquivos): {estrutura}\n\n\
+Os arquivos abaixo vêm em ORDEM DE IMPORTÂNCIA (README, manifestos, código de domínio com as regras, docs, infra; testes por último).\n\n\
 ÁRVORE DE ARQUIVOS:\n{arvore}{mais}{corpo}",
+        estrutura = estrutura,
         pasta = exibir(&base),
         total = total,
         lidos = lidos,

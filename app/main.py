@@ -455,16 +455,168 @@ def _anexos_cleanup():
         _appstate_save(APPSTATE)
 
 
-def _anexos_texto(sid, org=None):
+# Orçamento de caracteres do anexo por TIPO de modelo: o local (qwen2.5:3b, janela de 4096 tokens) descarta o que
+# não cabe — mandar 120 mil caracteres faz ele não ver NADA do anexo. Externo (Mistral/Claude…) aguenta bem mais.
+_ANEXO_LIMITE_LOCAL = int(os.getenv("ANEXO_LIMITE_LOCAL", "7000"))
+_ANEXO_LIMITE_EXTERNO = int(os.getenv("ANEXO_LIMITE_EXTERNO", "110000"))
+_PASTA_SEC_RE = re.compile(r"\n\n===== ARQUIVO: (.+?) =====\n")
+_PASTA_LOCKS = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "cargo.lock", "composer.lock", "gemfile.lock")
+
+
+def _anexo_limite(modelo):
+    """Orçamento de caracteres de anexo que o MODELO aguenta (janela + limites do provedor)."""
+    m = str(modelo or "")
+    if not m.startswith("ext-"):
+        return _ANEXO_LIMITE_LOCAL
+    if "reason" in m or "groq" in m:                  # Groq on_demand: 8k tokens/minuto
+        return 18000
+    if "nvidia" in m or "openrouter" in m:
+        return 60000
+    return _ANEXO_LIMITE_EXTERNO                      # Mistral/Codestral, Claude, Gemini…: janelas grandes
+
+
+_PASTA_DOMINIO = re.compile(r"regra|rule|valid|classific|elegib|habilit|polic|calc|status|fluxo|workflow|prazo|edital|"
+                            r"service|controller|entity|entidade|model|domain|dominio|usecase|caso", re.I)
+
+
+def _pasta_prioridade(caminho):
+    """Menor = mais importante para ENTENDER o projeto: o que é (README), stack (manifestos), as REGRAS (código de
+    domínio: services/controllers/entities/validações) e a arquitetura (docs/infra). Testes e locks por último."""
+    c = caminho.lower(); nome = c.rsplit("/", 1)[-1]; prof = c.count("/")
+    if nome in _PASTA_LOCKS or nome.endswith((".min.js", ".map", ".svg", ".lock")):
+        return 99
+    if ".spec." in nome or ".test." in nome or "/test/" in c or "/tests/" in c or "/e2e/" in c or "__tests__" in c or "__golden__" in c:
+        return 7
+    if nome.startswith("readme") or "arquitetura" in nome or "architecture" in nome:
+        return 0 + min(prof, 3) * 0.1
+    if nome.startswith(("leia-me", "leiame")):
+        return 0.05 + min(prof, 3) * 0.1
+    if nome in ("package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod", "pom.xml", "build.gradle",
+                "composer.json", "gemfile", "pnpm-workspace.yaml", "turbo.json", "setup.py") or nome.endswith(".csproj"):
+        return 1 + min(prof, 3) * 0.1
+    codigo = nome.endswith((".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".kt", ".cs", ".go", ".rs", ".rb", ".php", ".sql", ".vue", ".dart"))
+    if codigo and not nome.endswith(".sql") and _PASTA_DOMINIO.search(nome):
+        return 2 + min(prof, 6) * 0.05                 # regras/serviços/entidades: onde estão as condicionais
+    if codigo and not nome.endswith(".sql") and nome.split(".")[0] in ("main", "app", "index", "server", "settings", "urls", "routes"):
+        return 2.6 + min(prof, 6) * 0.05               # pontos de entrada: importam, mas depois das regras
+    if c.startswith("docs/") or "/docs/" in c or (nome.endswith(".md") and prof <= 1):
+        return 3 + min(prof, 3) * 0.1
+    if codigo:
+        return 4 + min(prof, 6) * 0.05
+    if nome.startswith(("dockerfile", "docker-compose", "compose.y", "cloudbuild", "makefile", "procfile")) \
+            or "/workflows/" in c or nome.endswith((".tf", "nginx.conf", ".env.example", ".yml", ".yaml")):
+        return 5 + min(prof, 3) * 0.1
+    return 6 + min(prof, 6) * 0.1
+
+
+# cota máxima do orçamento por CATEGORIA (0 README/arquitetura · 1 manifestos · 3 docs · 5 infra/CI · 6 outros · 7 testes);
+# o que sobra vai para o CÓDIGO de domínio (2) e demais fontes (4) — é ali que estão as regras e condicionais
+_PASTA_COTAS = {0: 0.22, 1: 0.06, 3: 0.15, 5: 0.06, 6: 0.04, 7: 0.05}
+
+
+_PT_STOP = set("para com que uma por como mais sobre esse essa este esta isso qual quais onde quando sendo seja "
+               "analise analisar codigo código pasta programa projeto fale diga desenvolvido arquitetura etc users user "
+               "documents chatgpt".split())
+
+
+def _pasta_compactar(texto, limite, consulta=""):
+    """Reorganiza o pacote da pasta (Cerne Desktop) para CABER no orçamento do modelo sem perder o essencial:
+    cabeçalho + resumo da árvore + arquivos por importância E relevância à pergunta (termos do pedido no caminho
+    ou no conteúdo puxam o arquivo para cima)."""
+    partes = _PASTA_SEC_RE.split(texto)
+    if len(texto) <= limite and len(partes) < 3:
+        return texto
+    cab, secoes = partes[0], list(zip(partes[1::2], partes[2::2]))
+    instr, _, arvore = cab.partition("ÁRVORE DE ARQUIVOS:\n")
+    if "ESTRUTURA COMPLETA" in instr:                  # desktop ≥1.0.6 já manda a estrutura de TODOS os diretórios
+        resumo = ""
+    else:
+        caminhos = [l.strip() for l in arvore.splitlines() if l.strip() and not l.startswith("…")]
+        dirs = {}
+        for c in caminhos:
+            d = "/".join(c.split("/")[:2]) if c.count("/") >= 2 else (c.split("/")[0] if "/" in c else "(raiz)")
+            dirs[d] = dirs.get(d, 0) + 1
+        resumo = "ESTRUTURA (diretório: nº de arquivos): " + ", ".join(f"{d}: {n}" for d, n in sorted(dirs.items(), key=lambda x: -x[1])[:50])
+    import unicodedata as _ud
+
+    def _sa(x):                                        # sem acento: "classificação" casa com "classificacao.ts"
+        return _ud.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+    termos = {t[:8] for t in re.findall(r"[a-z0-9_]{4,}", _sa(consulta)) if t not in _PT_STOP}
+
+    def chave(sec):
+        cam, cont = sec
+        p = _pasta_prioridade(cam)
+        cat = int(p)
+        hits = 0
+        if termos and cat in (2, 3, 4):                # relevância à pergunta ordena DENTRO do código/docs
+            alvo = _sa(cam) + " " + _sa(cont[:4000])
+            hits = min(sum(1 for t in termos if t in alvo), 4)
+        return (cat, -hits, p, cam)
+    ordem = sorted(secoes, key=chave)
+    # diversidade: intercala código/docs por MÓDULO (1º de cada app, depois o 2º…) — pergunta geral vê o sistema todo
+    _rank, _cont = {}, {}
+    for cam, _c in ordem:
+        k = (int(_pasta_prioridade(cam)), "/".join(cam.split("/")[:3]))
+        _rank[cam] = _cont.get(k, 0); _cont[k] = _rank[cam] + 1
+    ordem = sorted(ordem, key=lambda sc: (chave(sc)[0], chave(sc)[1], _rank[sc[0]] if chave(sc)[0] in (2, 3, 4) else 0, chave(sc)[2], sc[0]))
+    base = instr.strip()[:min(3500, max(1200, limite // 4))] + ("\n\n" + resumo if resumo else "") + "\n"
+    if len(texto) <= limite:                           # cabe tudo: só reordena (essencial primeiro)
+        return base + "".join(f"\n\n===== ARQUIVO: {c} =====\n{t}" for c, t in ordem if _pasta_prioridade(c) < 99)
+    cap_cod = max(1500, limite // 8)
+    cap_txt = max(900, limite // 14)                   # README/docs de subpasta: trecho menor (há dezenas deles)
+    usado_cat = {}
+    corpo, usados, omitidos = [], 0, 0
+    resto = limite - len(base) - 250
+    for cam, cont in ordem:
+        p = _pasta_prioridade(cam)
+        if p >= 99:
+            continue
+        cat = int(p)
+        cap = cap_cod if cat in (2, 4) else (cap_cod if p < 0.25 else cap_txt)   # README raiz ganha mais espaço
+        trecho = cont if len(cont) <= cap else cont[:cap] + "\n…[cortado]"
+        bloco = f"\n\n===== ARQUIVO: {cam} =====\n{trecho}"
+        cota = _PASTA_COTAS.get(cat)
+        if cota is not None and usado_cat.get(cat, 0) + len(bloco) > limite * cota and usado_cat.get(cat, 0) > 0:
+            omitidos += 1
+            continue
+        if len(bloco) > resto:
+            if resto > 700 and cat <= 2:
+                bloco = bloco[:resto - 20] + "\n…[cortado]"
+            else:
+                omitidos += 1
+                continue
+        corpo.append(bloco); resto -= len(bloco); usados += 1
+        usado_cat[cat] = usado_cat.get(cat, 0) + len(bloco)
+    nota = (f"\n\n[Pasta compactada para caber no modelo: {usados} arquivo(s) mais importantes/relevantes incluídos, "
+            f"{omitidos} omitido(s). Baseie-se neles e diga o que não foi possível ver.]")
+    return base + "".join(corpo) + nota
+
+
+def _anexos_texto(sid, org=None, limite=None, consulta=""):
+    """Anexos da conversa como texto. `limite` = orçamento do modelo que vai ler (local pequeno × externo).
+    Pastas lidas pelo Cerne Desktop são compactadas por importância, não cortadas no meio."""
     if not sid:
         return "", []
     org = org or _tenant()
     _anexos_cleanup()
     itens = [a for a in APPSTATE.get("anexos", []) if a.get("sid") == sid and a.get("org") == org]
-    txt = "\n\n".join("[ANEXO: " + a.get("nome", "arquivo") + "]\n" + (a.get("texto") or "") for a in itens)
-    # pasta local lida pelo Cerne Desktop (código de um projeto) precisa de muito mais espaço que um anexo comum
-    limite = 120000 if any(a.get("tipo") == "pasta" for a in itens) else 6000
-    return txt[:limite], [a.get("nome", "arquivo") for a in itens]
+    tem_pasta = any(a.get("tipo") == "pasta" for a in itens)
+    if limite is None:
+        limite = _ANEXO_LIMITE_EXTERNO if tem_pasta else 6000
+    if not tem_pasta:
+        limite = min(limite, max(6000, limite))
+    fatia = max(1500, limite // max(1, len(itens)))
+    blocos = []
+    for a in itens:
+        t = a.get("texto") or ""
+        t = _pasta_compactar(t, fatia, consulta) if a.get("tipo") == "pasta" else t[:fatia]
+        blocos.append("[ANEXO: " + a.get("nome", "arquivo") + "]\n" + t)
+    return "\n\n".join(blocos)[:limite], [a.get("nome", "arquivo") for a in itens]
+
+
+def _anexo_tem_pasta(sid, org=None):
+    org = org or _tenant()
+    return any(a.get("tipo") == "pasta" and a.get("sid") == sid and a.get("org") == org for a in APPSTATE.get("anexos", []))
 
 
 def _anexo_loop():
@@ -2543,7 +2695,8 @@ def ask_externo(body: AskExterno):
     sk_system, sk_nome, sk_cols = _skills_combinar(_sk_ids)
     if sk_cols:
         colls = list(dict.fromkeys((colls or []) + sk_cols))
-    ax, axn = _anexos_texto(body.session_id or "")
+    ax, axn = _anexos_texto(body.session_id or "", limite=_anexo_limite(getattr(body, "provider", "") or "ext-"),
+                            consulta=getattr(body, "question", "") or "")
     # busca na web (opt-in por org): também no caminho EXTERNO/híbrido — dá acesso a fatos atuais e
     # reduz alucinação (ex.: modelos/produtos novos que o provedor não conhece). A consulta usa a
     # pergunta original; o resultado (público) entra no contexto e é citado como fonte.
@@ -2881,7 +3034,7 @@ def agent(body: AgentReq):
     system, skill_nome, _skcols = _skills_combinar(_ids)
     if _skcols:
         colls = list(dict.fromkeys((colls or []) + _skcols))      # une as coleções das skills às da tarefa
-    axtxt, axnames = _anexos_texto(sid)
+    axtxt, axnames = _anexos_texto(sid, limite=_ANEXO_LIMITE_LOCAL, consulta=body.message)   # local: janela pequena
     web_on = bool(_org().get("busca_web"))
     webtxt, webfontes = _web_search(body.message) if web_on else ("", [])
     extra = "\n\n".join(x for x in (_memoria_bloco(), axtxt, webtxt) if x)     # memória + anexos + web (se ativos)
@@ -2967,13 +3120,17 @@ def agent_stream(body: AgentReq):
     system, skill_nome, _skcols = _skills_combinar(_ids)
     if _skcols:
         colls = list(dict.fromkeys((colls or []) + _skcols))
-    axtxt, axnames = _anexos_texto(sid)
+    axtxt, axnames = _anexos_texto(sid, limite=_ANEXO_LIMITE_LOCAL, consulta=body.message)   # local: janela pequena
+    _pasta_local = _anexo_tem_pasta(sid)
     lm = "chat-gemma" if body.modelo == "chat-gemma" else "chat"    # modelo local escolhido
 
     def gen():
         # narra as etapas ao vivo: [[STEP]]... antes de [[ANSWER]] (a resposta), depois [[META]]{json}
         # PLANO DE GATEWAY · cache semântico — pergunta equivalente já respondida? entrega na hora
         _orq = bool(body.orquestrar or _needs_orchestration(body.message))
+        if _pasta_local:
+            yield ("[[STEP]]📁 pasta anexada: o modelo local só enxerga um RESUMO dos arquivos mais importantes — "
+                   "para analisar o projeto inteiro, escolha um modelo externo (ex.: Mistral) no seletor")
         _ckey = _cache_chave(colls, ",".join(_ids), lm)
         if not _orq and not axtxt:                      # não cacheia orquestração nem chat com anexos
             _hit = _cache_get(body.message, _ckey)
@@ -10604,6 +10761,7 @@ class PlanoReq(BaseModel):
     tipo: str = "documento"
     colecoes: list | None = None
     session_id: str = ""         # p/ o plano refletir o anexo (case/brief) da conversa
+    modelo: str = ""             # modelo escolhido no seletor do chat (ex.: ext-mistral) — tem prioridade
 
 
 @app.post("/plano")
@@ -10650,10 +10808,13 @@ def plano(body: PlanoReq):
     titulo = (str(data.get("titulo") or "").strip() or ("Plano do " + tipo))[:120]
     resumo = str(data.get("resumo") or "").strip()[:240]
     prov = None
-    try:
-        prov = _best_provider_for(body.mensagem)
-    except Exception:
-        prov = None
+    if str(body.modelo or "").startswith("ext-") and body.modelo in _ext_permitidos(_org()):
+        prov = body.modelo
+    else:
+        try:
+            prov = _best_provider_for(body.mensagem)
+        except Exception:
+            prov = None
     externo = bool(prov) and str(prov).startswith("ext-")
     prov_nome = (str(prov).replace("ext-", "").replace("-", " ").title()) if externo else ""
     return {"titulo": titulo, "passos": passos, "resumo": resumo, "externo": externo, "provider": prov_nome}
@@ -10665,6 +10826,7 @@ class GerarReq(BaseModel):
     colecao: str = COLLECTION
     colecoes: list | None = None
     session_id: str = ""         # p/ incluir os anexos efêmeros da conversa como base do entregável
+    modelo: str = ""             # modelo escolhido no seletor do chat (ex.: ext-mistral) — tem prioridade
 
 
 def _limpa_placeholders(t):
@@ -10694,12 +10856,24 @@ def _limpa_placeholders(t):
 def gerar(body: GerarReq):
     _quota_consumir()
     hits = _search_multi(body.instrucao, 5, _colls_of(body))
-    ax, axn = _anexos_texto(body.session_id or "")
-    _parts = []
-    if ax:
-        _parts.append("DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax)
-    _parts += [h.payload.get("text", "") for h in hits]
-    ctx = "\n\n---\n\n".join(p for p in _parts if p)
+    _org_g = _org()
+    _perm = _ext_permitidos(_org_g)
+    # cadeia de provedores: o ESCOLHIDO no chat primeiro; depois o melhor da org (se híbrido); depois os demais externos
+    _cadeia = []
+    if str(body.modelo or "").startswith("ext-") and body.modelo in _perm:
+        _cadeia.append(body.modelo)
+    if _org_g.get("soberania") == "hibrido" or _cadeia:
+        _bp = _best_provider(_org_g)
+        for _p in ([_bp] if _bp else []) + [p for p in ("ext-mistral", "ext-claude", "ext-nvidia-ultra", "ext-openrouter", "ext-reason") if p in _perm]:
+            if _p and _p not in _cadeia:
+                _cadeia.append(_p)
+
+    def _ctx_para(modelo):
+        ax_, _ = _anexos_texto(body.session_id or "", limite=_anexo_limite(modelo), consulta=body.instrucao)
+        ps = (["DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax_] if ax_ else []) + [h.payload.get("text", "") for h in hits]
+        return "\n\n---\n\n".join(p for p in ps if p)
+    ax, axn = _anexos_texto(body.session_id or "", limite=_ANEXO_LIMITE_LOCAL)
+    ctx = _ctx_para(_cadeia[0] if _cadeia else "local")
     _anexo_regra = (" Se houver DOCUMENTO(S) ANEXADO(S) no contexto, trate-os como a BASE PRINCIPAL do pedido (leia o brief/case, "
                     "atenda a TODOS os pontos/perguntas dele); o acervo do projeto é apenas apoio." if axn else "")
     if body.tipo == "site":
@@ -10718,36 +10892,40 @@ def gerar(body: GerarReq):
                "Seja abrangente, concreto e específico ao contexto — nível de entrega para a diretoria — NUNCA raso, genérico ou fora do tema. "
                "Use o CONTEXTO do acervo apenas como APOIO; não copie o acervo nem troque o assunto do pedido. "
                "Responda SOMENTE com o Markdown do documento, sem explicações fora dele.")
-    org = _org()
-    prov = _best_provider(org) if org.get("soberania") == "hibrido" else None   # híbrido: modelo forte escreve o entregável
     tokens = None
-    try:
-        if prov:
-            # mascara só o PEDIDO (o ctx do acervo já vem mascarado da ingestão) -> provedor forte -> de-mascara
-            mq, mp = mask_reversible(body.instrucao)
+    usado = None
+    out = None
+    for prov in _cadeia:                                # cada externo recebe o contexto do TAMANHO que ele aguenta
+        try:
+            ctx = _ctx_para(prov)
+            mq, mp = mask_reversible(body.instrucao)    # mascara o PEDIDO (o acervo já vem mascarado da ingestão)
             raw = _chat_completo(prov, [{"role": "system", "content": sys},
                                         {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {mq}"}],
                                  max_tokens=8192, conts=2)
             out = demask(_strip_think(raw or ""), mp)
             out, _ = guard_output(out)
-        else:
+            usado = prov
+            break
+        except Exception as _e:                         # 413/429/etc. → tenta o próximo, sem cair calado no local
+            _event("geração · provedor falhou", f"{prov}: {str(_e)[:140]}")
+    if out is None:
+        try:                                            # local soberano, com um RESUMO da pasta que caiba na janela dele
+            ctx = _ctx_para("local")
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
                                     max_tokens=6000)
             out = _strip_think(out or "")
-    except Exception as e:
-        try:                                            # provedor externo falhou (429/etc.) -> cai p/ local soberano
-            out, tokens = _gen_call([{"role": "system", "content": sys},
-                                     {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=6000)
-            out = _strip_think(out or "")
+            usado = "local"
         except Exception as e2:
             return JSONResponse(status_code=502, content={"error": "falha na geração", "detail": str(e2)[:300]})
     out = re.sub(r"^```[a-zA-Z]*\n?", "", out.strip())
     out = re.sub(r"\n?```$", "", out).strip()
     out = _limpa_placeholders(out)
-    _event("geração", f"{body.tipo} · {body.instrucao[:50]}")
-    return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits})}
+    _event("geração", f"{body.tipo} · {usado} · {body.instrucao[:50]}")
+    return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits}),
+            "provedor": usado, "externo": str(usado).startswith("ext-"),
+            "provedor_nome": (str(usado).replace("ext-", "").replace("-", " ").title() if str(usado).startswith("ext-") else ""),
+            "escolhido_falhou": bool(_cadeia and body.modelo and usado != body.modelo and str(body.modelo).startswith("ext-"))}
 
 
 # ---- geração/ajuste de CÓDIGO com preview (código novo ou correção antes/depois) ----
@@ -10798,7 +10976,7 @@ def codigo(body: CodigoReq):
                 "CODIGO:\n```python\n<código completo>\n```\n"
                 "(troque 'python' pela linguagem real que você usou)")
     base = (f"Contexto do acervo (use como referência técnica se ajudar):\n{ctx}\n\n" if ctx else "")
-    axtxt, _axn = _anexos_texto(body.sid)
+    axtxt, _axn = _anexos_texto(body.sid, limite=(_ANEXO_LIMITE_EXTERNO if prov else _ANEXO_LIMITE_LOCAL))
     if axtxt:                                        # código do projeto anexado na conversa = base real do pedido
         base = "[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n" + base
     try:
@@ -10975,8 +11153,15 @@ def interpretar(body: InterpretarReq):
         intent = "responder"
     else:
         intent = "perguntar"
+    # pasta de código anexada + pergunta/análise ("analise", "me fale", "o que é", "arquitetura"...) = RESPONDER
+    # sobre o código, não gerar um relatório executivo (que ignora o código e devolve texto genérico)
+    _quer_doc = re.search(r"\b(gere|gerar|crie|criar|elabore|monte|escreva|redija)\b.*\b(documento|relat[oó]rio|docx|pdf|apresenta|site|p[aá]gina)", body.mensagem, re.I)
+    if _anexo_tem_pasta(body.session_id or "") and not _quer_doc and re.search(
+            r"analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|qual|quais|como funciona|arquitetura|entend|descrev|resum|stack|tecnologia",
+            body.mensagem, re.I):
+        intent, texto = "perguntar", ""
     # rede de segurança: anexo presente + verbo de construção -> é 'documento' (o assunto está no anexo, não é vago)
-    if axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
+    elif axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
         intent = "documento"; texto = ""
     if intent in ("responder", "esclarecer") and not texto:
         texto = ("Consigo responder sobre os documentos deste projeto e gerar documentos ou sites com base neles. "
@@ -13158,7 +13343,7 @@ async function lerPastaLocal(msg,th,tk){const m=(msg||'').match(LOCAL_PATH_RE);i
  if(!isDesk()){noteBefore(th,'📁 Você citou um caminho do seu computador (<code>'+esc(m[0].trim())+'</code>). Pelo navegador eu não tenho acesso ao seu disco — abra no <b>Cerne Desktop</b> (ele pede sua permissão e lê a pasta) ou anexe os arquivos com 📎.');return;}
  const inv=tauriInvoke();if(!inv){noteBefore(th,'📁 Para eu ler <code>'+esc(m[0].trim())+'</code>, atualize o Cerne Desktop (ícone na bandeja → <b>Verificar atualização</b>) e reinicie.');return;}
  relabel(tk,'aguardando sua permissão para ler a pasta');
- try{const r=await inv('ler_pasta_projeto',{candidato:m[0]});relabel(tk,'anexando a pasta à conversa');
+ try{const r=await inv('ler_pasta_projeto',{candidato:m[0],consulta:msg});relabel(tk,'anexando a pasta à conversa');
   const fd=new FormData();fd.append('file',new Blob([r.texto],{type:'text/plain'}),'pasta-'+(r.nome||'local').replace(/[^\w.-]+/g,'_')+'.txt');
   const a=await(await fetch('/anexo?tipo=pasta&sid='+encodeURIComponent(ensureSid()),{method:'POST',body:fd})).json();
   if(a&&a.id){WS.anexos=WS.anexos||[];WS.anexos.push({id:a.id,nome:a.nome});WS.pastaLocal=r.pasta;const t=curTask();if(t){t.anexos=WS.anexos;t.pastaLocal=r.pasta;saveTasks();}renderAxChips();}
@@ -13188,11 +13373,11 @@ function showSources(fs){const el=document.getElementById("cvSources");if(!el)re
 // Decide se a resposta é um DOCUMENTO longo (plano/relatório) — melhor lido na Prévia — ou conversa curta (chat).
 /* ---- Modo agente: plano -> aprovação -> execução (só gasta o modelo após o OK) ---- */
 let _PLANS={};
-async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
+async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid,modelo:WS.model||''})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
 function wPlanRun(k,btn){const it=_PLANS[k];if(!it)return;delete _PLANS[k];const bub=btn.closest('.bub');wGerarExec(it,bub);}
 function wPlanEdit(k){const it=_PLANS[k];if(!it)return;const inp=document.getElementById('amsg');if(inp){inp.value=it.msg;inp.focus();}try{toast('Ajuste o pedido e envie de novo.','info');}catch(e){}}
 function wPlanCancel(k,btn){delete _PLANS[k];const bub=btn.closest('.bub');if(bub)bub.innerHTML='<span class="faint">Plano cancelado — nada foi gerado.</span>';}
-async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
+async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid,modelo:WS.model||''})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';const ext=(r.externo!==undefined)?r.externo:it.externo;const pn=(r.provedor_nome!==undefined)?r.provedor_nome:it.provider;bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.'+(r.escolhido_falhou?'<div class="faint" style="margin-top:4px">⚠️ o modelo escolhido falhou (limite/erro do provedor) — usei '+esc(pn||'o modelo local')+'.</div>':'')+'<div class="trace" style="margin-top:5px">'+provSeal(ext?'ext':'local',{model:pn})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
 let _DOCS={};
 function isLongDoc(t){t=t||'';if(t.length<1400)return false;
  const heads=(t.match(/^#{1,4}\s+\S/gm)||[]).length;
