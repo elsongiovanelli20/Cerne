@@ -24,6 +24,8 @@ import re
 import threading
 
 ODKIT_DIR = os.getenv("ODKIT_DIR", "/opt/odkit")
+# VoltAgent/awesome-design-md (MIT): DESIGN.md de sites reais, com tokens no front matter. Baixado no build junto do kit.
+ADM_DIR = os.getenv("ODKIT_ADM_DIR", "") or os.path.join(ODKIT_DIR, "awesome-design-md")
 _LOCK = threading.Lock()
 _CACHE: dict | None = None
 
@@ -242,10 +244,145 @@ def _load_design_systems(base, descr):
             "blurb": (blurb.group(1).strip() if blurb else "")[:200],
             "paleta": paleta[:5], "fontes": fontes or ["system-ui"],
             "dark": bool(bg is not None and bg < 0.2),
-            "kind": de.get("kind", ""), "moods": de.get("moods", []),
+            "kind": de.get("kind", ""), "fonte": "open-design", "moods": de.get("moods", []),
             "industries": de.get("industries", []), "surfaces": de.get("surfaces", []),
             "_root": root, "_md_path": os.path.join(p, "DESIGN.md"),
             "_components": os.path.join(p, "components.html") if os.path.exists(os.path.join(p, "components.html")) else "",
+        }
+    return out
+
+
+# ---- awesome-design-md: front matter (colors/typography/rounded) → bloco :root no padrão de tokens do Open Design ----
+def _fm_block(fm, name):
+    m = re.search(r"^" + re.escape(name) + r":[ \t]*\n((?:[ \t]+.*\n?|\s*\n)+)", fm, re.M)
+    return m.group(1) if m else ""
+
+
+def _adm_parse(md):
+    """Lê o front matter de um DESIGN.md do awesome-design-md sem depender de YAML válido
+    (várias descrições têm ':' sem aspas). Retorna (cores, fontes{display,body}, raios, descrição, corpo)."""
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", md or "", re.S)
+    fm, body = (m.group(1), m.group(2)) if m else ("", md or "")
+    cores = {}
+    for k, v in re.findall(r"^[ \t]{2}([\w-]+):\s*[\"']?(#[0-9a-fA-F]{3,8})\b", _fm_block(fm, "colors"), re.M):
+        h = _hex_norm(v[:7])
+        if h:
+            cores.setdefault(k, h)
+    fontes = {}
+    tipo = _fm_block(fm, "typography")
+    for nome, bloco in re.findall(r"^[ \t]{2}([\w-]+):[ \t]*\n((?:[ \t]{4,}.*\n?)+)", tipo, re.M):
+        ff = re.search(r"fontFamily:\s*(.+)", bloco)
+        fam = _first_font(ff.group(1).strip().strip("\"'")) if ff else ""
+        if not fam:
+            continue
+        if nome.startswith(("display", "headline", "heading", "hero", "title")):
+            fontes.setdefault("display", fam)
+        if nome.startswith(("body", "text", "paragraph")):
+            fontes.setdefault("body", fam)
+        fontes.setdefault("any", fam)
+    if not fontes.get("any"):                               # sem front matter: seção "### Font Family" do texto
+        sec = re.search(r"###\s*Font Famil[a-z]*\s*\n(.*?)(?:\n#{2,3}\s|\Z)", body, re.S | re.I)
+        for rot, val in re.findall(r"^\s*-\s*\*\*([^*]+?)\*\*:?\*?\*?:?\s*`([^`]+)`", sec.group(1) if sec else "", re.M):
+            fam = _first_font(val)
+            if not fam:
+                continue
+            r = rot.lower()
+            if any(w in r for w in ("display", "headline", "heading", "title")):
+                fontes.setdefault("display", fam)
+            if any(w in r for w in ("text", "body", "ui", "primary", "sans")):
+                fontes.setdefault("body", fam)
+            fontes.setdefault("any", fam)
+    raios = {}
+    for k, v in re.findall(r"^[ \t]{2}([\w-]+):\s*[\"']?([\d.]+px|9999px|0)\b", _fm_block(fm, "rounded"), re.M):
+        raios[k] = v
+    desc = ""
+    dm = re.search(r"^description:\s*(.+)$", fm, re.M)
+    if dm:
+        desc = dm.group(1).strip().strip("\"'")
+    if not cores:                                           # sem front matter: hex citados no texto
+        for h in re.findall(r"#[0-9a-fA-F]{6}\b", body):
+            h = _hex_norm(h)
+            if h and h not in cores.values():
+                cores[f"c{len(cores) + 1}"] = h
+            if len(cores) >= 8:
+                break
+    return cores, fontes, raios, desc, body
+
+
+def _escuro(h):
+    l = _lum(h)
+    return l is not None and l < 0.2
+
+
+def _adm_root(cores, fontes, raios):
+    def pick(*ks):
+        for k in ks:
+            if cores.get(k):
+                return cores[k]
+        return ""
+    vals = list(cores.values())
+    if not any(k in cores for k in ("primary", "canvas", "ink")):   # sem front matter: heurística por cor
+        neutros = [v for v in vals if _hue(v)[1] < 0.18]
+        satur = sorted([v for v in vals if _hue(v)[1] >= 0.35], key=lambda v: -_hue(v)[1])
+        bg0 = neutros[0] if neutros else "#ffffff"
+        fg0 = max(neutros, key=lambda v: contraste(v, bg0) or 0) if len(neutros) > 1 else ("#f5f5f5" if _escuro(bg0) else "#111111")
+        cores = {"primary": satur[0] if satur else (vals[0] if vals else "#2563eb"), "canvas": bg0, "ink": fg0, **cores}
+    bg = (pick("canvas", "background", "bg", "canvas-light", "surface-canvas-light", "canvas-white", "surface",
+               "white", "canvas-dark", "canvas-night", "surface-canvas-dark") or (vals[1] if len(vals) > 1 else "#ffffff"))
+    fg = pick("ink", "body", "text", "foreground", "on-surface", "black") or ("#f5f5f5" if _escuro(bg) else "#111111")
+    if (contraste(fg, bg) or 21) < 4.5:                      # garante texto legível sobre o fundo
+        cands = [v for k, v in cores.items() if k.startswith(("on-", "ink", "body", "text", "white", "black"))]
+        cands += ["#ffffff", "#111111"]
+        fg = max(cands, key=lambda v: contraste(v, bg) or 0)
+    acc = pick("primary", "accent", "brand", "c1") or (vals[0] if vals else "#2563eb")
+    linhas = [
+        ("--bg", bg), ("--surface", pick("surface-card", "surface", "surface-soft", "canvas-soft") or bg),
+        ("--fg", fg), ("--muted", pick("muted", "mute", "body-soft", "body-muted", "text-secondary", "stone", "slate", "ash", "charcoal", "gray", "grey") or fg),
+        ("--border", pick("hairline", "border", "hairline-soft", "divider") or fg),
+        ("--accent", acc), ("--accent-hover", pick("primary-active", "primary-deep", "primary-press", "primary-hover") or acc),
+        ("--on-accent", pick("on-primary") or ("#ffffff" if (_lum(acc) if _lum(acc) is not None else 0) < 0.5 else "#111111")),
+    ]
+    for k in ("success", "warning", "error", "link"):
+        if cores.get(k):
+            linhas.append(("--" + k, cores[k]))
+    fd = fontes.get("display") or fontes.get("any") or "system-ui"
+    fb = fontes.get("body") or fontes.get("any") or "system-ui"
+    linhas += [("--font-display", f"'{fd}', system-ui, sans-serif"), ("--font-body", f"'{fb}', system-ui, sans-serif")]
+    for k, alvo in (("sm", "--radius-sm"), ("md", "--radius-md"), ("lg", "--radius-lg")):
+        if raios.get(k):
+            linhas.append((alvo, raios[k]))
+    if raios.get("full") or raios.get("pill"):
+        linhas.append(("--radius-pill", raios.get("pill") or raios.get("full")))
+    for k, v in cores.items():                              # paleta completa da marca, com o nome original
+        linhas.append(("--c-" + re.sub(r"[^\w-]", "", k), v))
+    return ":root {\n" + "\n".join(f"  {k}: {v};" for k, v in linhas) + "\n}"
+
+
+def _load_adm(base):
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    raiz = os.path.join(base, "design-md") if os.path.isdir(os.path.join(base, "design-md")) else base
+    for slug in sorted(os.listdir(raiz)):
+        path = os.path.join(raiz, slug, "DESIGN.md")
+        md = _read(path)
+        if not md:
+            continue
+        cores, fontes, raios, desc, _body = _adm_parse(md)
+        h1 = re.search(r"^#\s+(.+)$", _read(os.path.join(raiz, slug, "README.md"), 400), re.M)
+        nome = (h1.group(1) if h1 else slug).replace("Inspired Design System Analysis", "").replace("Design System Inspired by", "").strip()
+        nome = nome or slug.replace("-", " ").title()
+        root = _adm_root(cores, fontes, raios)
+        tk = _tokens(root)
+        paleta = list(dict.fromkeys(x for x in (_hex_norm(tk.get(k, "")) for k in ("--accent", "--bg", "--fg", "--surface", "--accent-hover")) if x))
+        key = "adm-" + re.sub(r"[^a-z0-9-]+", "-", slug.lower()).strip("-")
+        out[key] = {
+            "id": "od:" + key, "slug": key, "nome": nome, "categoria": "awesome-design-md",
+            "blurb": re.sub(r"\s+", " ", desc)[:200], "paleta": paleta[:5],
+            "fontes": list(dict.fromkeys(x for x in (fontes.get("display"), fontes.get("body")) if x)) or ["system-ui"],
+            "dark": _escuro(tk.get("--bg", "#ffffff")),
+            "kind": "brand", "fonte": "awesome-design-md", "moods": [], "industries": [], "surfaces": ["web"],
+            "_root": root, "_md_path": path, "_strip_fm": True, "_components": "",
         }
     return out
 
@@ -328,7 +465,7 @@ def _load():
     return {
         "ok": True, "base": base,
         "manifest": _json(os.path.join(base, "MANIFEST.json"), {}) or {},
-        "sistemas": _load_design_systems(base, descr),
+        "sistemas": {**_load_design_systems(base, descr), **_load_adm(ADM_DIR)},
         "receitas": _load_recipes(base, craft_req),
         "exemplos": _load_examples(base),
         "craft": craft, "surfaces": surfaces,
@@ -373,7 +510,9 @@ def info():
     man = k.get("manifest") or {}
     return {"ok": True, "origem": man.get("sourceRepo", ""), "versao": man.get("sourceRef", ""),
             "sincronizado": man.get("syncedAt", ""),
-            "contagem": {"sistemas": len(k["sistemas"]), "receitas": len(k["receitas"]),
+            "contagem": {"sistemas": len(k["sistemas"]),
+                         "adm": len([x for x in k["sistemas"].values() if x.get("fonte") == "awesome-design-md"]),
+                         "receitas": len(k["receitas"]),
                          "exemplos": len(k["exemplos"]), "craft": len(k["craft"])}}
 
 
@@ -392,8 +531,11 @@ def sistema_contrato(sid, rico=True):
     if not s:
         return ""
     md = _read(s["_md_path"])
+    if s.get("_strip_fm"):                                  # awesome-design-md: os tokens já estão no :root
+        md = re.sub(r"^---\s*\n.*?\n---\s*\n?", "", md, count=1, flags=re.S)
     md = re.sub(r"^#\s+.*\n", "", md, count=1)
-    return ("\nDESIGN SYSTEM OPEN DESIGN — " + s["nome"] + " (" + s["categoria"] + "). Siga-o como fonte de verdade.\n"
+    origem = "AWESOME-DESIGN-MD (VoltAgent)" if s.get("fonte") == "awesome-design-md" else "OPEN DESIGN"
+    return ("\nDESIGN SYSTEM " + origem + " — " + s["nome"] + " (" + s["categoria"] + "). Siga-o como fonte de verdade.\n"
             "1) Cole este bloco :root LITERALMENTE no primeiro <style> do HTML e use as cores/fontes/raios SEMPRE via var(--nome) "
             "— nunca reescreva os hex soltos fora do :root:\n" + s["_root"] + "\n"
             "2) DESIGN.md (atmosfera, tipografia, componentes, do/don't):\n" + _trim(md, 9000 if rico else 2400))

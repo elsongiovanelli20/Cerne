@@ -1,4 +1,4 @@
-# ---- Estágio 1: conteúdo do Open Design Agent Kit (design systems, receitas, exemplos, craft) ----
+# ---- Estágio 1: conteúdo do Open Design Agent Kit (design systems, receitas, exemplos, craft) + awesome-design-md ----
 # Kit: https://github.com/feimacode/open-design-agent-kit (MIT) — conteúdo vendorizado do
 # nexu-io/open-design (Apache-2.0). Pinado num commit p/ builds reprodutíveis; troque ODKIT_REF para atualizar.
 # Só o conteúdo (~20 MB) é baixado (sparse checkout); nada do kit roda em runtime — o Cerne lê os arquivos.
@@ -9,6 +9,14 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/feimacode/open
  && git sparse-checkout set --no-cone "/packages/content/assets/open-design/" "/LICENSE" \
  && git checkout ${ODKIT_REF} \
  && cp LICENSE packages/content/assets/open-design/LICENSE-open-design-agent-kit.txt
+# awesome-design-md (VoltAgent, MIT): DESIGN.md de sites reais (tokens no front matter) — vira mais uma seção da galeria
+ARG ADM_REF=fcc70284932276d085f01ef9f83edde90b1258cb
+RUN git clone --filter=blob:none --no-checkout https://github.com/VoltAgent/awesome-design-md.git /adm \
+ && cd /adm \
+ && git sparse-checkout set --no-cone "/design-md/" "/LICENSE" \
+ && git checkout ${ADM_REF} \
+ && mkdir -p /odak/packages/content/assets/open-design/awesome-design-md \
+ && cp -r design-md LICENSE /odak/packages/content/assets/open-design/awesome-design-md/
 
 # ---- Estágio 2: app ----
 FROM python:3.11-slim

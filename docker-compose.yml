@@ -112,6 +112,24 @@ services:
     mem_limit: 2g
     restart: unless-stopped
 
+  docling:
+    # Docling Serve (IBM / LF AI & Data, MIT): PDF/DOCX/PPTX/XLSX/HTML → Markdown com layout, ordem de leitura,
+    # tabelas e OCR de documento escaneado. Opcional: ative com COMPOSE_PROFILES=docling e DOCLING_URL=http://docling:5001
+    # no .env. Imagem CPU multi-arch (amd64 + arm64/Ampere), ~4.4 GB; modelos carregam no boot (1º start mais lento).
+    image: ${DOCLING_IMAGE:-quay.io/docling-project/docling-serve-cpu:latest}
+    container_name: cerne-docling
+    profiles: ["docling"]
+    environment:
+      - DOCLING_SERVE_ENABLE_UI=false
+      - DOCLING_SERVE_MAX_SYNC_WAIT=600          # PDFs grandes: até 10 min no endpoint síncrono
+      - DOCLING_SERVE_MAX_NUM_PAGES=${DOCLING_MAX_PAGES:-500}
+      - DOCLING_SERVE_MAX_FILE_SIZE=${DOCLING_MAX_FILE_SIZE:-104857600}
+      - DOCLING_NUM_THREADS=${DOCLING_THREADS:-4}
+      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1
+      - DOCLING_SERVE_API_KEY=${DOCLING_API_KEY:-}
+    mem_limit: ${DOCLING_MEM:-4g}
+    restart: unless-stopped                      # sem porta publicada: só o app (rede interna) acessa
+
   neo4j:
     image: neo4j:5-community
     container_name: cerne-neo4j
@@ -149,6 +167,10 @@ services:
       - ADMIN_SENHA=${ADMIN_SENHA:-}          # senha inicial do admin do painel; vazio = gerada e impressa no log
       - AUTH_TTL_HORAS=${AUTH_TTL_HORAS:-12}  # validade da sessão de login (horas)
       - NANOCLAW_DB=/data/nanoclaw/v2.db      # estado do runtime de agentes (somente-leitura) p/ o painel Runtime
+      - DOCLING_URL=${DOCLING_URL:-}            # http://docling:5001 com o perfil "docling" ligado; vazio = extratores locais
+      - DOCLING_API_KEY=${DOCLING_API_KEY:-}
+      - LANGFUSE_URL=${LANGFUSE_URL:-}          # preenchido pelo docker-compose.langfuse.yml
+      - LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-}
       - ODKIT_DIR=${ODKIT_DIR:-/opt/odkit}    # Open Design Agent Kit (conteúdo baixado no build); aponte p/ outra pasta montada se quiser
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
