@@ -53,6 +53,11 @@ EMBED_ALIAS = os.getenv("EMBED_ALIAS", "embed")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
 COLLECTION = os.getenv("COLLECTION", "cerne_docs")
 RERANK = os.getenv("RERANK", "1") == "1"   # reranking híbrido (vetorial + lexical)
+DOCLING_URL = os.getenv("DOCLING_URL", "").rstrip("/")   # Docling Serve (IBM, MIT) — parser de PDF/Office com layout,
+DOCLING_KEY = os.getenv("DOCLING_API_KEY", "")              # tabelas e OCR; vazio = desligado (usa os extratores locais)
+DOCLING_TIMEOUT = float(os.getenv("DOCLING_TIMEOUT", "620"))
+LANGFUSE_URL = os.getenv("LANGFUSE_URL", "").rstrip("/")    # Langfuse self-hosted (traces do gateway); vazio = desligado
+LANGFUSE_PUBLIC_URL = os.getenv("LANGFUSE_PUBLIC_URL", "").rstrip("/") or LANGFUSE_URL
 RERANK_URL = os.getenv("RERANK_URL", "")   # se setado, usa o cross-encoder neural (serviço rerank)
 NEO4J_URL = os.getenv("NEO4J_URL", "")     # ex.: bolt://neo4j:7687 (vazio = grafo desligado)
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
@@ -1313,10 +1318,27 @@ def _cache_limpar_org():
         _SEMCACHE.pop(k, None)
 
 
+def _lf_meta(nome: str) -> dict:
+    """Metadados de trace p/ o Langfuse (via LiteLLM): nome da feature, usuário e organização.
+    Só é enviado com o Langfuse ligado (LANGFUSE_URL); 'metadata' é consumido pelo LiteLLM e não vai ao provedor."""
+    if not LANGFUSE_URL:
+        return {}
+    try:
+        user = _actor()
+    except Exception:
+        user = "sistema"
+    try:
+        org = _tenant() or "default"
+    except Exception:
+        org = "default"
+    return {"metadata": {"trace_name": "cerne:" + nome, "generation_name": nome, "trace_user_id": user,
+                         "tags": ["cerne", nome, "org:" + str(org)]}}
+
+
 def chat_model(model: str, messages: list, max_tokens: int = 1024) -> str:
     r = httpx.post(f"{GATEWAY_URL}/v1/chat/completions", headers=HEADERS,
                    json={"model": model, "messages": messages,
-                         "temperature": 0.2, "max_tokens": max_tokens}, timeout=600)
+                         "temperature": 0.2, "max_tokens": max_tokens, **_lf_meta("chat")}, timeout=600)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -1329,7 +1351,8 @@ def _chat_completo(model, messages, max_tokens=1024, conts=2):
     msgs = list(messages)
     for _ in range(max(1, conts + 1)):
         r = httpx.post(f"{GATEWAY_URL}/v1/chat/completions", headers=HEADERS,
-                       json={"model": model, "messages": msgs, "temperature": 0.2, "max_tokens": max_tokens},
+                       json={"model": model, "messages": msgs, "temperature": 0.2, "max_tokens": max_tokens,
+                             **_lf_meta("geracao-completa")},
                        timeout=900)
         r.raise_for_status()
         ch = r.json()["choices"][0]
@@ -1376,7 +1399,8 @@ def chat(messages: list) -> str:
 def _gen_call(messages, max_tokens=2000):
     """Chamada de geração (documento/site) com mais tokens; retorna (texto, total_tokens reais)."""
     r = httpx.post(f"{GATEWAY_URL}/v1/chat/completions", headers=HEADERS,
-                   json={"model": "chat", "messages": messages, "temperature": 0.3, "max_tokens": max_tokens}, timeout=900)
+                   json={"model": "chat", "messages": messages, "temperature": 0.3, "max_tokens": max_tokens,
+                         **_lf_meta("documento")}, timeout=900)
     r.raise_for_status()
     j = r.json()
     return j["choices"][0]["message"]["content"], (j.get("usage") or {}).get("total_tokens")
@@ -1385,7 +1409,7 @@ def _gen_call(messages, max_tokens=2000):
 def _stream_tokens(messages, model=None):
     with httpx.stream("POST", f"{GATEWAY_URL}/v1/chat/completions", headers=HEADERS,
                       json={"model": model or CHAT_ALIAS, "messages": messages, "temperature": 0.2,
-                            "max_tokens": 1024, "stream": True}, timeout=600) as r:
+                            "max_tokens": 1024, "stream": True, **_lf_meta("chat-stream")}, timeout=600) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line or not line.startswith("data: "):
@@ -1475,11 +1499,106 @@ def _vision_describe(raw: bytes, prompt: str = "") -> str:
     return ((r.json().get("message") or {}).get("content") or "").strip()
 
 
+# ---- Docling (opcional): conversão de PDF/Office para Markdown com layout, ordem de leitura, tabelas e OCR ----
+DOCLING_EXT = (".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm")
+OFFICE_EXT = (".docx", ".pptx", ".xlsx")
+_DOCLING_OK = {"v": None, "ts": 0.0}
+
+
+def _docling_available() -> bool:
+    """True se o Docling Serve responder (checagem cacheada por 60s, para não atrasar cada arquivo)."""
+    if not DOCLING_URL:
+        return False
+    if _DOCLING_OK["v"] is not None and (time.time() - _DOCLING_OK["ts"]) < 60:
+        return _DOCLING_OK["v"]
+    ok = False
+    for path in ("/health", "/version"):
+        try:
+            ok = httpx.get(DOCLING_URL + path, timeout=5).status_code < 500
+            if ok:
+                break
+        except Exception:
+            ok = False
+    _DOCLING_OK["v"] = ok; _DOCLING_OK["ts"] = time.time()
+    return ok
+
+
+def _docling_convert(filename: str, raw: bytes) -> str:
+    """Converte um arquivo pelo Docling Serve → Markdown (tabelas preservadas). Retorna "" se falhar."""
+    data = {"to_formats": "md", "image_export_mode": "placeholder", "do_ocr": "true",
+            "ocr_lang": ["pt", "en"], "table_mode": "accurate", "abort_on_error": "false"}   # lista = campo repetido
+    headers = {"X-Api-Key": DOCLING_KEY} if DOCLING_KEY else {}
+    try:
+        r = httpx.post(f"{DOCLING_URL}/v1/convert/file", files={"files": (filename or "arquivo", raw)},
+                       data=data, headers=headers, timeout=DOCLING_TIMEOUT)
+        if r.status_code >= 400:
+            print("[cerne] docling", r.status_code, r.text[:160])
+            return ""
+        j = r.json()
+        if j.get("status") not in ("success", "partial_success"):
+            print("[cerne] docling status:", j.get("status"), str(j.get("errors"))[:160])
+            return ""
+        return ((j.get("document") or {}).get("md_content") or "").strip()
+    except Exception as e:
+        print("[cerne] docling falhou:", str(e)[:160])
+        _DOCLING_OK["v"] = None                        # força rechecagem na próxima
+        return ""
+
+
+def _office_text(fn: str, raw: bytes) -> str:
+    """Fallback local (sem Docling) para Word/PowerPoint/Excel — texto + tabelas em Markdown simples."""
+    buf = io.BytesIO(raw)
+    if fn.endswith(".docx"):
+        from docx import Document as _Docx
+        d = _Docx(buf)
+        partes = [p.text for p in d.paragraphs if p.text.strip()]
+        for t in d.tables:
+            linhas = ["| " + " | ".join(c.text.strip().replace("\n", " ") for c in row.cells) + " |" for row in t.rows]
+            if linhas:
+                partes.append("\n".join(linhas))
+        return "\n\n".join(partes)
+    if fn.endswith(".pptx"):
+        from pptx import Presentation
+        out = []
+        for i, sl in enumerate(Presentation(buf).slides, 1):
+            txt = []
+            for sh in sl.shapes:
+                if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip():
+                    txt.append(sh.text_frame.text.strip())
+                if getattr(sh, "has_table", False):
+                    for row in sh.table.rows:
+                        txt.append("| " + " | ".join(c.text.strip() for c in row.cells) + " |")
+            if txt:
+                out.append(f"## Slide {i}\n" + "\n".join(txt))
+        return "\n\n".join(out)
+    if fn.endswith(".xlsx"):
+        from openpyxl import load_workbook
+        wb = load_workbook(buf, read_only=True, data_only=True)
+        out = []
+        for ws in wb.worksheets:
+            linhas = []
+            for row in ws.iter_rows(values_only=True):
+                if any(v is not None and str(v).strip() for v in row):
+                    linhas.append("| " + " | ".join("" if v is None else str(v) for v in row) + " |")
+                if len(linhas) >= 5000:
+                    break
+            if linhas:
+                out.append(f"## Aba {ws.title}\n" + "\n".join(linhas))
+        return "\n\n".join(out)
+    return ""
+
+
 def extract_text(filename: str, raw: bytes) -> str:
     fn = filename.lower()
+    if fn.endswith(DOCLING_EXT) and _docling_available():   # Docling: layout, tabelas e OCR de PDF escaneado
+        md = _docling_convert(filename, raw)
+        if md:
+            return md
     if fn.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(raw))
         return "\n".join((p.extract_text() or "") for p in reader.pages)
+    if fn.endswith(OFFICE_EXT):
+        return _office_text(fn, raw)
     if fn.endswith(IMG_EXT):                              # imagem/scan -> OCR (Tesseract) + visão local (VLM)
         import pytesseract
         from PIL import Image
@@ -1502,7 +1621,7 @@ def extract_text(filename: str, raw: bytes) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-_INGEST_EXT = (".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html", ".xml", ".yaml", ".yml") + IMG_EXT
+_INGEST_EXT = (".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html", ".htm", ".xml", ".yaml", ".yml") + OFFICE_EXT + IMG_EXT
 
 
 def _is_ingestable(name):
@@ -1852,7 +1971,9 @@ async def ingest_file(file: UploadFile = File(...), colecao: str = COLLECTION):
         elif is_img:
             aviso = "não foi possível extrair texto nem descrição visual desta imagem."
         else:
-            aviso = "nenhum texto extraível (PDF digitalizado sem OCR? tente exportar como texto)."
+            aviso = ("nenhum texto extraível (PDF digitalizado?). Ative o Docling (OCR com layout e tabelas): "
+                     "COMPOSE_PROFILES=docling e DOCLING_URL=http://docling:5001 no .env." if not _docling_available()
+                     else "nenhum texto extraível, nem pelo Docling.")
         return {"source": file.filename, "chunks_indexed": 0, "pii_entities_count": 0, "aviso": aviso}
     return await run_in_threadpool(_ingest, txt, file.filename, colecao)
 
@@ -2523,7 +2644,7 @@ AGENT_SYSTEM = (
 def _chat_tools(model, messages):
     r = httpx.post(f"{GATEWAY_URL}/v1/chat/completions", headers=HEADERS,
                    json={"model": model, "messages": messages, "tools": TOOLS,
-                         "temperature": 0.2, "max_tokens": 600}, timeout=600)
+                         "temperature": 0.2, "max_tokens": 600, **_lf_meta("agente-ferramentas")}, timeout=600)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]
 
@@ -3332,6 +3453,10 @@ def stats():
         servicos["neo4j"] = g is not None
     if SEARXNG_URL:
         servicos["busca_web"] = _svc_up(f"{SEARXNG_URL}/healthz") or _svc_up(SEARXNG_URL)
+    if DOCLING_URL:
+        servicos["docling"] = _docling_available()
+    if LANGFUSE_URL:
+        servicos["langfuse"] = _svc_up(f"{LANGFUSE_URL}/api/public/health")
     return {
         "servicos": servicos,
         "vetores_indexados": docs,
@@ -3395,7 +3520,13 @@ def observability():
             lats.append(x["request_duration_ms"])
     agg = {"requisicoes": len(logs), "tokens": tot_tok, "custo": round(tot_cost, 5),
            "lat_media_ms": round(sum(lats) / len(lats)) if lats else None}
-    return {"agregado": agg, "recentes": recent}
+    return {"agregado": agg, "recentes": recent, "langfuse": _langfuse_info()}
+
+
+def _langfuse_info():
+    if not LANGFUSE_URL:
+        return {"ligado": False}
+    return {"ligado": True, "ok": _svc_up(f"{LANGFUSE_URL}/api/public/health"), "url": LANGFUSE_PUBLIC_URL}
 
 
 @app.get("/config")
@@ -3434,6 +3565,10 @@ def preflight():
         add("Reranker (BGE) acessível", _svc_up(f"{RERANK_URL}/health"))
     if NEO4J_URL:
         add("Grafo (Neo4j) acessível", _graph_counts() is not None)
+    if DOCLING_URL:
+        add("Docling (PDF/Office com layout, tabelas e OCR) acessível", _docling_available(), DOCLING_URL)
+    if LANGFUSE_URL:
+        add("Langfuse (traces do gateway) acessível", _svc_up(f"{LANGFUSE_URL}/api/public/health"), LANGFUSE_PUBLIC_URL)
     lg = _audit_read(1)
     add("Audit ledger íntegro", lg.get("integro", True), f"{lg.get('total', 0)} registros")
     passing = sum(1 for c in checks if c["ok"])
@@ -10469,7 +10604,7 @@ def _design_kit_lista():
     od = odkit.sistemas()
     return {"kit": odkit.info(),
             "sistemas_od": [{"id": x["id"], "nome": x["nome"], "categoria": x["categoria"], "paleta": x["paleta"],
-                             "fontes": x["fontes"], "dark": x["dark"], "blurb": x["blurb"], "kind": x["kind"],
+                             "fontes": x["fontes"], "dark": x["dark"], "blurb": x["blurb"], "kind": x["kind"], "fonte": x.get("fonte", ""),
                              "od": True, "custom": False} for x in od]}
 
 
@@ -12827,13 +12962,13 @@ function skView(id){const s=(SKILLS_ALL||[]).find(x=>x.id===id);if(!s)return;con
 V.components=async()=>{const s=await J('/stats'),svc=s.servicos||{};
  const P=[
   ["Plano de Qualidade","Feedback 👍/👎 nas respostas → dataset dourado → regressão no deploy + avaliação adversarial contínua",["feedback","golden set","regressão","harness"],true,false],
-  ["Plano de Governança","Observabilidade, Audit Ledger encadeado por hash e painel de controle",["LiteLLM logs","Postgres","SHA-256","RBAC"],svc.gateway,false],
+  ["Plano de Governança","Observabilidade, Audit Ledger encadeado por hash e painel de controle",["LiteLLM logs","Postgres","SHA-256","RBAC"].concat(svc.langfuse!=null?["Langfuse traces"]:[]),svc.gateway,false],
   ["Plano Agêntico & Guardrails","Orquestrador multi-agente, guardrails anti-injeção (OWASP), rate limiting e execução durável (fila em 2º plano + aprovação humana)",["orquestrador","guardrails","rate limit","skills","fila","aprovação"],svc.gateway,false],
   ["Plano de Gateway","Gateway OpenAI-compatível: roteamento, escalonamento mascarado, fallback e cache semântico (perguntas equivalentes → resposta instantânea)",["LiteLLM","fallback","cache semântico"],svc.gateway,false],
   ["Plano de Inteligência","Inferência e embeddings locais + reranker neural",["Ollama","qwen2.5:3b","bge-m3 1024d","qwen2.5-VL","BGE rerank"],svc.ollama,false],
   ["Plano de Memória","Memória longa por organização — fatos e preferências entre sessões, com opt-out e exclusão (soberana)",["memória","por org","opt-out"],true,false],
   ["Plano de Contexto","RAG híbrido multi-consulta (PT+EN) + grafo + citação de fontes",["Qdrant","Neo4j","multi-consulta","citações"],svc.qdrant,false],
-  ["Plano de Integração","PII mascarada (Presidio pt/BR) antes de qualquer saída, OCR e visão",["Presidio","PII BR","OCR","visão"],svc.pii,false],
+  ["Plano de Integração","PII mascarada (Presidio pt/BR) antes de qualquer saída, OCR e visão",["Presidio","PII BR","OCR","visão"].concat(svc.docling!=null?["Docling (PDF/Office)"]:[]),svc.pii,false],
   ["Plano de Núcleo","Infra soberana — contêineres no servidor ARM Ampere, TLS pelo Caddy",["Docker","ARM Ampere","Caddy TLS"],true,false],
  ];
  return `<h1 class="h">Componentes</h1><div class="lead">A pilha do Cerne em <b>planos</b> — do núcleo à governança, cada um sobre software aberto e soberano.</div>
@@ -12851,7 +12986,8 @@ V.observability=async()=>{const o=await J('/observability'),m=await J('/metricas
  const bym={};rec.forEach(r=>{const k=r.modelo||'—';bym[k]=(bym[k]||0)+1;});const modrows=Object.entries(bym).sort((x,y)=>y[1]-x[1]).slice(0,6);const mmax=Math.max(1,...modrows.map(x=>x[1]));
  const loc=rec.filter(r=>!(r.modelo||'').startsWith('ext-')).length;const ext=rec.length-loc;const pct=rec.length?Math.round(loc/rec.length*100):100;
  const rows=rec.map(r=>`<tr><td class="mono faint">${r.quando||'—'}</td><td class="mono">${esc(r.modelo||'—')}</td><td class="mono">${r.tokens??'—'}</td><td class="mono">${r.ms??'—'}ms</td><td class="mono">$${(r.custo||0).toFixed(5)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">sem requisições ainda</td></tr>';
- return `<h1 class="h">Observabilidade</h1><div class="lead">Adoção, soberania de execução e métrica de cada chamada de modelo (LiteLLM + Postgres).</div>${eye("ADOÇÃO")}<div class="grid" style="grid-template-columns:repeat(4,1fr)">${met("TAREFAS DE IA",m.tarefas_ia??0,'','accent')}${met("DOCUMENTOS",m.documentos_ingeridos??0,'')}${met("PII PROTEGIDAS",m.pii_protegidas??0,'')}${met("TEMPO ECON.",(Math.round((m.tempo_economizado_min??0)/6)/10)+'h','~4min/tarefa')}</div>
+ const lf=o.langfuse||{};const lfp=lf.ligado?`<div class="panel" style="display:flex;align-items:center;gap:12px;margin-bottom:14px"><span class="dot ${lf.ok?'ok':'crit'}"></span><div style="flex:1"><b>Langfuse</b> <span class="faint" style="font-size:12px">— traces, sessões, custos e avaliações de cada chamada do gateway (self-hosted)</span></div>${lf.url?`<a class="btn ghost" style="padding:6px 12px;font-size:12px" href="${esc(lf.url)}" target="_blank" rel="noopener">Abrir Langfuse ↗</a>`:''}</div>`:`<div class="faint" style="font-size:11.5px;margin:-4px 0 14px">Traces detalhados (prompt → resposta, sessões, avaliações): suba o Langfuse self-hosted com <span class="mono">docker-compose.langfuse.yml</span>.</div>`;
+ return `<h1 class="h">Observabilidade</h1><div class="lead">Adoção, soberania de execução e métrica de cada chamada de modelo (LiteLLM + Postgres${lf.ligado?' + Langfuse':''}).</div>${lfp}${eye("ADOÇÃO")}<div class="grid" style="grid-template-columns:repeat(4,1fr)">${met("TAREFAS DE IA",m.tarefas_ia??0,'','accent')}${met("DOCUMENTOS",m.documentos_ingeridos??0,'')}${met("PII PROTEGIDAS",m.pii_protegidas??0,'')}${met("TEMPO ECON.",(Math.round((m.tempo_economizado_min??0)/6)/10)+'h','~4min/tarefa')}</div>
  ${eye("CHAMADAS DE MODELO")}<div class="grid" style="grid-template-columns:repeat(4,1fr)">${met("REQUISIÇÕES",a.requisicoes??0,'')}${met("TOKENS",a.tokens??0,'')}${met("CUSTO","$"+((a.custo||0).toFixed(4)),'local + tiers grátis','cyant')}${met("LATÊNCIA",(a.lat_media_ms??'—')+'ms','média')}</div>
  ${eye("SOBERANIA DE EXECUÇÃO")}<div class="panel"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:9px"><span><b class="cyant" style="font-size:16px">${pct}%</b> rodou 100% local</span><span class="faint mono">${loc} local · ${ext} externo (mascarado)</span></div><div class="sovbar"><i class="loc" style="width:${pct}%"></i><i class="ext" style="width:${100-pct}%"></i></div><div class="faint" style="font-size:11px;margin-top:9px">Quanto das chamadas recentes ficou na sua infraestrutura, sem sair para provedores externos. Chamadas externas só saem com PII mascarada.</div></div>
  <div class="grid" style="grid-template-columns:1fr 1fr">
@@ -13240,8 +13376,8 @@ function _dsgFF(fontes){const j=(fontes||[]).join(' ').toLowerCase();if(/mono|co
 function dsgThemeOf(item){if(!item||!item.paleta||!item.paleta.length){const t=_dsgTheme([],false);t.ff=_dsgFF((item&&item.fontes)||[]);return t;}const dark=(typeof item.dark==='boolean')?item.dark:(!item.paleta.some(c=>_dsgLum(c)>.80)&&item.paleta.some(c=>_dsgLum(c)<.16));const t=_dsgTheme(item.paleta,dark);t.ff=_dsgFF(item.fontes||[]);return t;}
 function dsgCurItem(){const id=DSG.estilo||'';if(!id)return {id:'',nome:'Automático (design livre)',paleta:[],fontes:[]};return (DSG.estilos||[]).find(x=>x.id===id)||(DSG.sistemas||[]).find(x=>x.id===id)||{id:'',nome:'Automático',paleta:[]};}
 function dsgPal(){return dsgThemeOf(dsgCurItem());}
-function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.od?'<span class="tag" title="Open Design Agent Kit — DESIGN.md + tokens">OD</span>':(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:''))}</div></button>`;}
-function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysOD=sysF.filter(s=>s.od),sysBrand=sysF.filter(s=>!s.custom&&!s.od);let h='';if(DSG.rec&&DSG.rec.length&&!q){h+='<div class="dsgseclbl">✨ Recomendados para o seu briefing <span style="text-transform:none;font-weight:400;letter-spacing:0">— Open Design</span></div><div class="dsggrid">'+DSG.rec.map(r=>{const it=(DSG.sistemas||[]).find(x=>x.id===r.id)||r;return '<div title="'+esc(r.motivo||'')+'">'+dsgSysCard(it,cur===it.id)+'<div class="faint" style="font-size:10.5px;padding:4px 4px 0;line-height:1.35">'+esc(r.motivo||'')+'</div></div>';}).join('')+'</div>';}const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';const odG=sysOD.filter(s=>s.kind!=='brand'),odB=sysOD.filter(s=>s.kind==='brand');if(odG.length)h+='<div class="dsgseclbl">📐 Open Design · estilos ('+odG.length+')</div><div class="dsggrid">'+odG.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(odB.length)h+='<div class="dsgseclbl">📐 Open Design · inspirados em marcas ('+odB.length+')</div><div class="dsggrid">'+odB.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
+function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.od?(item.fonte==='awesome-design-md'?'<span class="tag" title="awesome-design-md (VoltAgent) — DESIGN.md + tokens do front matter">MD</span>':'<span class="tag" title="Open Design Agent Kit — DESIGN.md + tokens">OD</span>'):(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:''))}</div></button>`;}
+function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysOD=sysF.filter(s=>s.od),sysBrand=sysF.filter(s=>!s.custom&&!s.od);let h='';if(DSG.rec&&DSG.rec.length&&!q){h+='<div class="dsgseclbl">✨ Recomendados para o seu briefing <span style="text-transform:none;font-weight:400;letter-spacing:0">— Open Design</span></div><div class="dsggrid">'+DSG.rec.map(r=>{const it=(DSG.sistemas||[]).find(x=>x.id===r.id)||r;return '<div title="'+esc(r.motivo||'')+'">'+dsgSysCard(it,cur===it.id)+'<div class="faint" style="font-size:10.5px;padding:4px 4px 0;line-height:1.35">'+esc(r.motivo||'')+'</div></div>';}).join('')+'</div>';}const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';const odA=sysOD.filter(s=>s.fonte==='awesome-design-md'),odG=sysOD.filter(s=>s.kind!=='brand'&&s.fonte!=='awesome-design-md'),odB=sysOD.filter(s=>s.kind==='brand'&&s.fonte!=='awesome-design-md');if(odG.length)h+='<div class="dsgseclbl">📐 Open Design · estilos ('+odG.length+')</div><div class="dsggrid">'+odG.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(odB.length)h+='<div class="dsgseclbl">📐 Open Design · inspirados em marcas ('+odB.length+')</div><div class="dsggrid">'+odB.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(odA.length)h+='<div class="dsgseclbl">📄 awesome-design-md · DESIGN.md de sites reais ('+odA.length+') <span style="text-transform:none;font-weight:400;letter-spacing:0">— VoltAgent</span></div><div class="dsggrid">'+odA.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
 function _dsgGalFilter(){const q=(DSG.galQ||'').toLowerCase().trim();const match=x=>!q||(x.nome||'').toLowerCase().includes(q)||(x.categoria||'').toLowerCase().includes(q);const estF=(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).filter(match);const sysF=(DSG.sistemas||[]).filter(match);return [estF,sysF];}
 function dsgGalBody(){const f=_dsgGalFilter();const b=document.getElementById('dsg_galbody');if(b)b.innerHTML=dsgGalGrids(f[0],f[1]);}
 function dsgGalModal(){const f=_dsgGalFilter();const n=(DSG.sistemas||[]).length+(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).length;return `<div class="dsgov" onclick="if(event.target===this)dsgGalClose()"><div class="dsggalm"><div class="hd"><div style="font-weight:700;font-size:15px;flex:none">Design systems</div><input id="dsg_galq" class="field" placeholder="Buscar entre ${n} por nome ou categoria…" style="margin:0;flex:1" value="${esc(DSG.galQ||'')}" oninput="DSG.galQ=this.value;dsgGalBody()"><button class="btn ghost" style="padding:6px 11px;flex:none" onclick="dsgGalClose()">✕</button></div><div id="dsg_galbody" class="bd">${dsgGalGrids(f[0],f[1])}</div></div></div>`;}
@@ -13366,7 +13502,7 @@ function dsgKitCss(){if(document.getElementById('dsgkitcss'))return;const st=doc
 `;document.head.appendChild(st);}
 function dsgExFit(){[...document.querySelectorAll('.dsgexthumb')].forEach(t=>{const f=t.querySelector('iframe');if(f&&t.clientWidth)f.style.transform='scale('+(t.clientWidth/1280).toFixed(4)+')';});}
 function dsgReceitaOpts(){const cat=DSG.kitCat||{};const t=DSG.tipo||'landing';const rs=(cat.receitas||{})[t]||[];const pad=(cat.padrao||{})[t]||'';const pn=(rs.find(r=>r.id===pad)||{}).nome||pad;return `<option value=""${!DSG.receita?' selected':''}>Padrão do tipo${pad?' ('+esc(pn)+')':''}</option><option value="none"${DSG.receita==='none'?' selected':''}>Nenhuma — só o prompt</option>`+rs.filter(r=>r.id!==pad).map(r=>`<option value="${esc(r.id)}"${DSG.receita===r.id?' selected':''} title="${esc(r.desc||'')}">${esc(r.nome)}</option>`).join('');}
-function dsgKitPanel(){if(!(DSG.kit&&DSG.kit.ok))return '';const c=DSG.kit.contagem||{};const rx=DSG.remix;return `<div class="dsgkit"><div class="hd">📐 Open Design Agent Kit <span class="bdg">${c.sistemas||0} design systems · ${c.receitas||0} receitas · ${c.exemplos||0} exemplos</span><span style="flex:1"></span><span class="faint" style="font-weight:400;font-size:10.5px">${esc(DSG.kit.versao||'')}</span></div>
+function dsgKitPanel(){if(!(DSG.kit&&DSG.kit.ok))return '';const c=DSG.kit.contagem||{};const rx=DSG.remix;return `<div class="dsgkit"><div class="hd">📐 Open Design Agent Kit <span class="bdg">${c.sistemas||0} design systems${c.adm?' (+'+c.adm+' awesome-design-md)':''} · ${c.receitas||0} receitas · ${c.exemplos||0} exemplos</span><span style="flex:1"></span><span class="faint" style="font-weight:400;font-size:10.5px">${esc(DSG.kit.versao||'')}</span></div>
  <div class="dsg2col" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:end">
   <div class="dsgfield"><label class="dsglbl">Receita (workflow + checklist do tipo)</label><select class="field" id="dsg_receita" onchange="DSG.receita=this.value" ${rx?'disabled title="o remix usa o exemplo como base"':''}>${dsgReceitaOpts()}</select></div>
   <div class="dsgfield"><label class="dsglbl">Ponto de partida</label>${rx?`<span class="dsgchip">🔁 Remix: <b>${esc(rx.nome)}</b><button onclick="dsgExView('${esc(rx.id)}')" title="ver o exemplo">↗</button><button onclick="DSG.remix=null;dsgRe()" title="remover">✕</button></span>`:`<button type="button" class="field dsgpick" onclick="dsgExOpen()"><span style="font-size:13px">🔁 Remixar um exemplo pronto…</span><span style="flex:none;opacity:.55;font-size:11px">${c.exemplos||0} exemplos ▾</span></button>`}</div>

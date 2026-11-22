@@ -128,6 +128,29 @@ Endpoints: `GET /design/kit`, `GET /design/kit/exemplo/{id}/html`, `POST /design
 Sem o conteúdo (build offline), o Design Studio funciona como antes. Para atualizar o kit, mude `ODKIT_REF` e rode
 `docker compose build app`.
 
+### awesome-design-md
+A galeria de estilos também traz os **DESIGN.md de sites reais** do [VoltAgent/awesome-design-md](https://github.com/VoltAgent/awesome-design-md)
+(MIT, pinado em `ADM_REF` no `app/Dockerfile`). Os tokens do front matter (cores, tipografia, raios) viram um bloco
+`:root` no padrão do Open Design, com contraste de texto garantido, e o resto do arquivo entra no prompt como contrato visual.
+
+## Docling — ingestão de PDF/Office com layout (opcional)
+[Docling Serve](https://github.com/docling-project/docling-serve) (IBM / LF AI & Data, MIT) converte PDF, DOCX, PPTX,
+XLSX e HTML em Markdown preservando ordem de leitura e **tabelas**, com OCR de PDF escaneado. Ative no `.env`:
+`COMPOSE_PROFILES=docling` e `DOCLING_URL=http://docling:5001`, depois `docker compose up -d`.
+Sem ele (ou se uma conversão falhar), o Cerne usa os extratores locais — que agora também leem **Word, PowerPoint e
+Excel** (antes só PDF/texto/imagem). Vale para o acervo (`/ingest-file`), arquivos compactados, inbox e anexos do chat.
+
+## Langfuse — traces do gateway (opcional)
+[Langfuse](https://langfuse.com) self-hosted (MIT) recebe um trace de cada chamada do LiteLLM (callback `langfuse_otel`),
+com nome da funcionalidade, usuário e organização do Cerne. Fica num arquivo à parte — sem ele nada muda:
+```
+python scripts/langfuse-setup.py                                   # gera os segredos no .env (uma vez)
+docker compose -f docker-compose.yml -f docker-compose.langfuse.yml up -d
+```
+Painel em `http://localhost:3300` (publique pelo Caddy e ajuste `LANGFUSE_PUBLIC_URL`). Telemetria do Langfuse desligada.
+Por padrão o **conteúdo** de prompt/resposta não é gravado (`LANGFUSE_CAPTURE_CONTENT=false`), porque chamadas ao modelo
+local não passam pelo mascaramento de PII. Pede ~3–4 GB de RAM a mais. Status e link aparecem em Observabilidade e Preflight.
+
 ## Estrutura
 ```
 D:\cerne\
