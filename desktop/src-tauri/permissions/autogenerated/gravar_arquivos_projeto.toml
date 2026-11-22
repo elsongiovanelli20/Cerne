@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gravar-arquivos-projeto"
+description = "Enables the gravar_arquivos_projeto command without any pre-configured scope."
+commands.allow = ["gravar_arquivos_projeto"]
+
+[[permission]]
+identifier = "deny-gravar-arquivos-projeto"
+description = "Denies the gravar_arquivos_projeto command without any pre-configured scope."
+commands.deny = ["gravar_arquivos_projeto"]

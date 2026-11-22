@@ -72,11 +72,77 @@ function _clicar(seletor) {
 function _preencher(seletor, valor) {
   try {
     const el = document.querySelector(seletor); if (!el) return { erro: "não achei: " + seletor };
-    el.focus(); el.value = valor;
+    el.scrollIntoView({ block: "center" }); el.focus();
+    if (el.isContentEditable) { el.textContent = valor; }
+    else {
+      // setter NATIVO: React/Vue/Angular só enxergam a mudança assim (el.value = x é ignorado pelo React)
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+      const d = Object.getOwnPropertyDescriptor(proto, "value");
+      if (d && d.set) d.set.call(el, valor); else el.value = valor;
+    }
     el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
     return { ok: true, preenchido: seletor };
   } catch (e) { return { erro: String(e).slice(0, 200) }; }
 }
+// MAPA: lista os elementos interativos VISÍVEIS com um seletor estável (data-cerne) + rótulo humano,
+// para o agente saber o que pode clicar/preencher sem adivinhar CSS.
+function _mapa(comTexto) {
+  try {
+    const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none"; };
+    const rotulo = (el) => {
+      let t = el.getAttribute("aria-label") || "";
+      if (!t && el.id) { const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]'); if (l) t = l.innerText; }
+      if (!t && el.closest("label")) t = el.closest("label").innerText;
+      t = t || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("name") || el.innerText || el.value || el.getAttribute("alt") || "";
+      return String(t).replace(/\s+/g, " ").trim().slice(0, 90);
+    };
+    const els = [...document.querySelectorAll('a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=menuitem], [role=checkbox], [contenteditable=true], [onclick]')].filter(vis).slice(0, 150);
+    let n = 0;
+    const out = els.map((el) => {
+      let id = el.getAttribute("data-cerne"); if (!id) { id = "c" + (++n) + Math.random().toString(36).slice(2, 5); el.setAttribute("data-cerne", id); }
+      const tag = el.tagName.toLowerCase();
+      const tipo = tag === "input" ? "campo:" + (el.type || "text") : tag === "a" ? "link" : tag === "select" ? "lista:" + [...el.options].slice(0, 8).map(o => o.text.trim()).join("|") : tag === "textarea" ? "campo:texto-longo" : (el.getAttribute("role") || tag);
+      const valor = (tag === "input" || tag === "textarea") && el.type !== "password" ? (el.value || "") : (tag === "select" ? (el.selectedOptions[0] || {}).text || "" : "");
+      return { sel: '[data-cerne="' + id + '"]', tipo, rotulo: rotulo(el), valor };
+    });
+    const r = { titulo: document.title, url: location.href, elementos: out };
+    if (comTexto) r.texto = (document.body.innerText || "").replace(/\n{3,}/g, "\n\n").trim().slice(0, 1500);
+    return r;
+  } catch (e) { return { erro: String(e).slice(0, 200) }; }
+}
+function _clicarTexto(texto) {
+  try {
+    const alvo = String(texto || "").toLowerCase().trim(); if (!alvo) return { erro: "faltou o texto" };
+    const cands = [...document.querySelectorAll('button, a, [role=button], [role=link], [role=tab], [role=menuitem], input[type=submit], input[type=button], label, summary')];
+    const txt = (el) => (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const el = cands.find(e => txt(e) === alvo) || cands.find(e => txt(e).includes(alvo));
+    if (!el) return { erro: "não achei elemento com o texto: " + texto };
+    el.scrollIntoView({ block: "center" }); el.click(); return { ok: true, clicado: txt(el).slice(0, 80) };
+  } catch (e) { return { erro: String(e).slice(0, 200) }; }
+}
+function _selecionar(seletor, valor) {
+  try {
+    const el = document.querySelector(seletor); if (!el) return { erro: "não achei: " + seletor };
+    if (el.tagName !== "SELECT") return { erro: "o elemento não é uma lista (select) — use clicar/clicar_texto" };
+    const v = String(valor || "").toLowerCase().trim();
+    const op = [...el.options].find(o => o.value.toLowerCase() === v || o.text.trim().toLowerCase() === v) || [...el.options].find(o => o.text.toLowerCase().includes(v));
+    if (!op) return { erro: "opção não encontrada: " + valor + " (há: " + [...el.options].slice(0, 15).map(o => o.text.trim()).join(" | ") + ")" };
+    el.value = op.value; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, selecionado: op.text.trim() };
+  } catch (e) { return { erro: String(e).slice(0, 200) }; }
+}
+function _tecla(seletor, tecla) {
+  try {
+    const el = (seletor && document.querySelector(seletor)) || document.activeElement || document.body;
+    const k = String(tecla || "Enter"); const code = { Enter: 13, Tab: 9, Escape: 27, ArrowDown: 40, ArrowUp: 38, Backspace: 8, " ": 32 }[k] || 0;
+    el.focus && el.focus();
+    for (const tipo of ["keydown", "keypress", "keyup"]) el.dispatchEvent(new KeyboardEvent(tipo, { key: k, code: k, keyCode: code, which: code, bubbles: true, cancelable: true }));
+    if (k === "Enter" && el.form && el.tagName === "INPUT") { if (el.form.requestSubmit) el.form.requestSubmit(); else el.form.submit(); }
+    return { ok: true, tecla: k };
+  } catch (e) { return { erro: String(e).slice(0, 200) }; }
+}
+function _rolar(direcao) { window.scrollBy({ top: (direcao === "cima" ? -1 : 1) * Math.round(window.innerHeight * 0.85), behavior: "instant" }); return { ok: true, y: Math.round(window.scrollY) }; }
+function _existe(seletor) { try { return !!document.querySelector(seletor); } catch (e) { return false; } }
 function _acharLinks(termo) {
   try {
     const as = [...document.querySelectorAll("a[href]")];
@@ -100,11 +166,22 @@ async function executar(cmd) {
     if (acao === "abrir") {
       if (!cmd.url) return { erro: "faltou a url" };
       let url = cmd.url; if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-      if (tabId == null) { const nt = await chrome.tabs.create({ url }); controlledTabId = nt.id; await esperarCarregar(nt.id); overlay(nt.id, true, cmd.rotulo); const info = await injetar(nt.id, _lerPagina, [null]); return { ok: true, url: info && info.url, titulo: info && info.titulo }; }
+      if (tabId == null) { const nt = await chrome.tabs.create({ url }); controlledTabId = nt.id; await esperarCarregar(nt.id); overlay(nt.id, true, cmd.rotulo); return (await injetar(nt.id, _mapa, [true])) || { ok: true, url }; }
       await chrome.tabs.update(tabId, { url }); await esperarCarregar(tabId);
       overlay(tabId, true, cmd.rotulo);
-      const info = await injetar(tabId, _lerPagina, [null]);
-      return { ok: true, url: (info && info.url) || url, titulo: info && info.titulo };
+      return (await injetar(tabId, _mapa, [true])) || { ok: true, url };   // já devolve o mapa: economiza um passo
+    }
+    if (tabId == null && ["mapa", "clicar_texto", "selecionar", "tecla", "rolar", "esperar_elemento", "voltar"].includes(acao)) return { erro: "nenhuma aba" };
+    if (acao === "mapa") return await injetar(tabId, _mapa, [true]);
+    if (acao === "clicar_texto") { const r = await injetar(tabId, _clicarTexto, [cmd.texto || cmd.valor || ""]); await esperarCarregar(tabId, 6000); return r; }
+    if (acao === "selecionar") return await injetar(tabId, _selecionar, [cmd.seletor, cmd.valor || cmd.texto || ""]);
+    if (acao === "tecla") { const r = await injetar(tabId, _tecla, [cmd.seletor || null, cmd.tecla || cmd.valor || "Enter"]); await esperarCarregar(tabId, 5000); return r; }
+    if (acao === "rolar") return await injetar(tabId, _rolar, [cmd.direcao || "baixo"]);
+    if (acao === "voltar") { await chrome.tabs.goBack(tabId); await esperarCarregar(tabId); return await injetar(tabId, _mapa, [true]); }
+    if (acao === "esperar_elemento") {
+      const fim = Date.now() + Math.min(cmd.ms || 10000, 30000);
+      while (Date.now() < fim) { if (await injetar(tabId, _existe, [cmd.seletor || "body"])) return { ok: true, apareceu: cmd.seletor }; await new Promise(r => setTimeout(r, 500)); }
+      return { erro: "o elemento não apareceu a tempo: " + cmd.seletor };
     }
     if (acao === "ler") { if (tabId == null) return { erro: "nenhuma aba" }; return await injetar(tabId, _lerPagina, [cmd.seletor || null]); }
     if (acao === "clicar") { if (tabId == null) return { erro: "nenhuma aba" }; const r = await injetar(tabId, _clicar, [cmd.seletor]); await esperarCarregar(tabId, 6000); return r; }
@@ -137,7 +214,7 @@ async function pollLoop() {
       try {
         const r = await fetch(cfg.base + "/ext/poll", {
           method: "POST", headers: { "Content-Type": "application/json", "X-Ext-Token": cfg.token },
-          body: JSON.stringify({ v: "1.0.0" })
+          body: JSON.stringify({ v: "1.1.0" })
         });
         if (r.status === 401) { await chrome.storage.local.set({ token: "" }); break; }
         if (r.ok) { const j = await r.json(); cmd = j && j.comando ? j.comando : null; }

@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "cerne-desktop"
-version = "1.0.4"
+version = "1.0.7"
 dependencies = [
  "enigo",
  "serde",
@@ -464,6 +464,7 @@ dependencies = [
  "tauri-plugin-updater",
  "ureq",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

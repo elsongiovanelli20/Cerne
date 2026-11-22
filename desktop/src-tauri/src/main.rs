@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod computador;
+mod projeto;
+
 use std::sync::Mutex;
 use std::time::Duration;
 use serde::Serialize;
@@ -344,7 +347,7 @@ fn iniciar_poller_navegador(app: &AppHandle) {
         let _ = ureq::post(&format!("{}/desktop/hello", base))
             .set("X-Ext-Token", &token)
             .timeout(Duration::from_secs(15))
-            .send_json(serde_json::json!({}));
+            .send_json(serde_json::json!({ "versao": env!("CARGO_PKG_VERSION") }));
         let resp = ureq::post(&format!("{}/desktop/poll", base))
             .set("X-Ext-Token", &token)
             .timeout(Duration::from_secs(35))
@@ -357,6 +360,17 @@ fn iniciar_poller_navegador(app: &AppHandle) {
                         if a == "abrir_navegador" {
                             let url = acao.get("url").and_then(|x| x.as_str()).unwrap_or("");
                             let _ = launch_browser("auto", url);
+                        } else if a == "computador" {
+                            // roda em outra thread: o diálogo de permissão pode esperar o usuário sem travar o long-poll
+                            let (h2, acao2, base2, tok2) = (h.clone(), acao.clone(), base.clone(), token.clone());
+                            std::thread::spawn(move || {
+                                let res = computador::executar(&h2, &acao2);
+                                let id = acao2.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                let _ = ureq::post(&format!("{}/desktop/result", base2))
+                                    .set("X-Ext-Token", &tok2)
+                                    .timeout(Duration::from_secs(30))
+                                    .send_json(serde_json::json!({ "id": id, "resultado": res }));
+                            });
                         }
                     }
                 }
@@ -398,11 +412,14 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
+        .manage(projeto::Liberadas::default())
+        .manage(computador::Controle::default())
         .invoke_handler(tauri::generate_handler![
             conectar, escolher_pasta, ingerir_pasta,
             listar_dir, ler_arquivo, escrever_arquivo, abrir_caminho, rodar_comando,
             digitar_texto, pressionar_tecla, verificar_atualizacao,
-            abrir_navegador, configurar_navegador, status_navegador
+            abrir_navegador, configurar_navegador, status_navegador,
+            projeto::ler_pasta_projeto, projeto::gravar_arquivos_projeto, computador::computador_chat
         ])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Abrir Cerne", true, None::<&str>)?;
@@ -440,6 +457,7 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
+            computador::criar_moldura(app.handle());  // oculta; mostrada quando um agente controla um app
             iniciar_poller_navegador(app.handle());   // abre o navegador quando o agente pedir (se pareado)
             Ok(())
         })

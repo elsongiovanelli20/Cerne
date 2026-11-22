@@ -149,6 +149,7 @@ services:
       - ADMIN_SENHA=${ADMIN_SENHA:-}          # senha inicial do admin do painel; vazio = gerada e impressa no log
       - AUTH_TTL_HORAS=${AUTH_TTL_HORAS:-12}  # validade da sessão de login (horas)
       - NANOCLAW_DB=/data/nanoclaw/v2.db      # estado do runtime de agentes (somente-leitura) p/ o painel Runtime
+      - ODKIT_DIR=${ODKIT_DIR:-/opt/odkit}    # Open Design Agent Kit (conteúdo baixado no build); aponte p/ outra pasta montada se quiser
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
@@ -159,6 +160,7 @@ services:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - CERNE_MCP_TOKEN=${CERNE_MCP_TOKEN:-}   # servidor MCP (/mcp) + proxy mascarador p/ o PicoClaw
       - SANDBOX_URL=http://sandbox:8090        # executor isolado de código dos agentes (container separado)
       - RENDER_URL=http://render:8091          # renderizador Chromium (HTML → PNG/PDF/MP4), container separado
     volumes:
@@ -178,6 +180,7 @@ services:
       - default        # rede interna (gateway/qdrant/pii/etc.)
       - sandboxnet      # ponte só p/ falar com o executor isolado
       - rendernet       # ponte só p/ falar com o renderizador Chromium
+      - picoclawnet      # recebe /mcp e /mask-proxy do PicoClaw
     restart: unless-stopped
 
   searxng:                                     # metabusca self-hosted p/ a ferramenta "Buscar na web"
@@ -189,13 +192,16 @@ services:
       - ./searxng:/etc/searxng:rw
     mem_limit: 500m
     restart: unless-stopped
+    networks:
+      - default
+      - picoclawnet  # busca web do PicoClaw
 
   sandbox:                                     # executor ISOLADO de código dos agentes (Excel/Word/PPT/dados)
     build: ./sandbox
     container_name: cerne-sandbox
     read_only: true                            # rootfs somente-leitura
     tmpfs:
-      - /work:size=1536m,mode=1777            # área efêmera (frames de vídeo/imagens); some ao reiniciar
+      - /work:size=1536m,mode=1777,exec       # exec: pacotes com partes nativas (.so) instalados pelo agente; área efêmera (frames de vídeo/imagens); some ao reiniciar
       - /tmp:size=64m
     security_opt:
       - no-new-privileges:true
@@ -219,9 +225,30 @@ services:
       - rendernet                              # tem internet (fontes/imagens públicas), mas NÃO alcança gateway/qdrant/segredos
     restart: unless-stopped
 
+  picoclaw:                                    # porta de entrada por mensagem (Telegram) → ferramentas do Cerne via MCP
+    image: sipeed/picoclaw:v0.3.1
+    container_name: cerne-picoclaw
+    depends_on:
+      - app
+    volumes:
+      - ./picoclaw/data:/root/.picoclaw         # config.json gerado (render_config.py) + sessões/memória
+    environment:
+      - TZ=America/Sao_Paulo
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    pids_limit: 128
+    networks:
+      - picoclawnet                            # SÓ app + searxng (+ internet p/ Telegram); NÃO alcança gateway/qdrant/segredos
+    restart: unless-stopped
+
 networks:
   default:
   sandboxnet:
     driver: bridge
   rendernet:
+    driver: bridge
+  picoclawnet:
     driver: bridge

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-configurar-navegador"
+description = "Enables the configurar_navegador command without any pre-configured scope."
+commands.allow = ["configurar_navegador"]
+
+[[permission]]
+identifier = "deny-configurar-navegador"
+description = "Denies the configurar_navegador command without any pre-configured scope."
+commands.deny = ["configurar_navegador"]

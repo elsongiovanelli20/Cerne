@@ -1,0 +1,76 @@
+{
+  "_comment": "Modelo da config do PicoClaw no servidor do Cerne. NÃO contém segredos: o render_config.py preenche ${VAR} com o .env e grava data/config.json (fora do git).",
+  "version": 1,
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.picoclaw/workspace",
+      "restrict_to_workspace": true,
+      "allow_read_outside_workspace": false,
+      "model_name": "cerne-ultra",
+      "model_fallbacks": ["cerne-mistral", "cerne-reason"],
+      "max_tokens": 4096,
+      "context_window": 131072,
+      "temperature": 0.3,
+      "max_tool_iterations": 15,
+      "summarize_message_threshold": 20,
+      "summarize_token_percent": 75,
+      "max_llm_retries": 1,
+      "llm_retry_backoff_secs": 2,
+      "routing": { "enabled": true, "light_model": "cerne-lightning", "threshold": 0.35 },
+      "tool_feedback": { "enabled": true, "max_args_length": 200, "separate_messages": false }
+    }
+  },
+  "model_list": [
+    { "_comment": "Todos passam pelo PROXY MASCARADOR do Cerne (PII mascarada antes de sair; de-mascarada na volta).",
+      "model_name": "cerne-ultra", "model": "anthropic-messages/ext-nvidia-ultra",
+      "api_base": "http://app:8000/mask-proxy/v1", "api_keys": ["${CERNE_MCP_TOKEN}"] },
+    { "model_name": "cerne-lightning", "model": "anthropic-messages/ext-nvidia-lightning",
+      "api_base": "http://app:8000/mask-proxy/v1", "api_keys": ["${CERNE_MCP_TOKEN}"] },
+    { "model_name": "cerne-mistral", "model": "anthropic-messages/ext-nvidia-mistral",
+      "api_base": "http://app:8000/mask-proxy/v1", "api_keys": ["${CERNE_MCP_TOKEN}"] },
+    { "model_name": "cerne-reason", "model": "anthropic-messages/ext-reason",
+      "api_base": "http://app:8000/mask-proxy/v1", "api_keys": ["${CERNE_MCP_TOKEN}"] }
+  ],
+  "channel_list": {
+    "telegram": {
+      "enabled": "${TELEGRAM_ENABLED}",
+      "type": "telegram",
+      "allow_from": "${TELEGRAM_ALLOW_FROM}",
+      "settings": { "token": "${TELEGRAM_BOT_TOKEN}", "use_markdown_v2": false, "streaming": { "enabled": true } }
+    }
+  },
+  "tools": {
+    "allow_read_paths": [],
+    "allow_write_paths": [],
+    "_comment_exec": "No SERVIDOR o shell fica DESLIGADO (é a máquina de produção). Controle de PC/arquivos é no Cerne Desktop (fase B).",
+    "exec": { "enabled": false, "enable_deny_patterns": true },
+    "cron": { "enabled": true, "exec_timeout_minutes": 5, "allow_command": false },
+    "spawn": { "enabled": true },
+    "subagent": { "enabled": true },
+    "install_skill": { "enabled": false },
+    "find_skills": { "enabled": false },
+    "i2c": { "enabled": false },
+    "spi": { "enabled": false },
+    "serial": { "enabled": false },
+    "web": {
+      "enabled": true,
+      "provider": "searxng",
+      "searxng": { "enabled": true, "base_url": "http://searxng:8080", "max_results": 5 },
+      "sogou": { "enabled": false },
+      "duckduckgo": { "enabled": false }
+    },
+    "mcp": {
+      "enabled": true,
+      "servers": {
+        "cerne": {
+          "enabled": true,
+          "type": "http",
+          "url": "http://app:8000/mcp",
+          "headers": { "Authorization": "Bearer ${CERNE_MCP_TOKEN}" }
+        }
+      }
+    }
+  },
+  "heartbeat": { "enabled": false },
+  "gateway": { "host": "0.0.0.0", "port": 18790, "hot_reload": false, "log_level": "info" }
+}

@@ -1,10 +1,10 @@
 {
-  "version": "1.0.4",
-  "notes": "App Desktop enxuto: só as abas Workspace e Agentes (o restante da governança/config fica no app web).",
-  "pub_date": "2026-07-28T12:35:08Z",
+  "version": "1.0.7",
+  "notes": "Agente de implementação: o chat trabalha numa cópia do projeto (ler, buscar, editar, compilar e testar) e só aplica no original quando você pede.",
+  "pub_date": "2026-11-18T23:48:04Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRLzhMNEFzUHUrUTNZemQ0NUxUVFJkaGJWTW15NGZ0U1E0NVcwc05WNWtTN0FqRDNuMHlGZTlIUlNUa1pyOHNoUWQyOUkxYU5PTzlISG5KQ2s3S0pkenpUSHZDUVhlTXdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjQyMDgzCWZpbGU6Q2VybmUgRGVza3RvcF8xLjAuNF94NjQtc2V0dXAuZXhlCmJveC9LQzE4WFptbTFtMUl3N0dTb0J0cTlsaU5LMG5wUGdkVnAvdFMzVk9vSFY5ZXJQVlNKZTQxSEtneWNOQ0p3ekJKenkveTM1elRzbGtYV1YzY0J3PT0K",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRLzhMNEFzUHUrUXdDZk1vaUhPL3B0MFRQQi9iemo1UHhsK0RyeHB5RTFPYktrSllRd3hGUnRmQXZpbUg2V1pOeWRUNXJxbmNsMlMxQmtaZ0dxa1c3ck1oV043QU1MbXdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MDQ0NDkyCWZpbGU6Q2VybmUgRGVza3RvcF8xLjAuN194NjQtc2V0dXAuZXhlCndYcGxpMEpYdEpHYURQR1g1QVo1c2FoZHdUdm0yanp6V09NVDdDZXlnaTFVb2hFYUk3ZjZpamp1M0FGWno2cVBjTnhoSTZ6RURvQTBoc3dhQXBHbEFRPT0K",
       "url": "https://cerne.orqion-ia.com.br/download/cerne-desktop"
     }
   }

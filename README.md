@@ -111,6 +111,23 @@ Quando houver GPU, o serviço `ollama` ganha aceleração adicionando ao compose
 E o `gateway` pode rotear tarefas difíceis para um modelo frontier (ex.: `gpt-4o-mini`)
 — basta descomentar o bloco de exemplo em `gateway/litellm-config.yaml`.
 
+## Design Studio + Open Design Agent Kit
+A aba **Workspace → Design** usa o conteúdo do [Open Design Agent Kit](https://github.com/feimacode/open-design-agent-kit)
+(MIT; conteúdo do [nexu-io/open-design](https://github.com/nexu-io/open-design), Apache-2.0), baixado no
+`docker compose build` (estágio `odkit` do `app/Dockerfile`, pinado em `ODKIT_REF`) e lido 100% localmente por `app/odkit.py`:
+
+- **~200 design systems** (DESIGN.md + tokens CSS) na galeria de estilos, com **✨ recomendar** pelo briefing;
+- **receitas por tipo** (workflow + checklist: landing, deck, dashboard, CV…) injetadas no prompt;
+- **~190 exemplos remixáveis** — o Cerne mantém a assinatura visual e troca o conteúdo pelo seu briefing;
+- **regras de craft** (anti-AI-slop, cor, tipografia, acessibilidade) + **checagem de qualidade** com nota e
+  botão **Corrigir** (P0/P1 viram uma iteração automática);
+- conector **Open Design Agent Kit (MCP)** no catálogo de Agentes (roda via NanoClaw/npx).
+
+Endpoints: `GET /design/kit`, `GET /design/kit/exemplo/{id}/html`, `POST /design/kit/recomendar`,
+`POST /design/{id}/checar`, `POST /design/{id}/corrigir`; `POST /design` aceita `receita`, `exemplo` e `craft`.
+Sem o conteúdo (build offline), o Design Studio funciona como antes. Para atualizar o kit, mude `ODKIT_REF` e rode
+`docker compose build app`.
+
 ## Estrutura
 ```
 D:\cerne\

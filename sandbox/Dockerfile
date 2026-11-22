@@ -1,11 +1,12 @@
 FROM python:3.12-slim
 
-# Fontes (DejaVu) p/ texto nos criativos + ffmpeg p/ o Animate (motion graphics -> MP4).
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core ffmpeg \
+# Fontes (DejaVu) p/ texto nos criativos + ffmpeg p/ o Animate (motion graphics -> MP4)
+# + git/node/npm p/ os agentes clonarem repositórios, instalarem dependências e rodarem testes.
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core ffmpeg git nodejs npm ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Office/dados/imagem (Pillow via python-pptx) + rembg (remoção de fundo do Photoshoot, roda em CPU).
-RUN pip install --no-cache-dir openpyxl python-docx python-pptx pandas requests rembg onnxruntime \
+RUN pip install --no-cache-dir openpyxl python-docx python-pptx pandas requests rembg onnxruntime pytest \
     && useradd -u 1000 -m sandbox
 
 # Pré-baixa o modelo do rembg (u2net) num caminho FIXO — em runtime o rootfs é read-only.

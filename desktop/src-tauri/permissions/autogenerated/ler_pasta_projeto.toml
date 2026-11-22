@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ler-pasta-projeto"
+description = "Enables the ler_pasta_projeto command without any pre-configured scope."
+commands.allow = ["ler_pasta_projeto"]
+
+[[permission]]
+identifier = "deny-ler-pasta-projeto"
+description = "Denies the ler_pasta_projeto command without any pre-configured scope."
+commands.deny = ["ler_pasta_projeto"]

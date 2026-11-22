@@ -34,6 +34,11 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
+try:
+    import odkit  # Open Design Agent Kit — catálogo LOCAL de design systems, receitas, exemplos e craft
+except Exception as _odk_e:  # o Design Studio continua funcionando sem o kit
+    print("[cerne] odkit indisponível:", str(_odk_e)[:120])
+    odkit = None
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:4000")
 GATEWAY_KEY = os.getenv("GATEWAY_KEY", "")
@@ -455,14 +460,185 @@ def _anexos_cleanup():
         _appstate_save(APPSTATE)
 
 
-def _anexos_texto(sid, org=None):
+# Orçamento de caracteres do anexo por TIPO de modelo: o local (qwen2.5:3b, janela de 4096 tokens) descarta o que
+# não cabe — mandar 120 mil caracteres faz ele não ver NADA do anexo. Externo (Mistral/Claude…) aguenta bem mais.
+_ANEXO_LIMITE_LOCAL = int(os.getenv("ANEXO_LIMITE_LOCAL", "7000"))
+_ANEXO_LIMITE_EXTERNO = int(os.getenv("ANEXO_LIMITE_EXTERNO", "110000"))
+_PASTA_SEC_RE = re.compile(r"\n\n===== ARQUIVO: (.+?) =====\n")
+_PASTA_LOCKS = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "cargo.lock", "composer.lock", "gemfile.lock")
+
+
+def _cadeia_provedores(escolhido="", forcar=False):
+    """Ordem de tentativa dos modelos externos: o ESCOLHIDO no chat primeiro, depois o melhor da org e os demais.
+    Vazia quando a org é soberana e nada externo foi escolhido (fica no local)."""
+    org = _org()
+    perm = _ext_permitidos(org)
+    cad = []
+    if str(escolhido or "").startswith("ext-") and escolhido in perm:
+        cad.append(escolhido)
+    if cad or forcar or org.get("soberania") == "hibrido":
+        bp = _best_provider(org)
+        for p in ([bp] if bp else []) + [x for x in ("ext-mistral", "ext-claude", "ext-nvidia-ultra", "ext-openrouter", "ext-reason") if x in perm]:
+            if p and p not in cad:
+                cad.append(p)
+    return cad
+
+
+def _anexo_limite(modelo):
+    """Orçamento de caracteres de anexo que o MODELO aguenta (janela + limites do provedor)."""
+    m = str(modelo or "")
+    if not m.startswith("ext-"):
+        return _ANEXO_LIMITE_LOCAL
+    if "reason" in m or "groq" in m:                  # Groq on_demand: 8k tokens/minuto
+        return 18000
+    if "nvidia" in m or "openrouter" in m:
+        return 60000
+    return _ANEXO_LIMITE_EXTERNO                      # Mistral/Codestral, Claude, Gemini…: janelas grandes
+
+
+_PASTA_DOMINIO = re.compile(r"regra|rule|valid|classific|elegib|habilit|polic|calc|status|fluxo|workflow|prazo|edital|"
+                            r"service|controller|entity|entidade|model|domain|dominio|usecase|caso", re.I)
+
+
+def _pasta_prioridade(caminho):
+    """Menor = mais importante para ENTENDER o projeto: o que é (README), stack (manifestos), as REGRAS (código de
+    domínio: services/controllers/entities/validações) e a arquitetura (docs/infra). Testes e locks por último."""
+    c = caminho.lower(); nome = c.rsplit("/", 1)[-1]; prof = c.count("/")
+    if nome in _PASTA_LOCKS or nome.endswith((".min.js", ".map", ".svg", ".lock")):
+        return 99
+    if ".spec." in nome or ".test." in nome or "/test/" in c or "/tests/" in c or "/e2e/" in c or "__tests__" in c or "__golden__" in c:
+        return 7
+    if nome.startswith("readme") or "arquitetura" in nome or "architecture" in nome:
+        return 0 + min(prof, 3) * 0.1
+    if nome.startswith(("leia-me", "leiame")):
+        return 0.05 + min(prof, 3) * 0.1
+    if nome in ("package.json", "pyproject.toml", "requirements.txt", "cargo.toml", "go.mod", "pom.xml", "build.gradle",
+                "composer.json", "gemfile", "pnpm-workspace.yaml", "turbo.json", "setup.py") or nome.endswith(".csproj"):
+        return 1 + min(prof, 3) * 0.1
+    codigo = nome.endswith((".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".kt", ".cs", ".go", ".rs", ".rb", ".php", ".sql", ".vue", ".dart"))
+    if codigo and not nome.endswith(".sql") and _PASTA_DOMINIO.search(nome):
+        return 2 + min(prof, 6) * 0.05                 # regras/serviços/entidades: onde estão as condicionais
+    if codigo and not nome.endswith(".sql") and nome.split(".")[0] in ("main", "app", "index", "server", "settings", "urls", "routes"):
+        return 2.6 + min(prof, 6) * 0.05               # pontos de entrada: importam, mas depois das regras
+    if c.startswith("docs/") or "/docs/" in c or (nome.endswith(".md") and prof <= 1):
+        return 3 + min(prof, 3) * 0.1
+    if codigo:
+        return 4 + min(prof, 6) * 0.05
+    if nome.startswith(("dockerfile", "docker-compose", "compose.y", "cloudbuild", "makefile", "procfile")) \
+            or "/workflows/" in c or nome.endswith((".tf", "nginx.conf", ".env.example", ".yml", ".yaml")):
+        return 5 + min(prof, 3) * 0.1
+    return 6 + min(prof, 6) * 0.1
+
+
+# cota máxima do orçamento por CATEGORIA (0 README/arquitetura · 1 manifestos · 3 docs · 5 infra/CI · 6 outros · 7 testes);
+# o que sobra vai para o CÓDIGO de domínio (2) e demais fontes (4) — é ali que estão as regras e condicionais
+_PASTA_COTAS = {0: 0.22, 1: 0.06, 3: 0.15, 5: 0.06, 6: 0.04, 7: 0.05}
+
+
+_PT_STOP = set("para com que uma por como mais sobre esse essa este esta isso qual quais onde quando sendo seja "
+               "analise analisar codigo código pasta programa projeto fale diga desenvolvido arquitetura etc users user "
+               "documents chatgpt".split())
+
+
+def _pasta_compactar(texto, limite, consulta=""):
+    """Reorganiza o pacote da pasta (Cerne Desktop) para CABER no orçamento do modelo sem perder o essencial:
+    cabeçalho + resumo da árvore + arquivos por importância E relevância à pergunta (termos do pedido no caminho
+    ou no conteúdo puxam o arquivo para cima)."""
+    partes = _PASTA_SEC_RE.split(texto)
+    if len(texto) <= limite and len(partes) < 3:
+        return texto
+    cab, secoes = partes[0], list(zip(partes[1::2], partes[2::2]))
+    instr, _, arvore = cab.partition("ÁRVORE DE ARQUIVOS:\n")
+    if "ESTRUTURA COMPLETA" in instr:                  # desktop ≥1.0.6 já manda a estrutura de TODOS os diretórios
+        resumo = ""
+    else:
+        caminhos = [l.strip() for l in arvore.splitlines() if l.strip() and not l.startswith("…")]
+        dirs = {}
+        for c in caminhos:
+            d = "/".join(c.split("/")[:2]) if c.count("/") >= 2 else (c.split("/")[0] if "/" in c else "(raiz)")
+            dirs[d] = dirs.get(d, 0) + 1
+        resumo = "ESTRUTURA (diretório: nº de arquivos): " + ", ".join(f"{d}: {n}" for d, n in sorted(dirs.items(), key=lambda x: -x[1])[:50])
+    import unicodedata as _ud
+
+    def _sa(x):                                        # sem acento: "classificação" casa com "classificacao.ts"
+        return _ud.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+    consulta = re.sub(r"(?:[A-Za-z]:[\\/]|\\\\)[^\n\"'<>|?*]*?(?=\s+(?:e|para|com|e me|que)\s|$)", " ", consulta or "")  # sem o caminho
+    termos = {t[:8] for t in re.findall(r"[a-z0-9_]{4,}", _sa(consulta)) if t not in _PT_STOP}
+
+    def chave(sec):
+        cam, cont = sec
+        p = _pasta_prioridade(cam)
+        cat = int(p)
+        hits = 0
+        if termos and cat in (2, 3, 4):                # relevância à pergunta ordena DENTRO do código/docs
+            alvo = _sa(cam) + " " + _sa(cont[:4000])
+            hits = min(sum(1 for t in termos if t in alvo), 4)
+        return (cat, -hits, p, cam)
+    ordem = sorted(secoes, key=chave)
+    # diversidade: intercala código/docs por MÓDULO (1º de cada app, depois o 2º…) — pergunta geral vê o sistema todo
+    _rank, _cont = {}, {}
+    for cam, _c in ordem:
+        k = (int(_pasta_prioridade(cam)), "/".join(cam.split("/")[:3]))
+        _rank[cam] = _cont.get(k, 0); _cont[k] = _rank[cam] + 1
+    ordem = sorted(ordem, key=lambda sc: (chave(sc)[0], chave(sc)[1], _rank[sc[0]] if chave(sc)[0] in (2, 3, 4) else 0, chave(sc)[2], sc[0]))
+    base = instr.strip()[:min(3500, max(1200, limite // 4))] + ("\n\n" + resumo if resumo else "") + "\n"
+    if len(texto) <= limite:                           # cabe tudo: só reordena (essencial primeiro)
+        return base + "".join(f"\n\n===== ARQUIVO: {c} =====\n{t}" for c, t in ordem if _pasta_prioridade(c) < 99)
+    cap_cod = max(1500, limite // 8)
+    cap_txt = max(900, limite // 14)                   # README/docs de subpasta: trecho menor (há dezenas deles)
+    usado_cat = {}
+    corpo, usados, omitidos = [], 0, 0
+    resto = limite - len(base) - 250
+    for cam, cont in ordem:
+        p = _pasta_prioridade(cam)
+        if p >= 99:
+            continue
+        cat = int(p)
+        cap = cap_cod if cat in (2, 4) else (cap_cod if p < 0.25 else cap_txt)   # README raiz ganha mais espaço
+        trecho = cont if len(cont) <= cap else cont[:cap] + "\n…[cortado]"
+        bloco = f"\n\n===== ARQUIVO: {cam} =====\n{trecho}"
+        cota = _PASTA_COTAS.get(cat)
+        if cota is not None and usado_cat.get(cat, 0) + len(bloco) > limite * cota and usado_cat.get(cat, 0) > 0:
+            omitidos += 1
+            continue
+        if len(bloco) > resto:
+            if resto > 700 and cat <= 2:
+                bloco = bloco[:resto - 20] + "\n…[cortado]"
+            else:
+                omitidos += 1
+                continue
+        corpo.append(bloco); resto -= len(bloco); usados += 1
+        usado_cat[cat] = usado_cat.get(cat, 0) + len(bloco)
+    nota = (f"\n\n[Pasta compactada para caber no modelo: {usados} arquivo(s) mais importantes/relevantes incluídos, "
+            f"{omitidos} omitido(s). Baseie-se neles e diga o que não foi possível ver.]")
+    return base + "".join(corpo) + nota
+
+
+def _anexos_texto(sid, org=None, limite=None, consulta=""):
+    """Anexos da conversa como texto. `limite` = orçamento do modelo que vai ler (local pequeno × externo).
+    Pastas lidas pelo Cerne Desktop são compactadas por importância, não cortadas no meio."""
     if not sid:
         return "", []
     org = org or _tenant()
     _anexos_cleanup()
     itens = [a for a in APPSTATE.get("anexos", []) if a.get("sid") == sid and a.get("org") == org]
-    txt = "\n\n".join("[ANEXO: " + a.get("nome", "arquivo") + "]\n" + (a.get("texto") or "") for a in itens)
-    return txt[:6000], [a.get("nome", "arquivo") for a in itens]
+    tem_pasta = any(a.get("tipo") == "pasta" for a in itens)
+    if limite is None:
+        limite = _ANEXO_LIMITE_EXTERNO if tem_pasta else 6000
+    if not tem_pasta:
+        limite = min(limite, max(6000, limite))
+    fatia = max(1500, limite // max(1, len(itens)))
+    blocos = []
+    for a in itens:
+        t = a.get("texto") or ""
+        t = _pasta_compactar(t, fatia, consulta) if a.get("tipo") == "pasta" else t[:fatia]
+        blocos.append("[ANEXO: " + a.get("nome", "arquivo") + "]\n" + t)
+    return "\n\n".join(blocos)[:limite], [a.get("nome", "arquivo") for a in itens]
+
+
+def _anexo_tem_pasta(sid, org=None):
+    org = org or _tenant()
+    return any(a.get("tipo") == "pasta" and a.get("sid") == sid and a.get("org") == org for a in APPSTATE.get("anexos", []))
 
 
 def _anexo_loop():
@@ -611,7 +787,7 @@ def _sess_flush(force=False):
 # rotas públicas (sem sessão): shell da SPA (que exibe a tela de login), health e o próprio login
 _AUTH_PUBLIC = {"/", "/dashboard", "/health", "/auth/login", "/auth/me", "/favicon.ico", "/favicon.svg",
                 "/baixar", "/download/cerne-desktop", "/download/desktop-manifest",
-                "/ext/poll", "/ext/result", "/ext/hello", "/download/extensao",
+                "/ext/poll", "/ext/result", "/ext/hello", "/desktop/result", "/download/extensao",
                 "/desktop/poll", "/desktop/hello",
                 "/office/poll", "/office/result", "/office/hello", "/office/manifest.xml",
                 "/office/taskpane.html", "/office/taskpane.js", "/office/icon.png", "/download/office-manifest",
@@ -718,6 +894,16 @@ class _OrgMiddleware:
             finally:
                 _USER_CTX.reset(utoken)
                 _ORG_CTX.reset(token)
+        # Servidor MCP (runtime PicoClaw): autenticado por CERNE_MCP_TOKEN DENTRO do endpoint (links de arquivo
+        # por assinatura HMAC); roda na org padrão como o usuário de serviço de perfil mínimo.
+        if scope.get("path", "") == "/mcp" or scope.get("path", "").startswith("/mcp/"):
+            token = _ORG_CTX.set(DEFAULT_ORG)
+            utoken = _USER_CTX.set(dict(_MCP_USER))
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                _USER_CTX.reset(utoken)
+                _ORG_CTX.reset(token)
         key, xff = "", ""
         for k, v in scope.get("headers", []):
             if k == b"x-api-key":
@@ -816,6 +1002,27 @@ def mask_pii(text: str) -> dict:
     r = httpx.post(f"{PII_URL}/mask", json={"text": text}, timeout=120)
     r.raise_for_status()
     return r.json()
+
+
+def _mask_texto_grande(text: str, bloco: int = 40000) -> str:
+    """Mascara textos GRANDES (ex.: pasta de projeto do Cerne Desktop, 300k+ caracteres) em blocos cortados em
+    quebra de linha. Um único pedido de 370k derrubava o serviço de PII (limite de memória do spaCy)."""
+    if len(text) <= bloco:
+        return mask_pii(text).get("masked_text", text)
+    partes, i = [], 0
+    while i < len(text):
+        j = min(len(text), i + bloco)
+        if j < len(text):
+            k = text.rfind("\n", i + bloco // 2, j)
+            j = k + 1 if k > 0 else j
+        trecho = text[i:j]
+        try:
+            partes.append(mask_pii(trecho).get("masked_text", trecho))
+        except Exception:
+            partes.append(trecho if not re.search(r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}|@", trecho) else
+                          re.sub(r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}", "<BR_CPF>", re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "<EMAIL_ADDRESS>", trecho)))
+        i = j
+    return "".join(partes)
 
 
 # Siglas/termos de domínio que o NER pt marca erroneamente como PERSON — NÃO devem ser mascarados
@@ -1415,9 +1622,9 @@ def health():
 
 
 # ---- Cerne Desktop (app instalável) ----
-_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.4.exe")
-_DESKTOP_VER = "1.0.4"
-_DESKTOP_SHA = "d25841420bdd3767727dfb131d94cc820bcc66f3dcb3972ee093e3d51e8d8695"
+_DESKTOP_EXE = os.getenv("DESKTOP_EXE", "/data/app/CerneDesktop-Setup-1.0.7.exe")
+_DESKTOP_VER = "1.0.7"
+_DESKTOP_SHA = "e7acd2e6aed0f543c43cda35f6cfd72c8ec43787f6ab1eefad98608dda5345fe"
 
 
 @app.get("/download/cerne-desktop")
@@ -1466,12 +1673,25 @@ def download_extensao():
     return FileResponse(_EXT_ZIP, media_type="application/zip", filename="cerne-extensao-navegador.zip")
 
 
+def _ext_versao():
+    """Versão da extensão lida do manifest.json dentro do zip publicado (sempre bate com o download)."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(_EXT_ZIP) as z:
+            return json.loads(z.read("manifest.json").decode("utf-8")).get("version", "?")
+    except Exception:
+        return "?"
+
+
 @app.get("/baixar", response_class=HTMLResponse)
 def baixar_desktop():
     tem = os.path.exists(_DESKTOP_EXE)
     mb = f"{os.path.getsize(_DESKTOP_EXE)/1048576:.1f}" if tem else "—"
+    tem_ext = os.path.exists(_EXT_ZIP)
+    ext_kb = f"{os.path.getsize(_EXT_ZIP)/1024:.0f}" if tem_ext else "—"
+    ext_ver = _ext_versao() if tem_ext else "—"
     return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Cerne Desktop — download</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Cerne — downloads</title>
 <style>*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
 font-family:'Segoe UI',system-ui,sans-serif;background:radial-gradient(900px 500px at 80% -10%,rgba(108,140,255,.12),transparent 60%),#0a0e17;color:#e9eef8;padding:24px}}
 .card{{max-width:520px;width:100%;background:#121826;border:1px solid #22314a;border-radius:18px;padding:34px;box-shadow:0 24px 60px rgba(0,0,0,.5)}}
@@ -1487,7 +1707,9 @@ ul{{color:#c3cee1;font-size:13.5px;line-height:1.7;margin:22px 0 0;padding-left:
 .warn{{margin-top:18px;font-size:12px;color:#93a4bf;border-top:1px solid #22314a;padding-top:14px;line-height:1.6}}
 .sha{{font-family:ui-monospace,Consolas,monospace;font-size:9.5px;color:#63728e;word-break:break-all}}
 a.link{{color:#6c8cff}}</style></head>
-<body><div class="card">
+<style>body{{gap:22px;flex-wrap:wrap;align-items:flex-start}}.card:target{{border-color:#35e0e6;box-shadow:0 0 0 1px #35e0e6,0 24px 60px rgba(0,0,0,.5)}}
+ol{{color:#c3cee1;font-size:13.5px;line-height:1.7;margin:22px 0 0;padding-left:20px}}code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#35e0e6}}</style>
+<body><div class="card" id="desktop">
 <div class="d"></div>
 <h1>Cerne Desktop</h1>
 <p class="sub">O app soberano do Cerne para Windows — roda o Workspace e ingere pastas do seu computador direto no acervo.</p>
@@ -1501,6 +1723,21 @@ a.link{{color:#6c8cff}}</style></head>
 <div class="warn">Instalador ainda <b>não assinado digitalmente</b>: o Windows SmartScreen pode avisar — clique em <i>“Mais informações → Executar assim mesmo”</i>. Assinatura de código pode ser adicionada depois.
 <div class="sha" style="margin-top:8px">SHA-256: {_DESKTOP_SHA}</div></div>
 <p style="text-align:center;margin:18px 0 0"><a class="link" href="/">← voltar ao Cerne Web</a></p>
+</div>
+<div class="card" id="extensao">
+<div class="d" style="border-color:#8a7cff;box-shadow:0 0 26px rgba(138,124,255,.5)"></div>
+<h1>Extensão do navegador</h1>
+<p class="sub">Deixa os agentes do Cerne operarem, <b>com a sua permissão</b>, o Chrome ou Edge que você já usa — abrir páginas, preencher formulários, clicar e baixar, com uma moldura visível enquanto atuam.</p>
+<a class="btn {'' if tem_ext else 'off'}" href="/download/extensao" download>⬇ Baixar extensão &nbsp;·&nbsp; {ext_kb} KB</a>
+<div class="meta"><span class="pill">v{ext_ver}</span><span class="pill">Chrome · Edge</span><span class="pill">.zip</span></div>
+<ol>
+<li>Extraia o <b>.zip</b> numa pasta fixa (ex.: <code>Documentos\\Cerne\\extensao</code>).</li>
+<li>Abra <code>chrome://extensions</code> (ou <code>edge://extensions</code>) e ligue o <b>Modo do desenvolvedor</b>.</li>
+<li>Clique em <b>Carregar sem compactação</b> e escolha a pasta extraída.</li>
+<li>No Cerne: <b>Agentes → Integrações → Gerar código de pareamento</b>; cole o código no ícone da extensão.</li>
+</ol>
+<div class="warn"><b>Para atualizar:</b> baixe de novo, extraia <b>por cima da mesma pasta</b> e clique em <b>↻ Recarregar</b> no card da extensão em <code>chrome://extensions</code> — o pareamento continua valendo.
+Com o <b>Cerne Desktop</b> pareado, o navegador é aberto sozinho quando um agente precisar dele.</div>
 </div></body></html>"""
 
 
@@ -2501,7 +2738,8 @@ def ask_externo(body: AskExterno):
     sk_system, sk_nome, sk_cols = _skills_combinar(_sk_ids)
     if sk_cols:
         colls = list(dict.fromkeys((colls or []) + sk_cols))
-    ax, axn = _anexos_texto(body.session_id or "")
+    ax, axn = _anexos_texto(body.session_id or "", limite=_anexo_limite(getattr(body, "provider", "") or "ext-"),
+                            consulta=getattr(body, "question", "") or "")
     # busca na web (opt-in por org): também no caminho EXTERNO/híbrido — dá acesso a fatos atuais e
     # reduz alucinação (ex.: modelos/produtos novos que o provedor não conhece). A consulta usa a
     # pergunta original; o resultado (público) entra no contexto e é citado como fonte.
@@ -2737,7 +2975,11 @@ def _proxy_master_ok(request: Request) -> bool:
     auth = request.headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
         k = k or auth[7:]
-    return bool(GATEWAY_KEY) and secrets.compare_digest(k, GATEWAY_KEY)
+    if bool(GATEWAY_KEY) and secrets.compare_digest(k, GATEWAY_KEY):
+        return True
+    # runtime PicoClaw: usa o token MCP próprio (nunca recebe a master key do gateway)
+    tok_mcp = os.getenv("CERNE_MCP_TOKEN", "").strip()
+    return bool(tok_mcp) and bool(k) and secrets.compare_digest(k, tok_mcp)
 
 
 def _proxy_texto_da_resposta(resp):
@@ -2835,7 +3077,7 @@ def agent(body: AgentReq):
     system, skill_nome, _skcols = _skills_combinar(_ids)
     if _skcols:
         colls = list(dict.fromkeys((colls or []) + _skcols))      # une as coleções das skills às da tarefa
-    axtxt, axnames = _anexos_texto(sid)
+    axtxt, axnames = _anexos_texto(sid, limite=_ANEXO_LIMITE_LOCAL, consulta=body.message)   # local: janela pequena
     web_on = bool(_org().get("busca_web"))
     webtxt, webfontes = _web_search(body.message) if web_on else ("", [])
     extra = "\n\n".join(x for x in (_memoria_bloco(), axtxt, webtxt) if x)     # memória + anexos + web (se ativos)
@@ -2921,13 +3163,17 @@ def agent_stream(body: AgentReq):
     system, skill_nome, _skcols = _skills_combinar(_ids)
     if _skcols:
         colls = list(dict.fromkeys((colls or []) + _skcols))
-    axtxt, axnames = _anexos_texto(sid)
+    axtxt, axnames = _anexos_texto(sid, limite=_ANEXO_LIMITE_LOCAL, consulta=body.message)   # local: janela pequena
+    _pasta_local = _anexo_tem_pasta(sid)
     lm = "chat-gemma" if body.modelo == "chat-gemma" else "chat"    # modelo local escolhido
 
     def gen():
         # narra as etapas ao vivo: [[STEP]]... antes de [[ANSWER]] (a resposta), depois [[META]]{json}
         # PLANO DE GATEWAY · cache semântico — pergunta equivalente já respondida? entrega na hora
         _orq = bool(body.orquestrar or _needs_orchestration(body.message))
+        if _pasta_local:
+            yield ("[[STEP]]📁 pasta anexada: o modelo local só enxerga um RESUMO dos arquivos mais importantes — "
+                   "para analisar o projeto inteiro, escolha um modelo externo (ex.: Mistral) no seletor")
         _ckey = _cache_chave(colls, ",".join(_ids), lm)
         if not _orq and not axtxt:                      # não cacheia orquestração nem chat com anexos
             _hit = _cache_get(body.message, _ckey)
@@ -3192,6 +3438,246 @@ def preflight():
     add("Audit ledger íntegro", lg.get("integro", True), f"{lg.get('total', 0)} registros")
     passing = sum(1 for c in checks if c["ok"])
     return {"passando": passing, "total": len(checks), "checks": checks}
+
+
+# ============ Servidor MCP do Cerne (runtime PicoClaw: Telegram/WhatsApp/desktop → ferramentas do Cerne) ============
+# Transporte MCP "Streamable HTTP" em modo request/response (JSON-RPC 2.0 em POST /mcp, sem SSE standalone).
+# Autenticado por CERNE_MCP_TOKEN (token PRÓPRIO, nunca a master key). Roda na org padrão como o usuário de serviço
+# "picoclaw@runtime" com perfil mínimo (colaborador): mesmo isolamento/RBAC/guardrails/auditoria do painel.
+CERNE_MCP_TOKEN = os.getenv("CERNE_MCP_TOKEN", "").strip()
+_MCP_USER = {"email": "picoclaw@runtime", "nome": "PicoClaw (runtime)", "perfil": "colaborador"}
+_MCP_PROTO = "2025-06-18"
+_MCP_LINK_TTL = 24 * 3600
+
+_MCP_TOOLS = [
+    {"name": "buscar_acervo",
+     "description": "Busca trechos relevantes no acervo de documentos da organização (RAG). Use antes de responder sobre documentos, políticas, contratos ou dados internos.",
+     "inputSchema": {"type": "object", "properties": {
+         "consulta": {"type": "string", "description": "o que procurar"},
+         "colecao": {"type": "string", "description": "coleção específica (opcional; padrão = acervo principal)"}},
+         "required": ["consulta"]}},
+    {"name": "gerar_documento",
+     "description": "Gera um arquivo Office REAL (planilha .xlsx, documento .docx ou apresentação .pptx) a partir do pedido e devolve um link de download válido por 24h.",
+     "inputSchema": {"type": "object", "properties": {
+         "tipo": {"type": "string", "enum": ["planilha", "documento", "apresentacao"]},
+         "pedido": {"type": "string", "description": "o que o arquivo deve conter, com os dados reais"},
+         "usar_acervo": {"type": "boolean", "description": "aterrar o conteúdo no acervo (padrão: false)"}},
+         "required": ["tipo", "pedido"]}},
+    {"name": "listar_agentes",
+     "description": "Lista os agentes do Cerne disponíveis (id, nome, descrição, ferramentas).",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "executar_agente",
+     "description": "Executa um agente do Cerne com uma mensagem e devolve a resposta (e links dos arquivos gerados, se houver).",
+     "inputSchema": {"type": "object", "properties": {
+         "agente_id": {"type": "string"}, "mensagem": {"type": "string"},
+         "session_id": {"type": "string", "description": "para continuar a mesma conversa com o agente (opcional)"}},
+         "required": ["agente_id", "mensagem"]}},
+    {"name": "solicitar_aprovacao",
+     "description": "OBRIGATÓRIO antes de qualquer ação destrutiva ou irreversível (apagar/sobrescrever arquivos, instalar/desinstalar, enviar e-mail/mensagem em nome do usuário, pagamentos, alterar configurações). Cria um pedido na fila de aprovação do Cerne e devolve o id. Depois use consultar_aprovacao e só prossiga se o status for 'aprovado'.",
+     "inputSchema": {"type": "object", "properties": {
+         "acao": {"type": "string", "description": "a ação exata que será executada"},
+         "justificativa": {"type": "string", "description": "por que ela é necessária"}},
+         "required": ["acao"]}},
+    {"name": "consultar_aprovacao",
+     "description": "Consulta o status de um pedido de aprovação: aguardando_aprovacao | aprovado | recusado.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "lembrar",
+     "description": "Salva um fato duradouro na memória governada da organização (preferências, decisões, contexto do usuário).",
+     "inputSchema": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]}},
+    {"name": "data_hora",
+     "description": "Data e hora atuais do servidor (America/Sao_Paulo).",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def _mcp_sig(run_id, nome, exp):
+    msg = f"{run_id}/{nome}/{exp}".encode("utf-8")
+    return hashlib.sha256(CERNE_MCP_TOKEN.encode("utf-8") + b"|" + msg).hexdigest()[:32]
+
+
+def _mcp_link(url_artefato):
+    """/agentes/artefato/{run}/{nome} (exige login) → link público ASSINADO e temporário (24h) p/ o chat externo."""
+    m = re.match(r"^/agentes/artefato/([A-Za-z0-9_-]+)/(.+)$", url_artefato or "")
+    if not m:
+        return url_artefato
+    run_id, nome = m.group(1), m.group(2)
+    exp = int(time.time()) + _MCP_LINK_TTL
+    return f"{_OFFICE_BASE}/mcp/arquivo/{run_id}/{nome}?exp={exp}&sig={_mcp_sig(run_id, nome, exp)}"
+
+
+@app.get("/mcp/arquivo/{run_id}/{nome}")
+def mcp_arquivo(run_id: str, nome: str, exp: int = 0, sig: str = ""):
+    nome = os.path.basename(nome)
+    if (not CERNE_MCP_TOKEN or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or exp < time.time()
+            or not secrets.compare_digest(sig or "", _mcp_sig(run_id, nome, exp))):
+        raise HTTPException(status_code=403, detail="link inválido ou expirado")
+    p = os.path.join(_ART_DIR, run_id, nome)
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="arquivo não encontrado")
+    return FileResponse(p, filename=nome)
+
+
+def _mcp_gerar_documento(args):
+    tipo = args.get("tipo")
+    pedido = (args.get("pedido") or "").strip()
+    if tipo not in ("planilha", "documento", "apresentacao") or not pedido:
+        return "parâmetros inválidos: tipo ∈ {planilha, documento, apresentacao} e pedido obrigatório", True
+    ok, why = guard_input(pedido)
+    if not ok:
+        return f"bloqueado pelo guardrail: {why}", True
+    contexto = ""
+    if args.get("usar_acervo"):
+        hits = _search(pedido, 5)
+        contexto = "\n".join(f"[{h.payload.get('source', '?')}] {(h.payload.get('text', '') or '')[:300]}" for h in hits)
+    workdir = "mcp" + uuid.uuid4().hex[:12]
+    try:
+        spec = _office_spec(tipo, pedido, contexto)
+        if not spec:
+            return "não consegui estruturar os dados do arquivo; reformule o pedido com mais detalhes", True
+        code, fnome = _office_code(tipo, spec)
+        saida = _sandbox_exec(code, "python", workdir) if code else ""
+        if "OK arquivo:" not in (saida or ""):
+            return f"falha ao gerar o arquivo: {(saida or '')[:300]}", True
+        arts = _agente_coletar_artefatos(workdir)
+    finally:
+        _sb_reset(workdir)
+    if not arts:
+        return "o arquivo foi gerado mas não consegui disponibilizá-lo para download", True
+    links = "\n".join(f"- {a['nome']} ({a['bytes'] // 1024 or 1} KB): {_mcp_link(a['url'])}" for a in arts)
+    return f"Arquivo gerado (link válido por 24h):\n{links}", False
+
+
+def _mcp_call(name, args):
+    """Executa uma ferramenta MCP. Retorna (texto, is_error)."""
+    args = args or {}
+    if name == "buscar_acervo":
+        q = (args.get("consulta") or "").strip()
+        if not q:
+            return "consulta vazia", True
+        coll = args.get("colecao") or COLLECTION
+        if not _org_can(coll):
+            return f"coleção '{coll}' não existe ou não pertence à organização", True
+        hits = _search(q, 5, coll)
+        if not hits:
+            return "(nada encontrado no acervo)", False
+        return "\n\n---\n\n".join(f"[fonte: {h.payload.get('source', '?')}]\n{h.payload.get('text', '')}" for h in hits), False
+    if name == "gerar_documento":
+        return _mcp_gerar_documento(args)
+    if name == "listar_agentes":
+        rank = _PERFIL_RANK.get(_MCP_USER["perfil"], 1)
+        ags = [{"id": a.get("id"), "nome": a.get("nome"), "descricao": (a.get("descricao") or "")[:200],
+                "ferramentas": a.get("ferramentas") or []}
+               for a in _agentes() if a.get("ativo") and a.get("org", DEFAULT_ORG) == _tenant()
+               and _PERFIL_RANK.get(a.get("perfil_minimo", "colaborador"), 1) <= rank]
+        return json.dumps(ags, ensure_ascii=False), False
+    if name == "executar_agente":
+        aid, msg = args.get("agente_id") or "", (args.get("mensagem") or "").strip()
+        if not aid or not msg:
+            return "agente_id e mensagem são obrigatórios", True
+        try:
+            r = agentes_run(aid, AgenteRunReq(mensagem=msg, session_id=args.get("session_id") or None))
+        except HTTPException as e:
+            return f"erro: {e.detail}", True
+        if not isinstance(r, dict):
+            return "erro ao executar o agente", True
+        out = r.get("answer") or ""
+        if r.get("artefatos"):
+            out += "\n\nArquivos (links válidos por 24h):\n" + "\n".join(
+                f"- {a['nome']}: {_mcp_link(a['url'])}" for a in r["artefatos"])
+        out += f"\n\n(session_id: {r.get('session_id')})"
+        return out, bool(r.get("bloqueado"))
+    if name == "solicitar_aprovacao":
+        acao = (args.get("acao") or "").strip()
+        if not acao:
+            return "descreva a ação", True
+        jid = uuid.uuid4().hex[:10]
+        just = (args.get("justificativa") or "").strip()
+        j = {"id": jid, "org": _tenant(), "tipo": "aprovacao_runtime", "titulo": ("🤖 PicoClaw · " + acao)[:80],
+             "status": "aguardando_aprovacao", "pergunta": acao + (("\n\nJustificativa: " + just) if just else ""),
+             "colecoes": [], "skill_id": "", "skill_ids": [], "resultado": None, "fontes": [], "erro": None,
+             "criado": time.time(), "atualizado": time.time(), "aprovacao": True, "por": None}
+        _JOBS[jid] = j
+        _event("aprovação solicitada", f"PicoClaw · {acao[:60]} · {jid}", actor=_MCP_USER["email"])
+        return (f"Pedido de aprovação criado (id {jid}). Um responsável precisa aprovar em Workspace → Fila no Cerne. "
+                f"Consulte com consultar_aprovacao e NÃO execute a ação antes do status 'aprovado'."), False
+    if name == "consultar_aprovacao":
+        j = _JOBS.get(args.get("id") or "")
+        if not j or j.get("org") != _tenant() or j.get("tipo") != "aprovacao_runtime":
+            return "pedido não encontrado", True
+        return json.dumps({"id": j["id"], "status": j["status"], "acao": j["pergunta"][:300]}, ensure_ascii=False), False
+    if name == "lembrar":
+        r = memoria_add(MemoriaReq(texto=args.get("texto") or ""))
+        if isinstance(r, dict):
+            return f"memória salva (id {r['id']})", False
+        return "texto vazio", True
+    if name == "data_hora":
+        import datetime as _dt
+        try:
+            from zoneinfo import ZoneInfo
+            agora = _dt.datetime.now(ZoneInfo("America/Sao_Paulo"))
+        except Exception:                                   # sem tzdata: Brasília é UTC-3 fixo (sem horário de verão)
+            agora = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=-3)))
+        return agora.strftime("%d/%m/%Y %H:%M:%S (horário de Brasília)"), False
+    return f"ferramenta desconhecida: {name}", True
+
+
+def _mcp_rpc(msg):
+    """Processa UMA mensagem JSON-RPC. Retorna o dict de resposta, ou None p/ notificações."""
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    if mid is None:                                          # notificação (ex.: notifications/initialized)
+        return None
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+    if method == "initialize":
+        return ok({"protocolVersion": params.get("protocolVersion") or _MCP_PROTO,
+                   "capabilities": {"tools": {"listChanged": False}},
+                   "serverInfo": {"name": "cerne", "version": "1.0.0"},
+                   "instructions": "Ferramentas do Cerne (acervo, Office, agentes, aprovação humana, memória). "
+                                   "Ações destrutivas exigem solicitar_aprovacao antes."})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": _MCP_TOOLS})
+    if method == "tools/call":
+        name = params.get("name") or ""
+        t0 = time.time()
+        try:
+            texto, erro = _mcp_call(name, params.get("arguments") or {})
+        except Exception as e:
+            texto, erro = f"erro interno: {str(e)[:200]}", True
+        _event("mcp · ferramenta", f"{name} · {'erro' if erro else 'ok'} · {int((time.time() - t0) * 1000)}ms",
+               actor=_MCP_USER["email"])
+        return ok({"content": [{"type": "text", "text": texto}], "isError": bool(erro)})
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"método não suportado: {method}"}}
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    auth = request.headers.get("authorization") or ""
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not CERNE_MCP_TOKEN or not secrets.compare_digest(tok, CERNE_MCP_TOKEN):
+        return JSONResponse(status_code=401, content={"error": "token MCP inválido"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": None,
+                                                      "error": {"code": -32700, "message": "JSON inválido"}})
+    lote = body if isinstance(body, list) else [body]
+    # ferramentas são síncronas (HTTP/LLM/sandbox): roda no threadpool, copiando o contexto (org/usuário)
+    ctx = contextvars.copy_context()
+    import starlette.concurrency as _sc
+    resps = await _sc.run_in_threadpool(lambda: ctx.run(lambda: [r for r in (_mcp_rpc(m) for m in lote if isinstance(m, dict)) if r]))
+    if not resps:
+        return Response(status_code=202)
+    return JSONResponse(resps if isinstance(body, list) else resps[0])
+
+
+@app.get("/mcp")
+def mcp_get():
+    # sem stream SSE standalone (modo request/response); o cliente usa só POST
+    return Response(status_code=405, headers={"Allow": "POST"})
 
 
 # ============ Skills / Prompt Templates · Instruções globais · Projetos · Adoção ============
@@ -3699,6 +4185,10 @@ def job_aprovar(jid: str):
         return JSONResponse(status_code=404, content={"error": "job não encontrado"})
     if j["status"] != "aguardando_aprovacao":
         return _job_pub(j)
+    if j.get("tipo") == "aprovacao_runtime":             # aprovação de ação do runtime (PicoClaw): só libera, não orquestra
+        j["status"] = "aprovado"; j["por"] = _actor(); j["atualizado"] = time.time()
+        _event("ação do runtime aprovada", f'{j["titulo"][:50]} · {jid}')
+        return _job_pub(j)
     j["status"] = "na_fila"; j["por"] = _tenant(); j["atualizado"] = time.time()
     _event("job aprovado", f'{j["titulo"][:50]} · {jid}')
     _job_enfileirar(j)
@@ -3865,16 +4355,17 @@ def orgs_del(org: str):
 
 
 @app.post("/anexo")
-async def anexo_add(file: UploadFile = File(...), sid: str = ""):
+async def anexo_add(file: UploadFile = File(...), sid: str = "", tipo: str = ""):
     raw = await file.read()
     try:
         txt = extract_text(file.filename, raw)
     except Exception:
         txt = raw.decode("utf-8", errors="ignore")
-    masked = mask_pii(txt).get("masked_text", txt)   # anexo fica mascarado (soberano; seguro p/ externo)
+    masked = _mask_texto_grande(txt)                 # anexo fica mascarado (soberano; seguro p/ externo), em blocos
     aid = uuid.uuid4().hex[:10]
     APPSTATE.setdefault("anexos", []).append({"id": aid, "org": _tenant(), "sid": sid,
-                                              "nome": file.filename, "texto": masked, "ts": time.time()})
+                                              "nome": file.filename, "texto": masked, "ts": time.time(),
+                                              "tipo": "pasta" if tipo == "pasta" else ""})
     _anexos_cleanup()
     _appstate_save(APPSTATE)
     _event("anexo de chat", f"{file.filename}")
@@ -4271,8 +4762,10 @@ AGENTE_TOOLS = {
     "acervo": "Busca no acervo (RAG + grafo, com fontes)",
     "web": "Rastrear/ler páginas da web (crawler)",
     "gerar_documento": "Gerar documento ou site",
-    "codigo": "Executar código + gerar Excel/Word/PPT (sandbox isolado)",
-    "navegador": "Operar o navegador do usuário (extensão Chrome/Edge)",
+    "codigo": "Executar código/terminal, instalar pacotes (pip/npm), testar + gerar Excel/Word/PPT (sandbox isolado)",
+    "navegador": "Operar o navegador do usuário (extensão Chrome/Edge): ver elementos, clicar, preencher, automações",
+    "computador": "Operar o computador do usuário via Cerne Desktop: pastas, arquivos, comandos e teclado (com permissão nativa)",
+    "github": "GitHub: clonar repositório, alterar, testar e abrir Pull Request (token do conector GitHub)",
     "office": "Operar Excel/Word/PPT abertos ao vivo (add-in Office.js)",
     "nuvem": "Enviar arquivos gerados ao OneDrive/SharePoint (Graph)",
     "comparar": "Comparar documentos e apontar diferenças/riscos",
@@ -4321,6 +4814,8 @@ MCP_CATALOGO = {
                     "command": "npx", "args": ["-y", "@modelcontextprotocol/server-excel"], "env": []},
     "desktop":     {"nome": "Desktop · automação (pyautogui)", "cat": "Automação", "icon": "🖥️", "acoes": "controla mouse, teclado e aplicativos do computador — requer o Cerne Desktop (máquina local)",
                     "command": "npx", "args": ["-y", "mcp-pyautogui-server"], "env": []},
+    "opendesign":  {"nome": "Open Design Agent Kit", "cat": "Design", "icon": "🎨", "acoes": "design systems de marca, receitas e exemplos remixáveis do Open Design; gera e checa landing pages, decks, posters e dashboards em HTML",
+                    "command": "npx", "args": ["-y", "@feimacode/open-design-agent-kit-mcp"], "env": []},
 }
 _PERFIL_RANK = {"colaborador": 1, "gestor": 2, "admin": 3}
 
@@ -4329,12 +4824,19 @@ def _mcp_custom():
     return APPSTATE.get("mcp_custom", [])
 
 
+# Conectores do catálogo com equivalente NATIVO no motor do Cerne: anexar o conector liga a ferramenta nativa.
+# Os demais só executam com o runtime NanoClaw (MCP via npx) — a UI marca isso para não parecer que funcionam.
+_MCP_NATIVO = {"github": "github", "playwright": "navegador", "puppeteer": "navegador", "desktop": "computador"}
+_NANOCLAW_ATIVO = bool(os.getenv("NANOCLAW_URL", "").strip())
+
+
 def _mcp_lib():
     """TIPOS de conector (templates/shapes): catálogo curado + tipos MCP custom do admin.
     Definem o formato (command/args + NOMES das credenciais). Não contêm credenciais."""
-    lib = {k: dict(v, id=k, tipo="catalogo") for k, v in MCP_CATALOGO.items()}
+    lib = {k: dict(v, id=k, tipo="catalogo", nativo=_MCP_NATIVO.get(k, ""),
+                   executa=bool(_MCP_NATIVO.get(k) or _NANOCLAW_ATIVO)) for k, v in MCP_CATALOGO.items()}
     for c in _mcp_custom():
-        lib[c["id"]] = dict(c, tipo="custom")
+        lib[c["id"]] = dict(c, tipo="custom", nativo="", executa=_NANOCLAW_ATIVO)
     return lib
 
 
@@ -5032,6 +5534,10 @@ def agentes_save(body: AgenteReq):
         raise HTTPException(status_code=400, detail="informe o nome do agente")
     perfil = body.perfil_minimo if body.perfil_minimo in _PERFIL_RANK else "colaborador"
     tools = [t for t in (body.ferramentas or []) if t in AGENTE_TOOLS]
+    for _iid in (body.mcp or []):                           # GitHub/Playwright/Desktop → ferramenta nativa equivalente
+        _nat = _MCP_NATIVO.get(((_conn_por_id(_iid) or {}).get("tipo")) or "")
+        if _nat and _nat not in tools:
+            tools.append(_nat)
     ids_ok = {c["id"] for c in _conn_instancias()}
     mcp = [m for m in (body.mcp or []) if m in ids_ok]      # agora são IDs de INSTÂNCIAS configuradas
     ags = _agentes()
@@ -5043,7 +5549,8 @@ def agentes_save(body: AgenteReq):
             "nome": body.nome.strip(), "descricao": (body.descricao or "").strip(),
             "persona": (body.persona or "").strip(), "skill_id": skill_id, "ferramentas": tools, "mcp": mcp,
             "colecao": (body.colecao or "").strip(), "modelo": body.modelo or "agent",
-            "perfil_minimo": perfil, "ativo": bool(body.ativo)}
+            "perfil_minimo": perfil, "ativo": bool(body.ativo),
+            "criado_por": (atual or {}).get("criado_por") or (_usuario_atual() or {}).get("id")}
     APPSTATE["agentes"] = [a for a in ags if a.get("id") != item["id"]] + [item]
     _appstate_save(APPSTATE)
     _event("agente " + ("atualizado" if atual else "criado"),
@@ -5089,7 +5596,7 @@ def _extract_json(text, need_key=None):
                 depth -= 1
                 if depth == 0:
                     try:
-                        o = json.loads(text[i:j + 1])
+                        o = json.loads(text[i:j + 1], strict=False)   # tolera quebras de linha cruas (arquivo inteiro em "conteudo")
                         if isinstance(o, dict) and (need_key is None or o.get(need_key) is not None):
                             return o
                     except Exception:
@@ -5209,7 +5716,7 @@ def _sb_write(run_id, nome, conteudo):
     if SANDBOX_URL:
         try:
             httpx.post(f"{SANDBOX_URL}/write", json={"workdir": run_id, "nome": nome, "conteudo": conteudo or ""}, timeout=15)
-            return f"(arquivo '{os.path.basename(nome or '')}' escrito no workspace)"
+            return f"(arquivo '{nome}' escrito no workspace)"
         except Exception as e:
             return f"(erro ao escrever: {str(e)[:100]})"
     p = os.path.join(_sb_localdir(run_id), os.path.basename(nome or "arquivo.txt"))
@@ -5232,10 +5739,121 @@ def _sb_read(run_id, nome):
         return f"(erro: {str(e)[:80]})"
 
 
+def _github_token():
+    """Token do GitHub da org: conector 'GitHub' configurado (cifrado) → env GITHUB_TOKEN."""
+    org = _tenant()
+    for inst in _conn_instancias():
+        if inst.get("tipo") == "github" and (inst.get("org") in (None, "", org)):
+            raw = ((inst.get("env") or {}).get("GITHUB_PERSONAL_ACCESS_TOKEN") or "").strip()
+            if raw:
+                try:
+                    return _dec(raw)
+                except Exception:
+                    pass
+    return os.getenv("GITHUB_TOKEN", "").strip()
+
+
+def _gh_headers(token):
+    h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cerne-agente"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+_GH_RUN = {}                                               # workdir -> {owner, repo, base}
+
+
+def _gh_repo(txt):
+    m = re.search(r"(?:github\.com[/:])?([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/#?].*)?$", (txt or "").strip())
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _github_tool(call, workdir):
+    import base64 as _b64
+    acao = (call.get("acao") or "status").lower()
+    token = _github_token()
+    H = _gh_headers(token)
+    api = "https://api.github.com"
+    if acao == "clonar":
+        owner, repo = _gh_repo(call.get("repo") or "")
+        if not owner:
+            return "(informe o repositório: https://github.com/dono/repo ou dono/repo)"
+        info = httpx.get(f"{api}/repos/{owner}/{repo}", headers=H, timeout=30)
+        if info.status_code != 200:
+            return (f"(GitHub {info.status_code}: não achei {owner}/{repo}"
+                    + ("" if token else " — repositório privado exige o conector GitHub com token") + ")")
+        base = call.get("ref") or info.json().get("default_branch") or "main"
+        tb = httpx.get(f"{api}/repos/{owner}/{repo}/tarball/{base}", headers=H, timeout=180, follow_redirects=True)
+        if tb.status_code != 200:
+            return f"(falha ao baixar {owner}/{repo}@{base}: HTTP {tb.status_code})"
+        if len(tb.content) > 80 * 1024 * 1024:
+            return "(repositório grande demais para o sandbox (>80MB compactado))"
+        r = httpx.post(f"{SANDBOX_URL}/extract", json={"workdir": workdir, "dest": "repo",
+                       "b64": _b64.b64encode(tb.content).decode()}, timeout=240).json()
+        if r.get("erro"):
+            return f"(falha ao extrair no sandbox: {r['erro']})"
+        _GH_RUN[workdir] = {"owner": owner, "repo": repo, "base": base}
+        return (f"(clonado {owner}/{repo}@{base} em ./repo — {r.get('arquivos', '?')} arquivos. Use terminal "
+                f"(cd repo && ...) para instalar dependências e rodar testes; 'status' mostra o que mudou.)")
+    st = _GH_RUN.get(workdir)
+    if not st:
+        return "(nenhum repositório clonado nesta execução — use acao 'clonar' primeiro)"
+    ch = httpx.post(f"{SANDBOX_URL}/git_changes", json={"workdir": workdir, "dir": "repo",
+                    "conteudo": acao == "abrir_pr"}, timeout=120).json()
+    if ch.get("erro"):
+        return f"(falha ao listar alterações: {ch['erro']})"
+    mud = ch.get("mudancas") or []
+    if acao == "status":
+        return "(sem alterações)" if not mud else "Alterações:\n" + "\n".join(
+            f"{'removido' if m.get('removido') else 'alterado/novo'}: {m['caminho']}" for m in mud[:200])
+    if acao != "abrir_pr":
+        return "(ação inválida: use clonar | status | abrir_pr)"
+    if not token:
+        return "(para abrir PR configure o conector GitHub (token com permissão de escrita no repositório) em Agentes → Ferramentas)"
+    if not mud:
+        return "(nada a enviar: nenhuma alteração no repositório)"
+    owner, repo, base = st["owner"], st["repo"], st["base"]
+    branch = re.sub(r"[^\w./-]+", "-", (call.get("branch") or f"cerne/{uuid.uuid4().hex[:8]}").strip())[:100]
+    titulo = (call.get("titulo") or "Alterações propostas pelo agente do Cerne")[:200]
+    corpo = (call.get("descricao") or "") + "\n\n— aberto por um agente do Cerne"
+    try:
+        ref = httpx.get(f"{api}/repos/{owner}/{repo}/git/ref/heads/{base}", headers=H, timeout=30); ref.raise_for_status()
+        base_sha = ref.json()["object"]["sha"]
+        cm = httpx.get(f"{api}/repos/{owner}/{repo}/git/commits/{base_sha}", headers=H, timeout=30); cm.raise_for_status()
+        arvore = []
+        for m in mud[:300]:
+            if m.get("removido"):
+                arvore.append({"path": m["caminho"], "mode": "100644", "type": "blob", "sha": None})
+                continue
+            bl = httpx.post(f"{api}/repos/{owner}/{repo}/git/blobs", headers=H, timeout=60,
+                            json={"content": m.get("b64") or "", "encoding": "base64"}); bl.raise_for_status()
+            arvore.append({"path": m["caminho"], "mode": m.get("modo") or "100644", "type": "blob", "sha": bl.json()["sha"]})
+        tr = httpx.post(f"{api}/repos/{owner}/{repo}/git/trees", headers=H, timeout=60,
+                        json={"base_tree": cm.json()["tree"]["sha"], "tree": arvore}); tr.raise_for_status()
+        nc = httpx.post(f"{api}/repos/{owner}/{repo}/git/commits", headers=H, timeout=60,
+                        json={"message": titulo, "tree": tr.json()["sha"], "parents": [base_sha]}); nc.raise_for_status()
+        nr = httpx.post(f"{api}/repos/{owner}/{repo}/git/refs", headers=H, timeout=30,
+                        json={"ref": f"refs/heads/{branch}", "sha": nc.json()["sha"]}); nr.raise_for_status()
+        pr = httpx.post(f"{api}/repos/{owner}/{repo}/pulls", headers=H, timeout=30,
+                        json={"title": titulo, "head": branch, "base": base, "body": corpo}); pr.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        det = ""
+        try:
+            det = e.response.json().get("message", "")
+        except Exception:
+            pass
+        return (f"(GitHub recusou: HTTP {e.response.status_code} {det} — o token precisa de permissão de escrita "
+                f"(contents + pull requests) em {owner}/{repo})")
+    url = pr.json().get("html_url")
+    _event("PR aberto por agente", f"{owner}/{repo} · {branch} · {len(mud)} arquivo(s)")
+    return f"(PR aberto: {url} — branch {branch} → {base}, {len(mud)} arquivo(s))"
+
+
 def _sb_reset(run_id):
     if SANDBOX_URL:
         try:
             httpx.post(f"{SANDBOX_URL}/reset", json={"workdir": run_id}, timeout=10)
+            _GH_RUN.pop(run_id, None)
         except Exception:
             pass
     else:
@@ -5522,7 +6140,8 @@ def _ext_channel(uid):
         ch = _EXT_CH.get(uid)
         if not ch:
             ch = {"q": queue.Queue(), "res": {}, "ev": {}, "last_hello": 0.0, "info": {},
-                  "desktop_q": queue.Queue(), "desktop_hello": 0.0, "office": {}}
+                  "desktop_q": queue.Queue(), "desktop_hello": 0.0, "office": {},
+                  "dres": {}, "dev": {}, "desktop_ver": ""}
             _EXT_CH[uid] = ch
         return ch
 
@@ -5611,6 +6230,45 @@ def _browser_exec(uid, cmd, timeout=45):
     return (res or {}) if isinstance(res, dict) else {"erro": "resposta vazia"}
 
 
+_DESKTOP_ACOES = ("listar", "ler", "gravar", "rodar", "digitar", "tecla", "abrir")
+
+
+def _desktop_exec(uid, cmd, timeout=150):
+    """Envia uma ação ao Cerne Desktop do usuário e espera o resultado (o desktop pede permissão NATIVA)."""
+    ch = _ext_channel(uid)
+    cid = uuid.uuid4().hex[:10]
+    ev = threading.Event(); ch["dev"][cid] = ev
+    ch["desktop_q"].put(dict(cmd, id=cid))
+    if not ev.wait(timeout):
+        ch["dev"].pop(cid, None)
+        return {"erro": "sem resposta do Cerne Desktop (o usuário não respondeu à permissão, ou o app está desatualizado — "
+                        "bandeja → Verificar atualização)"}
+    res = ch["dres"].pop(cid, None); ch["dev"].pop(cid, None)
+    return res if isinstance(res, dict) else {"erro": "resposta vazia"}
+
+
+def _computador_exec_atual(call):
+    """Ferramenta 'computador': opera o PC do usuário pelo Cerne Desktop pareado. Cada pasta/comando/digitação
+    passa por um diálogo nativo de permissão no próprio computador — o servidor nunca age sozinho."""
+    u = _usuario_atual()
+    if not u:
+        return "(sem usuário na execução — computador indisponível)"
+    uid = u.get("id")
+    if not _desktop_conectado(uid):
+        return ("(o Cerne Desktop do usuário NÃO está conectado. Abra o Cerne Desktop e pareie em bandeja → "
+                "'Conectar navegador…' com o código de Agentes → Navegador do usuário.)")
+    acao = (call.get("acao") or "listar").lower()
+    if acao not in _DESKTOP_ACOES:
+        return f"(ação '{acao}' inválida; use: {', '.join(_DESKTOP_ACOES)})"
+    cmd = {"acao": "computador", "op": acao, "caminho": call.get("caminho") or "", "conteudo": call.get("conteudo"),
+           "programa": call.get("programa") or "", "args": [str(x) for x in (call.get("args") or [])][:40],
+           "texto": call.get("texto") or "", "tecla": call.get("tecla") or "", "pasta": call.get("pasta") or ""}
+    r = _desktop_exec(uid, cmd)
+    if r.get("erro"):
+        return f"(computador: {r['erro']})"
+    return json.dumps(r, ensure_ascii=False)[:4000]
+
+
 def _browser_exec_atual(call):
     """Usado pelo loop do agente: opera o navegador do usuário logado e resume o resultado p/ o raciocínio."""
     u = _usuario_atual()
@@ -5630,11 +6288,21 @@ def _browser_exec_atual(call):
                     "Agentes → Navegador do usuário; com o Cerne Desktop aberto, o navegador é iniciado automaticamente. "
                     "Enquanto isso, é possível usar a ferramenta web/código.)")
     cmd = {"acao": (call.get("acao") or "ler"), "url": call.get("url"), "seletor": call.get("seletor"),
-           "valor": call.get("valor"), "termo": call.get("termo"), "rotulo": "Cerne (agente) operando este navegador"}
+           "valor": call.get("valor"), "termo": call.get("termo"), "texto": call.get("texto"),
+           "tecla": call.get("tecla"), "direcao": call.get("direcao"), "ms": call.get("ms"),
+           "rotulo": "Cerne (agente) operando este navegador"}
     r = _browser_exec(uid, cmd)
     if isinstance(r, dict):
         if r.get("erro"):
             return f"(navegador: {r['erro']})"
+        if "elementos" in r:                               # mapa: lista compacta de elementos interativos
+            linhas = [f"[{r.get('titulo', '')}] {r.get('url', '')}"]
+            for e in r.get("elementos") or []:
+                linhas.append(f"{e.get('sel')} · {e.get('tipo')} · {(e.get('rotulo') or '')[:80]}"
+                              + (f" = {e.get('valor')[:40]}" if e.get("valor") else ""))
+            if r.get("texto"):
+                linhas.append("--- texto ---\n" + (r.get("texto") or "")[:1200])
+            return "\n".join(linhas)[:5000]
         if "texto" in r:
             return f"[{r.get('titulo', '')}] {r.get('url', '')}\n{(r.get('texto') or '')[:2500]}"
         return json.dumps(r, ensure_ascii=False)[:1500]
@@ -5739,8 +6407,25 @@ async def desktop_hello(request: Request):
     m = _ext_tokens().get(tok)
     if not m:
         raise HTTPException(status_code=401, detail="código de pareamento inválido")
-    _ext_channel(m["user_id"])["desktop_hello"] = time.time()
+    ch = _ext_channel(m["user_id"]); ch["desktop_hello"] = time.time()
+    ch["desktop_ver"] = (await _ext_body(request)).get("versao") or ch.get("desktop_ver") or ""
     return {"ok": True, "usuario": m.get("nome")}
+
+
+@app.post("/desktop/result")
+async def desktop_result(request: Request):
+    tok = request.headers.get("x-ext-token", "")
+    m = _ext_tokens().get(tok)
+    if not m:
+        raise HTTPException(status_code=401, detail="código de pareamento inválido")
+    body = await _ext_body(request)
+    cid = body.get("id"); ch = _ext_channel(m["user_id"])
+    if cid:
+        ch["dres"][cid] = body.get("resultado") or {}
+        ev = ch["dev"].get(cid)
+        if ev:
+            ev.set()
+    return {"ok": True}
 
 
 @app.post("/desktop/poll")
@@ -6138,7 +6823,26 @@ def _sub_agente(papel, tarefa):
         return f"(sub-agente falhou: {str(e)[:120]})"
 
 
-def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
+def _precisa_workdir(ferramentas):
+    return "codigo" in (ferramentas or []) or "github" in (ferramentas or [])
+
+
+def _loop_model(modelo_cfg, permitidos):
+    """Quem DECIDE as ferramentas: o modelo externo do agente (com PII mascarada) quando permitido —
+    modelos locais pequenos erram muito em automações longas; senão o local soberano."""
+    m = str(modelo_cfg or "")
+    return _resolve_provider(m, "") if (m.startswith("ext-") and m in (permitidos or [])) else None
+
+
+def _rel_seguro(nome):
+    n = (nome or "").replace("\\", "/").strip().lstrip("/")
+    partes = [p for p in n.split("/") if p not in ("", ".")]
+    if not partes or any(p == ".." for p in partes):
+        return None
+    return "/".join(partes)
+
+
+def _agente_loop_gen(task, tools, colls, model, workdir, hint="", loop_model=None):
     """Loop agêntico SOBERANO como GERADOR: decide e EXECUTA ferramentas de verdade
     (acervo/web/planilha/documento/apresentacao/codigo/arquivo/navegador/sub_agente). Yield ('step', txt) a cada
     ação p/ streaming; termina com ('result', {evid, fontes, usadas, arquivos}). Fecha o gap vs Codex/Cowork."""
@@ -6147,15 +6851,20 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
         disp.append('acervo — {"ferramenta":"acervo","consulta":"..."}')
     if "web" in tools and _org().get("busca_web"):
         disp.append('web — {"ferramenta":"web","consulta":"..."}')
-    code_on = "codigo" in tools and _AGENT_CODE_EXEC
+    code_on = ("codigo" in tools or "github" in tools) and _AGENT_CODE_EXEC
     if code_on:
         disp.append('planilha (GERA um .xlsx REAL) — {"ferramenta":"planilha","nome":"vendas.xlsx","abas":[{"nome":"Vendas","colunas":["Produto","Qtd","Preço"],"linhas":[["Cadeira",12,150]],"totais":{"Qtd":"soma","Preço":"soma"}}]}')
         disp.append('documento (GERA um .docx REAL) — {"ferramenta":"documento","nome":"relatorio.docx","titulo":"Título","secoes":[{"titulo":"Seção","paragrafos":["texto..."],"tabela":{"colunas":["A","B"],"linhas":[[1,2]]}}]}')
         disp.append('apresentacao (GERA um .pptx REAL) — {"ferramenta":"apresentacao","nome":"deck.pptx","titulo":"Título","subtitulo":"...","slides":[{"titulo":"Slide","topicos":["ponto 1","ponto 2"]}]}')
         disp.append('codigo (Python/bash avançado no workspace isolado, p/ cálculos/análises) — {"ferramenta":"codigo","linguagem":"python","codigo":"..."}')
-        disp.append('arquivo — {"ferramenta":"arquivo","acao":"escrever|ler","nome":"x.txt","conteudo":"..."}')
+        disp.append('terminal (bash no workspace isolado COM internet: instale o que precisar — pip install X, npm install X —, rode testes — python -m pytest -q —, git; repita até passar) — {"ferramenta":"terminal","comando":"pip install requests && python -m pytest -q","timeout":180}')
+        disp.append('arquivo (ler/escrever arquivo do workspace; aceita subpastas) — {"ferramenta":"arquivo","acao":"escrever|ler","nome":"src/app.py","conteudo":"..."}')
+    if "github" in tools and workdir and _AGENT_CODE_EXEC:
+        disp.append('github — clonar: {"ferramenta":"github","acao":"clonar","repo":"https://github.com/dono/repo","ref":"main"} (fica em ./repo; depois use terminal/arquivo p/ alterar e testar) · ver alterações: {"ferramenta":"github","acao":"status"} · abrir PR: {"ferramenta":"github","acao":"abrir_pr","titulo":"...","descricao":"...","branch":"cerne/minha-mudanca"}')
     if "navegador" in tools:
-        disp.append('navegador (opera o navegador do usuário: abrir/ler/clicar/preencher/baixar) — {"ferramenta":"navegador","acao":"abrir|ler|clicar|preencher|baixar|links","url":"...","seletor":"...","valor":"..."}')
+        disp.append('navegador (opera o navegador REAL do usuário) — {"ferramenta":"navegador","acao":"...","url":"...","seletor":"...","valor":"...","texto":"..."}. Ações: abrir(url) · mapa (lista campos/botões/links com SELETORES prontos — use antes de clicar/preencher) · ler · clicar(seletor) · clicar_texto(texto do botão/link) · preencher(seletor,valor) · selecionar(seletor,valor da opção) · tecla(tecla: Enter|Tab|Escape|ArrowDown, seletor opcional) · rolar(direcao: baixo|cima) · esperar_elemento(seletor) · voltar · links(termo) · baixar(url) · screenshot')
+    if "computador" in tools:
+        disp.append('computador (PC do usuário via Cerne Desktop; cada ação pede permissão a ele) — {"ferramenta":"computador","acao":"listar|ler|gravar|rodar|digitar|tecla|abrir","caminho":"C:/pasta/arq.txt","conteudo":"...","programa":"python","args":["script.py"],"pasta":"C:/projeto","texto":"...","tecla":"enter"}')
     if "office" in tools:
         disp.append('office (opera o Excel/Word/PPT ABERTO ao vivo) — {"ferramenta":"office","app":"excel|word|ppt","acao":"...","celula":"B2","valor":"...","intervalo":"A1:C3","valores":[[...]],"formula":"=SUM(...)","texto":"...","titulo":"...","topicos":["..."]}. Ações Excel: ler_selecao/escrever_celula/escrever_intervalo/ler_intervalo/formula/adicionar_linha/nova_aba/ler_planilha; Word: ler_documento/ler_selecao/inserir_texto/substituir_selecao/adicionar_paragrafo/adicionar_titulo; PPT: ler_slides/adicionar_slide/inserir_texto.')
     if "nuvem" in tools:
@@ -6165,12 +6874,19 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
     if code_on:
         regras = ('\nREGRA: se o pedido é ENTREGAR uma planilha, documento ou apresentação, use planilha/documento/'
                   'apresentacao com os DADOS reais preenchidos — NÃO apenas descreva, GERE o arquivo. Nunca use '
-                  'sub_agente para produzir arquivos.')
+                  'sub_agente para produzir arquivos.'
+                  '\nREGRA DE CÓDIGO: crie/edite arquivos com a ferramenta arquivo (nome com subpastas); rode os testes '
+                  'com o comando PADRÃO (python -m pytest -q, npm test) sem inventar opções; LEIA o erro e corrija o '
+                  'CÓDIGO ou instale o pacote que faltar; nunca repita um comando que já falhou do mesmo jeito.')
     ctx = (f"\nContexto do agente: {hint[:500]}" if hint else "")
+    max_passos = 25 if any(t in tools for t in ("navegador", "computador", "github", "codigo")) else 8
     sysp = ("Você é um agente que USA ferramentas antes de responder. Para chamar uma, responda SOMENTE com uma "
             "linha JSON (sem texto em volta). Ferramentas:\n- " + "\n- ".join(disp) + regras + ctx +
-            '\nQuando já tiver o necessário, responda {"ferramenta":"pronto"}. No máximo 5 chamadas, sem repetir.')
+            f'\nQuando já tiver o necessário, responda {{"ferramenta":"pronto"}}. Até {max_passos} chamadas: pode repetir '
+            'ferramentas (vários cliques, instalar → testar → corrigir → testar). Em automações de navegador, use "mapa" '
+            'para descobrir os seletores antes de clicar/preencher e confira o resultado depois.')
     msgs = [{"role": "user", "content": task}]
+    mapa_pii = {}
     evid, fontes, usadas, arquivos = [], [], [], []
     decidiu = False
 
@@ -6222,14 +6938,40 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             yield ("result", {"evid": "\n\n".join(evid), "fontes": fontes, "usadas": usadas, "arquivos": arquivos})
             return
 
-    for _ in range(5):
+    ultimas = []
+    ultimo_res, repet_res = None, 0
+    nao_validado, cobrou_validacao = False, False
+    t_inicio, max_segundos = time.time(), int(os.getenv("AGENT_MAX_SECONDS", "600"))
+    for _ in range(max_passos):
+        janela = msgs[:1] + msgs[-16:] if len(msgs) > 17 else msgs     # mantém o pedido + o histórico recente
         try:
-            raw = _strip_think(chat_model(model, [{"role": "system", "content": sysp}] + msgs, max_tokens=1400) or "")
+            if loop_model:                                  # externo: PII mascarada na ida, restaurada na volta
+                mm, mapa_pii = _mask_conv([{"role": "system", "content": sysp}] + janela, mapa_pii)
+                raw = demask(_strip_think(chat_model(loop_model, mm, max_tokens=4000) or ""), mapa_pii)
+            else:
+                raw = _strip_think(chat_model(model, [{"role": "system", "content": sysp}] + janela, max_tokens=2400) or "")
         except Exception:
+            if loop_model:                                  # provedor externo falhou → segue no local soberano
+                loop_model = None
+                continue
             break
         call = _parse_tool_call(raw)
         if call:
+            assinatura = json.dumps(call, sort_keys=True, ensure_ascii=False)
+            ultimas = (ultimas + [assinatura])[-3:]
+            if len(ultimas) == 3 and len(set(ultimas)) == 1:   # mesma chamada 3x seguidas → travou
+                yield ("step", "⚠️ o agente repetiu a mesma ação 3 vezes — encerrando o loop")
+                break
+        if call:
             decidiu = True
+        if call and call.get("ferramenta") == "pronto" and nao_validado and not cobrou_validacao \
+                and re.search(r"test|rod[ae]|execut|valid|funcion", task or "", re.I):
+            cobrou_validacao = True                         # alterou arquivos e não rodou depois → cobra 1 vez
+            yield ("step", "🔁 ainda não validou as últimas alterações — pedindo para rodar antes de finalizar")
+            msgs.append({"role": "assistant", "content": raw})
+            msgs.append({"role": "user", "content": "Você alterou arquivos e NÃO executou/testou depois disso. Rode os "
+                         "testes (ou execute o código) com a ferramenta terminal e só finalize se passarem."})
+            continue
         if not call or call.get("ferramenta") == "pronto":
             break
         nome = call.get("ferramenta")
@@ -6264,6 +7006,22 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             acao = (call.get("acao") or "ler")
             yield ("step", f"🧭 navegador: {acao} {(call.get('url') or call.get('seletor') or '')[:50]}")
             res = _browser_exec_atual(call); usadas.append("navegador")
+        elif nome == "computador" and "computador" in tools:
+            yield ("step", f"🖥️ computador: {(call.get('acao') or '')} {(call.get('caminho') or call.get('programa') or call.get('tecla') or '')[:50]}")
+            res = _computador_exec_atual(call); usadas.append("computador")
+        elif nome == "terminal" and workdir and _AGENT_CODE_EXEC:
+            cmd_t = (call.get("comando") or "")[:20000]
+            yield ("step", f"⌨️ terminal: {cmd_t.splitlines()[0][:70] if cmd_t else ''}")
+            try:
+                to = min(max(int(call.get("timeout") or 120), 5), 600)
+            except Exception:
+                to = 120
+            res = _sandbox_exec(cmd_t, "bash", workdir, timeout=to); usadas.append("terminal")
+            nao_validado = False
+        elif nome == "github" and "github" in tools and workdir and _AGENT_CODE_EXEC:
+            acao = (call.get("acao") or "status")
+            yield ("step", f"🐙 github: {acao} {(call.get('repo') or call.get('titulo') or '')[:50]}")
+            res = _github_tool(call, workdir); usadas.append("github")
         elif nome == "office" and "office" in tools:
             app_ = (call.get("app") or ""); acao = (call.get("acao") or "ler")
             emoji = {"excel": "📊", "word": "📄", "ppt": "📽️"}.get(app_, "🗂️")
@@ -6277,10 +7035,11 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             yield ("step", f"💻 executando código ({lang})")
             res = _sandbox_exec(call.get("codigo", ""), lang, workdir); usadas.append("codigo")
         elif nome == "arquivo" and workdir:
-            acao = call.get("acao", "ler"); nomearq = os.path.basename(call.get("nome", "arquivo.txt") or "arquivo.txt")
+            acao = call.get("acao", "ler"); nomearq = _rel_seguro(call.get("nome") or "") or "arquivo.txt"
             if acao == "escrever":
                 yield ("step", f"📝 escreveu arquivo {nomearq}")
                 res = _sb_write(workdir, nomearq, call.get("conteudo", "")); arquivos.append(nomearq)
+                nao_validado = True
             else:
                 yield ("step", f"📄 leu arquivo {nomearq}")
                 res = _sb_read(workdir, nomearq)
@@ -6290,7 +7049,20 @@ def _agente_loop_gen(task, tools, colls, model, workdir, hint=""):
             res = _sub_agente(papel, call.get("tarefa") or task); usadas.append("sub_agente")
         evid.append(f"[{nome}]\n{res[:1500]}")
         msgs.append({"role": "assistant", "content": raw})
-        msgs.append({"role": "user", "content": f"Resultado:\n{res[:1500]}\n\nUse outra ferramenta ou responda {{\"ferramenta\":\"pronto\"}}."})
+        # mesmo RESULTADO (ex.: o mesmo erro) seguidas vezes → avisa para mudar de estratégia; na 3ª, encerra
+        _sig_res = (nome or "") + "|" + re.sub(r"/work/\w+|\d+(\.\d+)?s\b", "", (res or "")[-600:])
+        _falhou = bool(re.search(r"erro|error|falha|traceback|não achei|retorno [1-9]|exception", (res or "")[-600:], re.I))
+        repet_res = (repet_res + 1) if (_falhou and _sig_res == ultimo_res) else 0
+        ultimo_res = _sig_res
+        if repet_res >= 2:
+            yield ("step", "⚠️ o mesmo resultado se repetiu 3 vezes — encerrando para não gastar à toa")
+            break
+        aviso = ("\n\nATENÇÃO: este é EXATAMENTE o mesmo resultado da tentativa anterior. Mude de estratégia "
+                 "(corrija o código, use outro comando ou outra abordagem) — não repita." if repet_res == 1 else "")
+        if time.time() - t_inicio > max_segundos:
+            yield ("step", f"⏱️ limite de {max_segundos // 60} min do agente atingido — encerrando com o que já foi feito")
+            break
+        msgs.append({"role": "user", "content": f"Resultado:\n{res[:5000]}{aviso}\n\nUse outra ferramenta ou responda {{\"ferramenta\":\"pronto\"}}."})
     if not usadas and not decidiu:                         # modelo local fraco não decidiu -> executa 1x direto
         if "web" in tools and _org().get("busca_web"):
             yield ("step", "🌐 buscando na web")
@@ -6415,15 +7187,16 @@ def agentes_run(aid: str, body: AgenteRunReq):
         persona += "\n\nFerramentas declaradas: " + ", ".join(AGENTE_TOOLS.get(t, t) for t in a["ferramentas"]) + "."
     if a.get("mcp"):
         nomes = [(_conn_por_id(m) or {}).get("nome", m) for m in a["mcp"]]
-        persona += "\n\nConectores disponíveis: " + ", ".join(nomes) + " — executados pelo runtime NanoClaw."
+        persona += "\n\nConectores anexados: " + ", ".join(nomes) + "."
     modelo_cfg = a.get("modelo") or "agent"
     permitidos = _ext_permitidos(_org())
     ferramentas = a.get("ferramentas") or []
     # LOOP REAL DE FERRAMENTAS (soberano): o agente decide e EXECUTA acervo/web/código/arquivo/sub-agente.
-    workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+    workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
     steps, loop, artefatos = [], {"evid": "", "fontes": [], "usadas": [], "arquivos": []}, []
     try:
-        for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona):
+        for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona,
+                                          loop_model=_loop_model(modelo_cfg, permitidos)):
             if kind == "step":
                 steps.append(val)
             else:
@@ -6486,10 +7259,11 @@ def agentes_run_stream(aid: str, body: AgenteRunReq):
             permitidos = _ext_permitidos(_org())
             ferramentas = a.get("ferramentas") or []
             yield "[[STEP]]interpretando o pedido"
-            workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+            workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
             loop, artefatos = {"evid": "", "fontes": [], "usadas": [], "arquivos": []}, []
             try:
-                for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona):
+                for kind, val in _agente_loop_gen(body.mensagem, ferramentas, colls, "chat", workdir, hint=persona,
+                                                  loop_model=_loop_model(modelo_cfg, permitidos)):
                     if kind == "step":
                         yield "[[STEP]]" + val
                     else:
@@ -6550,11 +7324,12 @@ def _agente_exec_headless(a, instrucao, origem="agendado"):
     modelo_cfg = a.get("modelo") or "agent"
     permitidos = _ext_permitidos(_org())
     ferramentas = a.get("ferramentas") or []
-    workdir = ("ag" + uuid.uuid4().hex[:12]) if ("codigo" in ferramentas and _AGENT_CODE_EXEC) else None
+    workdir = ("ag" + uuid.uuid4().hex[:12]) if (_precisa_workdir(ferramentas) and _AGENT_CODE_EXEC) else None
     sess = _session("sched-" + a["id"])
     loop = {"evid": "", "fontes": [], "usadas": [], "arquivos": []}; artefatos = []
     try:
-        for kind, val in _agente_loop_gen(instrucao, ferramentas, colls, "chat", workdir, hint=persona):
+        for kind, val in _agente_loop_gen(instrucao, ferramentas, colls, "chat", workdir, hint=persona,
+                                          loop_model=_loop_model(modelo_cfg, permitidos)):
             if kind == "result":
                 loop = val
         ans, pii, fontes_ans, soberano, rebaixado = _agente_answer(a, instrucao, persona, colls,
@@ -6576,6 +7351,21 @@ def _sched_registrar_run(s, gatilho, ok, resumo, artefatos):
     s["ultima_exec"] = time.strftime("%Y-%m-%dT%H:%M:%S"); s["ultima_status"] = "ok" if ok else "erro"
 
 
+def _sched_usuario(s, a):
+    """Usuário em nome de quem o agendamento roda: quem criou o agendamento → quem criou o agente →
+    (legado, sem dono) único usuário da org com navegador/desktop pareado."""
+    for uid in (s.get("criado_por"), a.get("criado_por")):
+        u = _usuario_por_id(uid) if uid else None
+        if u:
+            return u
+    org = s.get("org") or DEFAULT_ORG
+    uids = {m.get("user_id") for m in _ext_tokens().values() if (m.get("org") or DEFAULT_ORG) == org}
+    uids.discard(None)
+    if len(uids) == 1:
+        return _usuario_por_id(next(iter(uids)))
+    return None
+
+
 def _sched_disparar(s, gatilho, instrucao_extra=""):
     a = _agente_por_id(s.get("agente_id"))
     if not a:
@@ -6585,6 +7375,7 @@ def _sched_disparar(s, gatilho, instrucao_extra=""):
         instr = (instr + "\n\n" + instrucao_extra).strip() if instr else instrucao_extra
     try:
         _ORG_CTX.set(s.get("org") or DEFAULT_ORG)
+        _USER_CTX.set(_sched_usuario(s, a))                   # sem isso, navegador/computador ficam indisponíveis
         ans, arts, usadas, sob = _agente_exec_headless(a, instr or "Execute a tarefa configurada.")
         _sched_registrar_run(s, gatilho, True, ans, arts)
         _event("agente agendado", f"{a['nome']} · {gatilho} · {'+'.join(usadas) or 'sem ferramentas'}"
@@ -6949,6 +7740,8 @@ def agendamentos_save(body: SchedReq):
     item = atual or {"id": "sch" + uuid.uuid4().hex[:10], "org": _tenant(), "runs": []}
     item.update({"agente_id": body.agente_id, "nome": (body.nome or "").strip(),
                  "instrucao": (body.instrucao or "").strip(), "ativo": bool(body.ativo)})
+    if not item.get("criado_por"):
+        item["criado_por"] = (_usuario_atual() or {}).get("id")
     novos = _sched_norm_triggers(body.triggers)
     # preserva o estado interno (_ultima, _vistos, _last_uid…) dos gatilhos que continuam iguais, por índice/tipo
     antigos = (atual or {}).get("triggers") or []
@@ -9527,6 +10320,8 @@ def _design_estilo_txt(estilo):
     """Contrato do estilo/design-system escolhido (abstrato, marca famosa OU customizado) injetado no prompt."""
     if not estilo:
         return ""
+    if estilo.startswith("od:"):
+        return odkit.sistema_contrato(estilo, rico=_design_rico()) if _design_odkit_ok() else ""
     if estilo in _DESIGN_ESTILOS:
         g = (_DESIGN_ESTILOS[estilo] or {}).get("guia")
         return f"\nESTILO VISUAL (aplique): {g}" if g else ""
@@ -9562,19 +10357,54 @@ def _design_html(resp):
     return re.sub(r"^```[a-z]*\n?|\n?```$", "", html.strip())
 
 
-def _design_gerar(prompt, tipo, dna, estilo="", html_atual=None, instrucao=None, capa_url=None):
+def _design_odkit_ok():
+    return bool(odkit is not None and odkit.disponivel())
+
+
+def _design_rico():
+    """True quando há modelo pago configurado (contexto grande) — o kit injeta conteúdo completo;
+    no modelo local soberano (contexto curto) injeta versões resumidas."""
+    return len(_design_cands()) > 1
+
+
+def _design_receita_id(tipo, receita):
+    """receita None/"" → padrão do tipo; "none" → sem receita; senão o id pedido."""
+    if not _design_odkit_ok():
+        return ""
+    if receita in (None, ""):
+        return odkit.receita_padrao(tipo)
+    return "" if receita == "none" else receita
+
+
+def _design_gerar(prompt, tipo, dna, estilo="", html_atual=None, instrucao=None, capa_url=None,
+                  receita=None, exemplo="", craft=True):
     tp = _DESIGN_TIPOS.get(tipo) or _DESIGN_TIPOS["landing"]
     ds = _design_sistema(dna)
     ds += _design_estilo_txt(estilo)
     if capa_url:
         ds += (f"\nIMAGEM DE CAPA: use EXATAMENTE este src como hero (em <img> ou background-image cobrindo a área), "
                f"com bom scrim/legibilidade do texto por cima; NÃO invente outras imagens externas. SRC: {capa_url}")
+    rico = _design_rico()
+    sys_p = _DESIGN_SYS
+    rid = _design_receita_id(tipo, receita)
+    kit_ok = _design_odkit_ok()
+    if kit_ok and craft:
+        sys_p += odkit.craft_txt(odkit.craft_ids(rid), rico=rico)
     if html_atual and instrucao:
         user = ("Aqui está o HTML atual do design. Aplique a MUDANÇA pedida e devolva o HTML COMPLETO atualizado.\n\n"
                 "MUDANÇA: " + instrucao + "\n\n" + ds + "\n\nHTML ATUAL:\n" + html_atual[:60000])
+    elif exemplo and kit_ok and odkit.exemplo(exemplo):
+        ref = odkit.exemplo_html(exemplo)
+        user = (f"REMIX de um exemplo Open Design. Crie um(a) {tp['nome']} NOVO a partir do HTML de referência abaixo: "
+                "preserve a ASSINATURA VISUAL (grid, ritmo, tratamento tipográfico, componentes, micro-interações) e "
+                "SUBSTITUA TODO o conteúdo pelo briefing — textos reais em português do Brasil, nada do conteúdo original. "
+                "Se houver marca/design system abaixo, eles mandam nas cores e fontes.\n\n"
+                f"BRIEFING DO USUÁRIO: {prompt}\n\n{ds}\n\nNOTAS DO EXEMPLO:\n{odkit.exemplo_skill(exemplo, rico=rico)}"
+                f"\n\nHTML DE REFERÊNCIA:\n{ref[:60000 if rico else 14000]}")
     else:
-        user = f"Crie um(a) {tp['nome']}. Especificação: {tp['guia']}\n\nBRIEFING DO USUÁRIO: {prompt}\n\n{ds}"
-    msgs = [{"role": "system", "content": _DESIGN_SYS}, {"role": "user", "content": user}]
+        extra = odkit.receita_txt(rid, rico=rico) if (kit_ok and rid) else ""
+        user = f"Crie um(a) {tp['nome']}. Especificação: {tp['guia']}\n\nBRIEFING DO USUÁRIO: {prompt}\n\n{ds}{extra}"
+    msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": user}]
     resp = ""
     for mdl in _design_cands():                           # tenta os pagos em ordem e cai no local soberano
         try:
@@ -9598,7 +10428,9 @@ def _design_pub(d, full=False):
     base = {"id": d["id"], "titulo": d.get("titulo") or "(sem título)", "tipo": d.get("tipo"),
             "tipo_nome": (_DESIGN_TIPOS.get(d.get("tipo")) or {}).get("nome", d.get("tipo")),
             "marca_id": d.get("marca_id") or "", "estilo": d.get("estilo") or "",
-            "criado": d.get("criado"), "iteracoes": len(d.get("historico") or [])}
+            "criado": d.get("criado"), "iteracoes": len(d.get("historico") or []),
+            "receita": d.get("receita") or "", "exemplo": d.get("exemplo") or "",
+            "checagem": d.get("checagem") or None}
     if full:
         base.update({"html": d.get("html") or "", "prompt": d.get("prompt") or "", "historico": d.get("historico") or []})
     return base
@@ -9611,6 +10443,9 @@ class DesignReq(BaseModel):
     marca_id: str = ""
     estilo: str = ""
     capa_ia: bool = False        # gera uma imagem de capa/hero por IA e embute no design
+    receita: str = ""            # Open Design: id da receita ("" = padrão do tipo, "none" = sem receita)
+    exemplo: str = ""            # Open Design: id do exemplo a REMIXAR (vazio = do zero)
+    craft: bool = True           # Open Design: injeta as regras de craft (anti-AI-slop, cor, tipografia, a11y…)
 
 
 class DesignIterarReq(BaseModel):
@@ -9624,7 +10459,18 @@ def design_list():
             "estilos": [{"id": k, "nome": v["nome"], "paleta": v.get("paleta", []), "fontes": v.get("fontes", []), "dark": v.get("dark", False)} for k, v in _DESIGN_ESTILOS.items()],
             "sistemas": [{"id": k, "nome": v["nome"], "categoria": v.get("categoria", ""), "paleta": v.get("paleta", []), "fontes": v.get("fontes", []), "custom": False} for k, v in _DESIGN_SYSTEMS.items()]
                        + [{"id": x["id"], "nome": x["nome"], "categoria": x.get("categoria", "Meus"), "paleta": x.get("paleta", []), "fontes": x.get("fontes", []), "custom": True} for x in _design_sistemas_custom()],
-            "templates": _DESIGN_TEMPLATES}
+            "templates": _DESIGN_TEMPLATES} | _design_kit_lista()
+
+
+def _design_kit_lista():
+    """Acrescenta ao GET /design os design systems do Open Design Agent Kit (e esconde os legados duplicados)."""
+    if not _design_odkit_ok():
+        return {"kit": {"ok": False}}
+    od = odkit.sistemas()
+    return {"kit": odkit.info(),
+            "sistemas_od": [{"id": x["id"], "nome": x["nome"], "categoria": x["categoria"], "paleta": x["paleta"],
+                             "fontes": x["fontes"], "dark": x["dark"], "blurb": x["blurb"], "kind": x["kind"],
+                             "od": True, "custom": False} for x in od]}
 
 
 class SistemaReq(BaseModel):
@@ -9668,6 +10514,91 @@ def design_sistema_del(sid: str):
     return {"ok": True}
 
 
+# ---- Open Design Agent Kit: catálogo, remix, recomendação e checagem de qualidade ----
+def _design_checagem(d):
+    r = odkit.checar(d.get("html") or "", sistema_id=(d.get("estilo") or "") if str(d.get("estilo") or "").startswith("od:") else "", tipo=d.get("tipo") or "")
+    return {"score": r["score"], "resumo": r["resumo"], "achados": r["achados"][:30], "quando": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+class KitRecReq(BaseModel):
+    prompt: str = ""
+    tipo: str = ""
+
+
+@app.get("/design/kit")
+def design_kit(tipo: str = "", q: str = ""):
+    """Catálogo do Open Design Agent Kit: exemplos remixáveis + receitas por tipo de design."""
+    if not _design_odkit_ok():
+        return {"kit": {"ok": False, "erro": "conteúdo do Open Design Agent Kit não encontrado (ODKIT_DIR)"}, "exemplos": [], "receitas": {}}
+    return {"kit": odkit.info(),
+            "exemplos": [{k: e[k] for k in ("id", "nome", "desc", "mode", "surface", "scenario", "tags", "prompt", "kb")}
+                         for e in odkit.exemplos(q=q, tipo=tipo)],
+            "receitas": {t: [{"id": r["id"], "nome": r["nome"], "desc": r["desc"]} for r in odkit.receitas(t)] for t in _DESIGN_TIPOS},
+            "padrao": {t: odkit.receita_padrao(t) for t in _DESIGN_TIPOS}}
+
+
+@app.get("/design/kit/exemplo/{eid}/html")
+def design_kit_exemplo_html(eid: str):
+    """HTML do exemplo (para a prévia da galeria). Servido com CSP sandbox — roda isolado mesmo se aberto direto."""
+    if not _design_odkit_ok() or not odkit.exemplo(eid):
+        raise HTTPException(status_code=404, detail="exemplo não encontrado")
+    return HTMLResponse(odkit.exemplo_html(eid), headers={"Content-Security-Policy": "sandbox allow-scripts",
+                                                          "Cache-Control": "private, max-age=3600"})
+
+
+@app.post("/design/kit/recomendar")
+def design_kit_recomendar(body: KitRecReq):
+    """Sugere 5 design systems do kit para o briefing (setor, tom, superfície, claro/escuro, marca citada)."""
+    if not _design_odkit_ok():
+        return {"sistemas": []}
+    return {"sistemas": odkit.recomendar(body.prompt, body.tipo, n=5)}
+
+
+@app.post("/design/kit/recarregar")
+def design_kit_recarregar():
+    _assert_admin_sessao()
+    if odkit is None:
+        raise HTTPException(status_code=503, detail="módulo odkit ausente")
+    odkit.recarregar()
+    return odkit.info()
+
+
+@app.post("/design/{did}/checar")
+def design_checar(did: str):
+    """Checagem de qualidade Open Design (anti-AI-slop, tokens, acessibilidade, responsivo) — determinística, local."""
+    d = _design_por_id(did)
+    if not d:
+        raise HTTPException(status_code=404, detail="design não encontrado")
+    if not _design_odkit_ok():
+        raise HTTPException(status_code=503, detail="Open Design Agent Kit não instalado")
+    d["checagem"] = _design_checagem(d)
+    _appstate_save(APPSTATE)
+    return d["checagem"]
+
+
+@app.post("/design/{did}/corrigir")
+def design_corrigir(did: str):
+    """Roda a checagem e pede ao modelo para corrigir os achados P0/P1; devolve o design atualizado + nova nota."""
+    _assert_admin_sessao()
+    d = _design_por_id(did)
+    if not d:
+        raise HTTPException(status_code=404, detail="design não encontrado")
+    if not _design_odkit_ok():
+        raise HTTPException(status_code=503, detail="Open Design Agent Kit não instalado")
+    antes = _design_checagem(d)
+    instr = odkit.instrucao_correcao(antes)
+    if not instr:
+        d["checagem"] = antes
+        return {**_design_pub(d, full=True), "aviso": "nada a corrigir — a checagem não encontrou problemas."}
+    out = design_iterar(did, DesignIterarReq(mensagem=instr))
+    if d.get("historico"):
+        d["historico"][-1]["texto"] = f"🛠 Corrigir os achados da checagem Open Design (nota {antes['score']}: {antes['resumo']['P0']} P0, {antes['resumo']['P1']} P1)"
+        _appstate_save(APPSTATE)
+        out = _design_pub(d, full=True)
+    _event("design corrigido (Open Design)", f"{d.get('titulo') or ''} · {antes['score']}→{(d.get('checagem') or {}).get('score')}", actor=_actor())
+    return {**out, "antes": antes["score"]}
+
+
 @app.get("/design/asset/{nome}")
 def design_asset(nome: str):
     """Imagem de capa gerada por IA — PÚBLICA (o preview em iframe/blob e o HTML exportado precisam carregá-la)."""
@@ -9703,7 +10634,8 @@ def design_criar(body: DesignReq):
         if not capa_url:
             aviso = "capa por IA indisponível (" + (cerr or "sem provedor de imagem") + ") — gerei sem imagem."
     try:
-        html = _design_gerar(body.prompt, body.tipo, dna, estilo=body.estilo, capa_url=capa_url)
+        html = _design_gerar(body.prompt, body.tipo, dna, estilo=body.estilo, capa_url=capa_url,
+                             receita=body.receita, exemplo=body.exemplo, craft=body.craft)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao gerar: {str(e)[:160]}")
     if "<" not in html:
@@ -9712,7 +10644,10 @@ def design_criar(body: DesignReq):
     d = {"id": did, "org": _tenant(), "criado": time.strftime("%Y-%m-%dT%H:%M:%S"),
          "titulo": (body.titulo or body.prompt[:60]), "tipo": body.tipo, "marca_id": body.marca_id or "",
          "estilo": body.estilo or "", "prompt": body.prompt, "html": html[:400000], "capa_url": capa_url or "",
-         "historico": [{"papel": "user", "texto": body.prompt}]}
+         "receita": _design_receita_id(body.tipo, body.receita), "exemplo": body.exemplo or "", "craft": body.craft,
+         "historico": [{"papel": "user", "texto": (("[remix: " + body.exemplo + "] ") if body.exemplo else "") + body.prompt}]}
+    if _design_odkit_ok():
+        d["checagem"] = _design_checagem(d)
     APPSTATE.setdefault("designs", []).append(d)
     _appstate_save(APPSTATE)
     _event("design gerado", f"{(_DESIGN_TIPOS.get(body.tipo) or {}).get('nome', body.tipo)} · {str(d['titulo'])[:40]}", actor=_actor())
@@ -9734,11 +10669,14 @@ def design_iterar(did: str, body: DesignIterarReq):
         if mm:
             dna = _marca_pub(mm)["dna"]
     try:
-        html = _design_gerar(d.get("prompt"), d.get("tipo"), dna, estilo=d.get("estilo", ""), html_atual=d.get("html"), instrucao=msg, capa_url=d.get("capa_url") or None)
+        html = _design_gerar(d.get("prompt"), d.get("tipo"), dna, estilo=d.get("estilo", ""), html_atual=d.get("html"), instrucao=msg,
+                             capa_url=d.get("capa_url") or None, receita=d.get("receita") or "none", craft=d.get("craft", True))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao iterar: {str(e)[:160]}")
     if "<" in html:
         d["html"] = html[:400000]
+        if _design_odkit_ok():
+            d["checagem"] = _design_checagem(d)
     d.setdefault("historico", []).append({"papel": "user", "texto": msg})
     _appstate_save(APPSTATE)
     return _design_pub(d, full=True)
@@ -9905,7 +10843,8 @@ def design_variacao(did: str):
         if mm:
             dna = _marca_pub(mm)["dna"]
     try:
-        html = _design_gerar((d.get("prompt") or "") + " (gere uma variação visual diferente da anterior)", d.get("tipo"), dna, estilo=d.get("estilo", ""))
+        html = _design_gerar((d.get("prompt") or "") + " (gere uma variação visual diferente da anterior)", d.get("tipo"), dna, estilo=d.get("estilo", ""),
+                             receita=d.get("receita") or "none", craft=d.get("craft", True))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao gerar variação: {str(e)[:160]}")
     if "<" not in html:
@@ -10013,6 +10952,7 @@ class PlanoReq(BaseModel):
     tipo: str = "documento"
     colecoes: list | None = None
     session_id: str = ""         # p/ o plano refletir o anexo (case/brief) da conversa
+    modelo: str = ""             # modelo escolhido no seletor do chat (ex.: ext-mistral) — tem prioridade
 
 
 @app.post("/plano")
@@ -10059,10 +10999,13 @@ def plano(body: PlanoReq):
     titulo = (str(data.get("titulo") or "").strip() or ("Plano do " + tipo))[:120]
     resumo = str(data.get("resumo") or "").strip()[:240]
     prov = None
-    try:
-        prov = _best_provider_for(body.mensagem)
-    except Exception:
-        prov = None
+    if str(body.modelo or "").startswith("ext-") and body.modelo in _ext_permitidos(_org()):
+        prov = body.modelo
+    else:
+        try:
+            prov = _best_provider_for(body.mensagem)
+        except Exception:
+            prov = None
     externo = bool(prov) and str(prov).startswith("ext-")
     prov_nome = (str(prov).replace("ext-", "").replace("-", " ").title()) if externo else ""
     return {"titulo": titulo, "passos": passos, "resumo": resumo, "externo": externo, "provider": prov_nome}
@@ -10074,6 +11017,7 @@ class GerarReq(BaseModel):
     colecao: str = COLLECTION
     colecoes: list | None = None
     session_id: str = ""         # p/ incluir os anexos efêmeros da conversa como base do entregável
+    modelo: str = ""             # modelo escolhido no seletor do chat (ex.: ext-mistral) — tem prioridade
 
 
 def _limpa_placeholders(t):
@@ -10103,12 +11047,24 @@ def _limpa_placeholders(t):
 def gerar(body: GerarReq):
     _quota_consumir()
     hits = _search_multi(body.instrucao, 5, _colls_of(body))
-    ax, axn = _anexos_texto(body.session_id or "")
-    _parts = []
-    if ax:
-        _parts.append("DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax)
-    _parts += [h.payload.get("text", "") for h in hits]
-    ctx = "\n\n---\n\n".join(p for p in _parts if p)
+    _org_g = _org()
+    _perm = _ext_permitidos(_org_g)
+    # cadeia de provedores: o ESCOLHIDO no chat primeiro; depois o melhor da org (se híbrido); depois os demais externos
+    _cadeia = []
+    if str(body.modelo or "").startswith("ext-") and body.modelo in _perm:
+        _cadeia.append(body.modelo)
+    if _org_g.get("soberania") == "hibrido" or _cadeia:
+        _bp = _best_provider(_org_g)
+        for _p in ([_bp] if _bp else []) + [p for p in ("ext-mistral", "ext-claude", "ext-nvidia-ultra", "ext-openrouter", "ext-reason") if p in _perm]:
+            if _p and _p not in _cadeia:
+                _cadeia.append(_p)
+
+    def _ctx_para(modelo):
+        ax_, _ = _anexos_texto(body.session_id or "", limite=_anexo_limite(modelo), consulta=body.instrucao)
+        ps = (["DOCUMENTO(S) ANEXADO(S) — BASE PRINCIPAL do pedido:\n" + ax_] if ax_ else []) + [h.payload.get("text", "") for h in hits]
+        return "\n\n---\n\n".join(p for p in ps if p)
+    ax, axn = _anexos_texto(body.session_id or "", limite=_ANEXO_LIMITE_LOCAL)
+    ctx = _ctx_para(_cadeia[0] if _cadeia else "local")
     _anexo_regra = (" Se houver DOCUMENTO(S) ANEXADO(S) no contexto, trate-os como a BASE PRINCIPAL do pedido (leia o brief/case, "
                     "atenda a TODOS os pontos/perguntas dele); o acervo do projeto é apenas apoio." if axn else "")
     if body.tipo == "site":
@@ -10127,36 +11083,40 @@ def gerar(body: GerarReq):
                "Seja abrangente, concreto e específico ao contexto — nível de entrega para a diretoria — NUNCA raso, genérico ou fora do tema. "
                "Use o CONTEXTO do acervo apenas como APOIO; não copie o acervo nem troque o assunto do pedido. "
                "Responda SOMENTE com o Markdown do documento, sem explicações fora dele.")
-    org = _org()
-    prov = _best_provider(org) if org.get("soberania") == "hibrido" else None   # híbrido: modelo forte escreve o entregável
     tokens = None
-    try:
-        if prov:
-            # mascara só o PEDIDO (o ctx do acervo já vem mascarado da ingestão) -> provedor forte -> de-mascara
-            mq, mp = mask_reversible(body.instrucao)
+    usado = None
+    out = None
+    for prov in _cadeia:                                # cada externo recebe o contexto do TAMANHO que ele aguenta
+        try:
+            ctx = _ctx_para(prov)
+            mq, mp = mask_reversible(body.instrucao)    # mascara o PEDIDO (o acervo já vem mascarado da ingestão)
             raw = _chat_completo(prov, [{"role": "system", "content": sys},
                                         {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {mq}"}],
                                  max_tokens=8192, conts=2)
             out = demask(_strip_think(raw or ""), mp)
             out, _ = guard_output(out)
-        else:
+            usado = prov
+            break
+        except Exception as _e:                         # 413/429/etc. → tenta o próximo, sem cair calado no local
+            _event("geração · provedor falhou", f"{prov}: {str(_e)[:140]}")
+    if out is None:
+        try:                                            # local soberano, com um RESUMO da pasta que caiba na janela dele
+            ctx = _ctx_para("local")
             out, tokens = _gen_call([{"role": "system", "content": sys},
                                      {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
                                     max_tokens=6000)
             out = _strip_think(out or "")
-    except Exception as e:
-        try:                                            # provedor externo falhou (429/etc.) -> cai p/ local soberano
-            out, tokens = _gen_call([{"role": "system", "content": sys},
-                                     {"role": "user", "content": f"Contexto:\n{ctx}\n\nPedido: {body.instrucao}"}],
-                                    max_tokens=6000)
-            out = _strip_think(out or "")
+            usado = "local"
         except Exception as e2:
             return JSONResponse(status_code=502, content={"error": "falha na geração", "detail": str(e2)[:300]})
     out = re.sub(r"^```[a-zA-Z]*\n?", "", out.strip())
     out = re.sub(r"\n?```$", "", out).strip()
     out = _limpa_placeholders(out)
-    _event("geração", f"{body.tipo} · {body.instrucao[:50]}")
-    return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits})}
+    _event("geração", f"{body.tipo} · {usado} · {body.instrucao[:50]}")
+    return {"tipo": body.tipo, "conteudo": out, "tokens": tokens, "fontes": sorted({h.payload.get("source", "?") for h in hits}),
+            "provedor": usado, "externo": str(usado).startswith("ext-"),
+            "provedor_nome": (str(usado).replace("ext-", "").replace("-", " ").title() if str(usado).startswith("ext-") else ""),
+            "escolhido_falhou": bool(_cadeia and body.modelo and usado != body.modelo and str(body.modelo).startswith("ext-"))}
 
 
 # ---- geração/ajuste de CÓDIGO com preview (código novo ou correção antes/depois) ----
@@ -10173,6 +11133,8 @@ class CodigoReq(BaseModel):
     instrucao: str
     colecao: str = COLLECTION
     colecoes: list | None = None
+    sid: str = ""                                    # anexos da conversa (ex.: pasta local lida pelo Cerne Desktop)
+    modelo: str = ""                                 # modelo escolhido no chat (ex.: ext-mistral) — tem prioridade
 
 
 @app.post("/codigo")
@@ -10206,16 +11168,29 @@ def codigo(body: CodigoReq):
                 "CODIGO:\n```python\n<código completo>\n```\n"
                 "(troque 'python' pela linguagem real que você usou)")
     base = (f"Contexto do acervo (use como referência técnica se ajudar):\n{ctx}\n\n" if ctx else "")
-    try:
-        if prov:
+    cadeia = _cadeia_provedores(body.modelo, forcar=bool(prov))
+    raw, prov, erros = None, None, []
+    for _p in cadeia:                                # cada externo com o anexo do tamanho que ele aguenta
+        try:
+            axtxt, _axn = _anexos_texto(body.sid, limite=_anexo_limite(_p), consulta=instr)
+            b2 = (("[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n") if axtxt else "") + base
             mq, mapping = mask_reversible(instr)
-            raw = demask(_strip_think(chat_model(prov, [{"role": "system", "content": sysp},
-                        {"role": "user", "content": base + "Pedido:\n" + mq}], max_tokens=2800) or ""), mapping)
-        else:
+            raw = demask(_strip_think(chat_model(_p, [{"role": "system", "content": sysp},
+                        {"role": "user", "content": b2 + "Pedido:\n" + mq}], max_tokens=4000) or ""), mapping)
+            prov = _p
+            break
+        except Exception as e:
+            erros.append(f"{_p}: {str(e)[:120]}")
+            _event("código · provedor falhou", erros[-1])
+    if raw is None:
+        try:                                         # local soberano com o anexo resumido p/ caber na janela dele
+            axtxt, _axn = _anexos_texto(body.sid, limite=_ANEXO_LIMITE_LOCAL, consulta=instr)
+            b2 = (("[ANEXOS DA CONVERSA — código real do usuário]\n" + axtxt + "\n\n") if axtxt else "") + base
             raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp},
-                        {"role": "user", "content": base + "Pedido:\n" + instr}], max_tokens=2800) or "")
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": "falha ao gerar o código", "detail": str(e)[:200]})
+                        {"role": "user", "content": b2 + "Pedido:\n" + instr}], max_tokens=2800) or "")
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": "falha ao gerar o código",
+                                                          "detail": "; ".join(erros + [str(e)[:200]])[:600]})
     blocks = [b.strip() for b in _code_blocks(raw) if b.strip()]
     ml = re.search(r"```([a-zA-Z0-9_+.\-]+)", raw)
     lang = (ml.group(1) if ml else "python")
@@ -10242,6 +11217,329 @@ def codigo(body: CodigoReq):
     _event("código · novo", instr[:50])
     return {"modo": "novo", "linguagem": lang, "codigo": codigo,
             "explicacao": _code_field(raw, "EXPLICACAO"), "fontes": fontes, "modelo": modelo}
+
+
+# ================= AGENTE DE IMPLEMENTAÇÃO (dev no projeto do usuário, via Cerne Desktop) =================
+# O chat reconhece um pedido de desenvolvimento sobre uma pasta anexada e entra neste fluxo SOZINHO (sem botão).
+# O servidor decide o próximo passo (modelo escolhido, PII mascarada) e o DESKTOP executa — numa CÓPIA de
+# trabalho autorizada por diálogo nativo; o original só muda se o usuário pedir "aplicar" (diálogo + backup).
+_DEV_RUNS = {}
+_DEV_MAX_PASSOS = int(os.getenv("DEV_MAX_PASSOS", "45"))
+_DEV_MAX_SEG = int(os.getenv("DEV_MAX_SEGUNDOS", "1800"))
+_DEV_SYS = """Você é um ENGENHEIRO DE SOFTWARE SÊNIOR implementando uma alteração REAL no projeto do usuário.
+Você trabalha numa CÓPIA do projeto (o original NÃO é tocado). Raiz da cópia: <<COPIA>>
+TODOS os caminhos são RELATIVOS à raiz da cópia (ex.: "apps/solicitacoes/src/app.module.ts"; "." = a raiz).
+Responda SEMPRE com UMA linha JSON, sem nenhum texto em volta. Ferramentas:
+- {"ferramenta":"listar","caminho":"apps/solicitacoes"}
+- {"ferramenta":"buscar","caminho":".","termo":"texto exato"}   → linhas arquivo:linha onde aparece (caminhos relativos)
+- {"ferramenta":"ler","caminho":"apps/x/src/arquivo.ts","linha_inicio":1,"linha_fim":250}
+- {"ferramenta":"gravar","caminho":"apps/x/src/novo.ts","conteudo":"<o arquivo COMPLETO>"}   → SÓ para arquivo NOVO
+- {"ferramenta":"editar","caminho":"apps/x/src/app.module.ts","trocar":"<trecho EXATO e único copiado do arquivo>","por":"<novo trecho>"}   → alterar arquivo EXISTENTE
+- {"ferramenta":"rodar","programa":"npm|npx|node|python|pytest|dotnet|go|mvn…","args":["…"],"pasta":"apps/x","timeout":600}
+- {"ferramenta":"diff"}   → arquivos alterados/novos na cópia
+- {"ferramenta":"pronto","resumo":"o que foi feito, arquivos, como testar e o que ficou pendente"}
+MÉTODO (siga nesta ordem):
+1. ENTENDA antes de mudar, de forma OBJETIVA (no máximo ~10 ações): use o resumo do projeto abaixo, BUSQUE onde fica a
+   funcionalidade relacionada e LEIA os arquivos vizinhos para copiar as CONVENÇÕES (módulos, decorators, DTOs,
+   entidades, testes, nomes). Arquivos grandes: leia por FAIXA de linhas. Nunca repita uma busca/leitura já feita.
+   Se o pedido for amplo, escolha a menor implementação ÚTIL e coerente com o projeto e siga com ela.
+2. NUNCA invente métodos, imports, decorators ou caminhos: confirme com buscar/ler antes de usar.
+3. Respeite a arquitetura (ex.: serviços separados não importam código uns dos outros; registre módulos novos onde
+   o projeto registra; no frontend siga o padrão de chamadas autenticadas do projeto).
+4. ARQUIVO NOVO → gravar (completo). ARQUIVO EXISTENTE → editar (troque só o trecho exato; NUNCA reescreva um arquivo
+   existente inteiro de memória — isso apaga partes dele). Prefira estender o que existe a criar estruturas paralelas.
+   Todo import que você usar precisa existir (confirme com buscar); importe tudo o que referenciar.
+5. VALIDE: rode o build/typecheck/testes do que você mudou (se não houver node_modules, rode a instalação uma vez com
+   timeout alto). Em MONOREPO, compile antes os pacotes internos de que o app depende (ex.: npm run build -w <pacote>)
+   — erro "Cannot find module '@org/pacote'" geralmente é isso, não o seu código. LEIA o erro, separe o que é dos
+   arquivos que VOCÊ mexeu e CORRIJA; rode de novo até passar. Não repita o mesmo comando que falhou do mesmo jeito.
+6. Termine com "pronto" e um resumo HONESTO: o que passou, o que não foi possível validar e por quê.
+Pedido do usuário: <<PEDIDO>>"""
+
+
+class DevIniciarReq(BaseModel):
+    mensagem: str
+    session_id: str = ""
+    modelo: str = ""
+    pasta: str = ""
+
+
+class DevPassoReq(BaseModel):
+    run: str
+    resultado: dict | list | str | None = None
+
+
+def _dev_limpar():
+    agora = time.time()
+    for k in [k for k, r in _DEV_RUNS.items() if agora - r.get("t0", agora) > 7200]:
+        _DEV_RUNS.pop(k, None)
+
+
+def _dev_res_txt(res, limite=8000):
+    if isinstance(res, dict):
+        if res.get("erro"):
+            return "ERRO: " + str(res["erro"])[:2000]
+        if "conteudo" in res:
+            c = res.get("conteudo") or ""
+            return (f"[{res.get('caminho', '')} · linhas {res.get('linhas', '')} de {res.get('linhas_total', '?')}]\n"
+                    + (c if len(c) <= limite else c[:limite] + "\n…[cortado — leia por faixa de linhas]"))
+        if "achados" in res:
+            a = res.get("achados") or []
+            return f"{len(a)} ocorrência(s):\n" + "\n".join(a)[:limite] if a else "nenhuma ocorrência"
+        if "saida" in res or "tempo_esgotado" in res:
+            return f"código de saída {res.get('codigo')}\n" + (res.get("saida") or res.get("nota") or "")[-limite:]
+        return json.dumps(res, ensure_ascii=False)[:limite]
+    return str(res)[:limite]
+
+
+def _dev_caminho(run, c):
+    """Caminho que o modelo citou → caminho ABSOLUTO dentro da cópia. O agente é orientado a usar caminhos
+    RELATIVOS (modelos erram ao copiar caminhos longos); absolutos do original/cópia são reconhecidos pelo nome
+    da pasta. Nunca devolve algo fora da cópia."""
+    cop, orig = (run.get("copia") or "").rstrip("\\/"), (run.get("original") or "").rstrip("\\/")
+    c = (c or "").strip().strip('"').replace("/", "\\")
+    if not c or c in (".", "\\", "<cópia>", "<copia>"):
+        return cop
+    low, sep = c.lower(), "\\"
+    for raiz in (cop, orig):                         # cópia primeiro: o nome dela COMEÇA com o nome do original
+        if raiz and (low == raiz.lower() or low.startswith(raiz.lower() + sep)):
+            return cop + c[len(raiz):]
+    if len(c) > 2 and c[1] == ":":                   # absoluto "quase certo": recorta a partir do nome da pasta
+        for nome in (os.path.basename(cop), os.path.basename(orig)):
+            k = low.rfind(sep + nome.lower() + sep)
+            if nome and k >= 0:
+                return cop + c[k + len(nome) + 1:]
+            if nome and low.endswith(sep + nome.lower()):
+                return cop
+        return cop                                   # absoluto fora do projeto → raiz da cópia (nunca sai dela)
+    return cop + sep + c.lstrip("\\")
+
+
+def _dev_proximo(run):
+    """Chama o modelo e devolve a próxima AÇÃO para o desktop (ou o fim)."""
+    if run["passos"] >= _DEV_MAX_PASSOS or time.time() - run["t0"] > _DEV_MAX_SEG:
+        run["msgs"].append({"role": "user", "content": "Limite de passos/tempo atingido. Responda AGORA com pronto e um resumo honesto do estado."})
+        run["forcar_fim"] = True
+    # histórico maior (o agente esquecia o que já leu e relia); resultados ANTIGOS resumidos p/ caber
+    hist = run["msgs"][2:]
+    hist = hist[-34:]
+    antigos = len(hist) - 10
+    hist = [dict(m, content=(m["content"][:700] + "\n…[resultado antigo resumido]") if (i < antigos and m["role"] == "user"
+            and len(m["content"]) > 900) else m["content"]) for i, m in enumerate(hist)]
+    janela = run["msgs"][:2] + hist
+    sysp = _DEV_SYS.replace("<<COPIA>>", run.get("copia") or "?").replace("<<PEDIDO>>", run["pedido"])
+    raw, usado, falhas = None, None, []
+    for prov in ([run["modelo"]] if run.get("modelo") else []) + [p for p in run["cadeia"] if p != run.get("modelo")]:
+        if prov == "local" and run.get("modelo") != "local":
+            continue                                    # o local (3B, janela de 4k) não conduz uma implementação
+        for espera in (0, 8, 15, 25, 40):               # 429 (limite de taxa) é passageiro: espera e tenta o MESMO modelo
+            if espera:
+                time.sleep(espera)
+            try:
+                if prov == "local":
+                    raw = _strip_think(chat_model("chat", [{"role": "system", "content": sysp}] + janela, max_tokens=3500) or "")
+                else:
+                    mm, run["mapa"] = _mask_conv([{"role": "system", "content": sysp}] + janela, run["mapa"])
+                    raw = demask(_strip_think(chat_model(prov, mm, max_tokens=8000) or ""), run["mapa"])
+                usado = prov
+                break
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "Too Many" in msg:
+                    continue
+                falhas.append(f"{prov}: {msg[:90]}")
+                _event("dev · provedor falhou", falhas[-1])
+                break
+        else:
+            falhas.append(f"{prov}: limite de taxa (429) mesmo após aguardar")
+        if raw is not None:
+            break
+    if raw is None:
+        return {"fim": True, "run": run["id"], "copia": run.get("copia"),
+                "resposta": "⚠️ Parei: nenhum modelo externo conseguiu responder agora (" + "; ".join(falhas)[:400] +
+                            "). Nada foi alterado no original. Tente de novo em alguns minutos ou configure outro provedor em Model Ops."}
+    if usado != run.get("modelo"):
+        run["modelo"] = usado
+    run["passos"] += 1
+    call = _parse_tool_call(raw)
+    if not call:
+        if run.get("sem_json"):
+            return _dev_finalizar(run, raw)
+        run["sem_json"] = True
+        run["msgs"] += [{"role": "assistant", "content": raw[:3000]},
+                        {"role": "user", "content": 'Responda com UMA linha JSON de ferramenta (ex.: {"ferramenta":"buscar",...}) ou {"ferramenta":"pronto","resumo":"..."}.'}]
+        return _dev_proximo(run)
+    run["sem_json"] = False
+    nome = (call.get("ferramenta") or "").lower()
+    assin = json.dumps(call, sort_keys=True, ensure_ascii=False)[:2000]
+    run["ultimas"] = (run.get("ultimas", []) + [assin])[-3:]
+    if len(run["ultimas"]) == 3 and len(set(run["ultimas"])) == 1:
+        return _dev_finalizar(run, "O agente repetiu a mesma ação 3 vezes e foi interrompido.")
+    run["msgs"].append({"role": "assistant", "content": raw[:6000]})
+    # ---- ação JÁ feita (mesma busca/leitura/listagem, mesmo que intercalada) → não repete; empurra p/ frente ----
+    if nome in ("listar", "buscar", "ler"):
+        chave = json.dumps({k: v for k, v in call.items() if k != "ferramenta"}, sort_keys=True, ensure_ascii=False) + nome
+        feitos = run.setdefault("feitos", {})
+        if chave in feitos:
+            run["repetidas"] = run.get("repetidas", 0) + 1
+            if run["repetidas"] >= 4:
+                return _dev_finalizar(run, "Interrompi: o agente ficou repetindo buscas/leituras já feitas sem avançar para a implementação.")
+            run["msgs"].append({"role": "user", "content": "Você JÁ executou exatamente essa ação antes (o resultado está no histórico). "
+                                "NÃO repita. Avance: leia um arquivo DIFERENTE e específico, ou comece a GRAVAR a implementação."})
+            return _dev_proximo(run)
+        feitos[chave] = run["passos"]
+        run["explorou"] = run.get("explorou", 0) + 1
+        if run["explorou"] == 12 and not run.get("gravados"):
+            run["msgs"].append({"role": "user", "content": "Você já explorou o suficiente (12 ações). A partir de agora DECIDA e IMPLEMENTE: "
+                                "no máximo 3 leituras pontuais e então GRAVE os arquivos (completos) da solução."})
+        if run["explorou"] >= 24 and not run.get("gravados"):
+            return _dev_finalizar(run, "Interrompi: depois de 24 ações de exploração o agente ainda não tinha começado a implementar. "
+                                       "Tente um pedido mais específico (ex.: em qual app/tela e o que o chatbot deve responder).")
+    elif nome == "gravar":
+        run["explorou"] = 0
+    if nome == "pronto" or run.get("forcar_fim"):
+        if run.get("gravou_sem_validar") and not run.get("cobrou") and not run.get("forcar_fim"):
+            run["cobrou"] = True
+            run["msgs"].append({"role": "user", "content": "Você gravou arquivos e NÃO rodou build/typecheck/testes depois. Valide com a ferramenta rodar antes de finalizar."})
+            return _dev_proximo(run)
+        if run.get("rodar_falhou") and run.get("cobrou_falha", 0) < 2 and not run.get("forcar_fim"):
+            run["cobrou_falha"] = run.get("cobrou_falha", 0) + 1
+            run["msgs"].append({"role": "user", "content": "O último build/teste FALHOU. Não finalize ainda: separe os erros dos arquivos que "
+                                "VOCÊ criou/editou e corrija-os com editar/gravar; se o erro for de pacote interno não compilado "
+                                "(ex.: Cannot find module '@org/pacote'), compile esse pacote primeiro. Depois rode de novo."})
+            return _dev_proximo(run)
+        run["resumo"] = call.get("resumo") or raw
+        return {"run": run["id"], "passo": "📋 conferindo o que mudou na cópia", "acao": {"op": "diff", "copia": run["copia"]}, "etapa": "diff_final"}
+    if nome == "listar":
+        acao = {"op": "listar", "caminho": _dev_caminho(run, call.get("caminho"))}; rot = f"📂 listando {acao['caminho'][-60:]}"
+    elif nome == "buscar":
+        acao = {"op": "buscar", "caminho": _dev_caminho(run, call.get("caminho")), "termo": call.get("termo") or ""}
+        rot = f"🔎 buscando \"{(call.get('termo') or '')[:40]}\""
+    elif nome == "ler":
+        acao = {"op": "ler", "caminho": _dev_caminho(run, call.get("caminho"))}
+        for k in ("linha_inicio", "linha_fim"):
+            if call.get(k):
+                try:
+                    acao[k] = int(call[k])
+                except Exception:
+                    pass
+        rot = f"📖 lendo {acao['caminho'].split(chr(92))[-1]}"
+    elif nome == "gravar":
+        acao = {"op": "gravar", "caminho": _dev_caminho(run, call.get("caminho")), "conteudo": call.get("conteudo") or ""}
+        run["gravou_sem_validar"] = True; run.setdefault("gravados", set()).add(acao["caminho"])
+        rot = f"✍️ gravando {acao['caminho'].split(chr(92))[-1]} (na cópia)"
+    elif nome == "rodar":
+        acao = {"op": "rodar", "programa": call.get("programa") or "", "args": [str(a) for a in (call.get("args") or [])][:60],
+                "pasta": _dev_caminho(run, call.get("pasta")), "timeout": min(max(int(call.get("timeout") or 300), 10), 900)}
+        run["gravou_sem_validar"] = False
+        rot = f"⌨️ {acao['programa']} {' '.join(acao['args'])[:60]}"
+    elif nome == "editar":
+        acao = {"op": "editar", "caminho": _dev_caminho(run, call.get("caminho")), "trocar": call.get("trocar") or "", "por": call.get("por") or ""}
+        run["gravou_sem_validar"] = True; run.setdefault("gravados", set()).add(acao["caminho"]); run["explorou"] = 0
+        rot = f"✏️ editando {acao['caminho'].split(chr(92))[-1]} (na cópia)"
+    elif nome == "diff":
+        acao = {"op": "diff", "copia": run["copia"]}; rot = "📋 vendo o que mudou"
+    else:
+        run["msgs"].append({"role": "user", "content": f"Ferramenta '{nome}' não existe. Use listar, buscar, ler, gravar, editar, rodar, diff ou pronto."})
+        return _dev_proximo(run)
+    run["ultima_op"] = acao["op"]
+    return {"run": run["id"], "passo": rot, "acao": acao, "modelo": run["modelo"]}
+
+
+def _dev_finalizar(run, resumo, diff=None):
+    alt = (diff or {}).get("alterados") or []
+    nov = (diff or {}).get("novos") or []
+    partes = [resumo.strip() if isinstance(resumo, str) else str(resumo)]
+    if alt or nov:
+        partes.append("\n\n**Na cópia de trabalho** `" + (run.get("copia") or "") + "`:\n"
+                      + "".join(f"\n- ✎ `{a}`" for a in alt[:60]) + "".join(f"\n- ＋ `{n}`" for n in nov[:60]))
+        partes.append("\n\nO **original não foi alterado**. Para levar isso ao projeto, diga *\"aplique as alterações no original\"* "
+                      "(vou pedir confirmação no seu computador e guardar backup).")
+    elif diff is not None:
+        partes.append("\n\n(Nenhum arquivo foi alterado na cópia.)")
+    _event("dev · implementação", f"{run['pedido'][:50]} · {run['passos']} passos · {len(alt) + len(nov)} arquivo(s) · {run.get('modelo')}")
+    return {"fim": True, "run": run["id"], "resposta": "".join(partes), "copia": run.get("copia"),
+            "original": run.get("original"), "alterados": alt, "novos": nov, "modelo": run.get("modelo"), "passos": run["passos"]}
+
+
+@app.post("/dev/iniciar")
+def dev_iniciar(body: DevIniciarReq):
+    _quota_consumir(externa=True)
+    _dev_limpar()
+    ok, why = guard_input(body.mensagem)
+    if not ok:
+        return {"fim": True, "resposta": f"⛔ Bloqueado pelo guardrail: {why}."}
+    # implementação precisa de janela grande: fora os provedores pequenos (ex.: Groq 8k tokens/min)
+    cad = [p for p in _cadeia_provedores(body.modelo, forcar=True) if _anexo_limite(p) >= 60000]
+    modelo = cad[0] if cad else "local"
+    rid = "dev" + uuid.uuid4().hex[:10]
+    ax, _ = _anexos_texto(body.session_id or "", limite=min(_anexo_limite(modelo), 15000), consulta=body.mensagem)
+    run = {"id": rid, "t0": time.time(), "pedido": body.mensagem[:2000], "modelo": modelo, "cadeia": cad + ["local"],
+           "mapa": {}, "passos": 0, "original": body.pasta, "copia": None, "user": (_usuario_atual() or {}).get("id"),
+           "msgs": [{"role": "user", "content": "RESUMO DO PROJETO (pasta lida pelo Cerne Desktop, arquivos mais relevantes):\n"
+                     + (ax or "(sem resumo — explore com listar/buscar)")},
+                    {"role": "assistant", "content": '{"ferramenta":"listar","caminho":"<cópia>"}'}]}
+    _DEV_RUNS[rid] = run
+    return {"run": rid, "passo": "🗂️ criando a cópia de trabalho (o original não será alterado)", "modelo": modelo,
+            "acao": {"op": "preparar_copia", "pasta": body.pasta, "pedido": body.mensagem[:240]}, "etapa": "copia"}
+
+
+@app.post("/dev/passo")
+def dev_passo(body: DevPassoReq):
+    run = _DEV_RUNS.get(body.run)
+    if not run:
+        raise HTTPException(status_code=404, detail="execução não encontrada ou expirada")
+    if run.get("user") and run["user"] != (_usuario_atual() or {}).get("id"):
+        raise HTTPException(status_code=403, detail="execução de outro usuário")
+    res = body.resultado if body.resultado is not None else {}
+    if not run.get("copia"):
+        if isinstance(res, dict) and res.get("copia"):
+            run["copia"] = res["copia"]; run["original"] = res.get("original") or run["original"]
+            run["msgs"].append({"role": "user", "content": f"Cópia de trabalho criada em {run['copia']} "
+                                f"({res.get('arquivos', '?')} arquivos; {res.get('nota', '')}). Comece."})
+            return _dev_proximo(run)
+        _DEV_RUNS.pop(run["id"], None)
+        return {"fim": True, "run": run["id"], "resposta": "Não comecei a implementação: " +
+                (str(res.get("erro")) if isinstance(res, dict) and res.get("erro") else "a cópia de trabalho não foi criada") + "."}
+    if run.get("resumo") is not None and isinstance(res, dict) and ("alterados" in res or "novos" in res):
+        return _dev_finalizar(run, run["resumo"], res)
+    if run.get("ultima_op") == "rodar" and isinstance(res, dict):
+        run["rodar_falhou"] = bool(res.get("erro") or res.get("tempo_esgotado") or (res.get("codigo") not in (0, None)))
+    run["msgs"].append({"role": "user", "content": "Resultado:\n" + _dev_res_txt(res)})
+    return _dev_proximo(run)
+
+
+class DevProporReq(BaseModel):
+    mensagem: str
+    session_id: str = ""
+    modelo: str = ""
+
+
+@app.post("/dev/propor")
+def dev_propor(body: DevProporReq):
+    """Sem o desktop novo (sem execução local): pede a implementação em ARQUIVOS COMPLETOS no formato gravável;
+    se o modelo devolver só trechos/explicação, pede de novo uma vez."""
+    _quota_consumir(externa=True)
+    cad = _cadeia_provedores(body.modelo, forcar=True) or ["local"]
+    sysp = ("Você é engenheiro de software sênior. IMPLEMENTE o pedido no projeto do anexo seguindo as convenções e a "
+            "arquitetura dele (não invente métodos/imports: use só o que aparece no código). Explique em poucas linhas e "
+            "devolva CADA arquivo criado/alterado COMPLETO neste formato exato (caminho relativo à pasta do projeto):\n"
+            "<<<ARQUIVO: caminho/relativo.ext>>>\n(conteúdo completo)\n<<<FIM>>>")
+    for prov in cad:
+        try:
+            ax, _ = _anexos_texto(body.session_id or "", limite=_anexo_limite(prov), consulta=body.mensagem)
+            msgs = [{"role": "system", "content": sysp}, {"role": "user", "content": f"Projeto:\n{ax}\n\nPedido: {body.mensagem}"}]
+            mm, mapa = _mask_conv(msgs, {}) if prov != "local" else (msgs, {})
+            fazer = (lambda m: chat_model("chat" if prov == "local" else prov, m, max_tokens=8000))
+            raw = demask(_strip_think(fazer(mm) or ""), mapa)
+            if "<<<ARQUIVO:" not in raw:
+                mm2 = mm + [{"role": "assistant", "content": raw[:4000]},
+                            {"role": "user", "content": "Agora devolva os ARQUIVOS COMPLETOS no formato <<<ARQUIVO: caminho>>> … <<<FIM>>>."}]
+                raw = demask(_strip_think(fazer(mm2) or ""), mapa)
+            return {"resposta": raw, "modelo": prov, "arquivos": len(re.findall(r"<<<ARQUIVO:", raw))}
+        except Exception as e:
+            _event("dev · propor falhou", f"{prov}: {str(e)[:120]}")
+    return JSONResponse(status_code=502, content={"error": "nenhum modelo respondeu"})
 
 
 # ---- ações prontas sobre o acervo (resumir / riscos / extrair) ----
@@ -10380,8 +11678,15 @@ def interpretar(body: InterpretarReq):
         intent = "responder"
     else:
         intent = "perguntar"
+    # pasta de código anexada + pergunta/análise ("analise", "me fale", "o que é", "arquitetura"...) = RESPONDER
+    # sobre o código, não gerar um relatório executivo (que ignora o código e devolve texto genérico)
+    _quer_doc = re.search(r"\b(gere|gerar|crie|criar|elabore|monte|escreva|redija)\b.*\b(documento|relat[oó]rio|docx|pdf|apresenta|site|p[aá]gina)", body.mensagem, re.I)
+    if _anexo_tem_pasta(body.session_id or "") and not _quer_doc and re.search(
+            r"analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|qual|quais|como funciona|arquitetura|entend|descrev|resum|stack|tecnologia",
+            body.mensagem, re.I):
+        intent, texto = "perguntar", ""
     # rede de segurança: anexo presente + verbo de construção -> é 'documento' (o assunto está no anexo, não é vago)
-    if axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
+    elif axn and intent in ("esclarecer", "perguntar") and re.search(r"aval|estrutur|\bcri[ae]|\bger[ae]|monte|elabor|fa[çc]a|respond|plano|proposta|an[aá]lise|entreg|desafio|case", body.mensagem, re.I):
         intent = "documento"; texto = ""
     if intent in ("responder", "esclarecer") and not texto:
         texto = ("Consigo responder sobre os documentos deste projeto e gerar documentos ou sites com base neles. "
@@ -11240,6 +12545,7 @@ button:focus-visible,a:focus-visible,[role=button]:focus-visible,.sel:focus-visi
   <span class="pill" id="statuspill"><span class="dot ok pulse" style="color:var(--ok)"></span>NOMINAL</span>
   <span class="clock" id="clk">--:--:--</span>
   <button class="themebtn" onclick="window.open('/baixar','_blank')" title="Baixar o app Cerne Desktop (Windows)" style="border-color:var(--cyan);color:var(--cyan)">⬇ Desktop</button>
+  <button class="themebtn" onclick="window.open('/baixar#extensao','_blank')" title="Baixar a extensão do navegador (Chrome/Edge) — deixa os agentes operarem o seu navegador" style="border-color:var(--cyan);color:var(--cyan)">⬇ Extensão</button>
   <button class="themebtn" id="themebtn" onclick="cycleTheme()">◐ Orqion</button>
   <div class="rolebox" id="rolebox" style="display:none"><span class="rl">VER COMO</span><select class="rolesel" id="rolesel" onchange="setRole(this.value)"><option value="admin">Administrador</option><option value="gestor">Gestor</option><option value="colaborador">Colaborador</option></select></div>
   <div class="userbox" id="userbox" style="display:none"></div>
@@ -11288,7 +12594,7 @@ function setRole(r){role=r;const fb=ROLES[role][0];location.hash=(fb==="work"?"w
 const THEMES=[["orqion","Orqion"],["dark","Dark"],["normal","Normal"],["jarvis","Jarvis"]];let ti=1;
 function applyTheme(){document.body.setAttribute("data-theme",THEMES[ti][0]);const b=document.getElementById("themebtn");if(b)b.textContent="◐ "+THEMES[ti][1];try{localStorage.setItem("cerne_theme",ti)}catch(e){}}
 function cycleTheme(){ti=(ti+1)%THEMES.length;applyTheme();}
-const NAV=[{sec:"OPERAR"},{v:"overview",ic:"grid",l:"Visão geral"},{v:"projects",ic:"folder",l:"Projetos & Coleções"},{v:"acervo",ic:"archive",l:"Acervo"},{sec:"CONHECIMENTO"},{v:"graph",ic:"graph",l:"Grafo de conhecimento"},{v:"skills",ic:"spark",l:"Skills & Instruções"},{v:"runtime",ic:"cpu",l:"Runtime de Agentes"},{v:"conectores",ic:"plug",l:"Conectores"},{sec:"INFRAESTRUTURA"},{v:"components",ic:"layers",l:"Componentes"},{v:"gateway",ic:"route",l:"Model Gateway"},{v:"preflight",ic:"check",l:"Preflight"},{v:"environments",ic:"server",l:"Ambientes"},{sec:"GOVERNANÇA"},{v:"observability",ic:"activity",l:"Observabilidade"},{v:"events",ic:"list",l:"Eventos"},{v:"guardrails",ic:"shield",l:"Guardrails"},{v:"audit",ic:"link",l:"Auditoria"},{v:"users",ic:"key",l:"Acessos"},{sec:"SISTEMA"},{v:"setup",ic:"play",l:"Setup guiado"},{v:"org",ic:"building",l:"Organização"},{v:"settings",ic:"gear",l:"Configurações"},{v:"baixar",ic:"server",l:"Baixar App Desktop",href:"/baixar"},{v:"map",ic:"map",l:"Mapa da plataforma"}];
+const NAV=[{sec:"OPERAR"},{v:"overview",ic:"grid",l:"Visão geral"},{v:"projects",ic:"folder",l:"Projetos & Coleções"},{v:"acervo",ic:"archive",l:"Acervo"},{sec:"CONHECIMENTO"},{v:"graph",ic:"graph",l:"Grafo de conhecimento"},{v:"skills",ic:"spark",l:"Skills & Instruções"},{v:"runtime",ic:"cpu",l:"Runtime de Agentes"},{v:"conectores",ic:"plug",l:"Conectores"},{sec:"INFRAESTRUTURA"},{v:"components",ic:"layers",l:"Componentes"},{v:"gateway",ic:"route",l:"Model Gateway"},{v:"preflight",ic:"check",l:"Preflight"},{v:"environments",ic:"server",l:"Ambientes"},{sec:"GOVERNANÇA"},{v:"observability",ic:"activity",l:"Observabilidade"},{v:"events",ic:"list",l:"Eventos"},{v:"guardrails",ic:"shield",l:"Guardrails"},{v:"audit",ic:"link",l:"Auditoria"},{v:"users",ic:"key",l:"Acessos"},{sec:"SISTEMA"},{v:"setup",ic:"play",l:"Setup guiado"},{v:"org",ic:"building",l:"Organização"},{v:"settings",ic:"gear",l:"Configurações"},{v:"baixar",ic:"server",l:"Baixar App Desktop",href:"/baixar"},{v:"baixarext",ic:"link",l:"Baixar Extensão",href:"/baixar#extensao"},{v:"map",ic:"map",l:"Mapa da plataforma"}];
 const CRUMB={overview:"OPERAR / VISÃO GERAL",projects:"OPERAR / PROJETOS",acervo:"OPERAR / ACERVO",graph:"CONHECIMENTO / GRAFO",skills:"CONHECIMENTO / SKILLS",agentes:"CONHECIMENTO / AGENTES",runtime:"CONHECIMENTO / RUNTIME",conectores:"CONHECIMENTO / CONECTORES",marca:"MARKETING / STUDIO DE MARCA",components:"INFRA / COMPONENTES",gateway:"INFRA / MODEL GATEWAY",preflight:"INFRA / PREFLIGHT",environments:"INFRA / AMBIENTES",observability:"GOVERNANÇA / OBSERVABILIDADE",events:"GOVERNANÇA / EVENTOS",guardrails:"GOVERNANÇA / GUARDRAILS",audit:"GOVERNANÇA / AUDITORIA",users:"GOVERNANÇA / ACESSOS",setup:"SISTEMA / SETUP GUIADO",settings:"SISTEMA / CONFIGURAÇÕES",map:"SISTEMA / MAPA",org:"SISTEMA / ORGANIZAÇÃO"};
 const met=(c,n,s,cl)=>`<div class="panel metric"><div class="cap">${c}</div><div class="num ${cl||''}">${n}</div>${s?`<div class="sub">${s}</div>`:""}</div>`;
 const eye=t=>`<div class="eyebrow">${t}</div>`;
@@ -11924,7 +13230,8 @@ function mkPecaSimular(id,i){const g=k=>(document.getElementById(k+i)||{}).value
 /* ===== Design Studio (motor de design estilo Open Design / Claude Design) ===== */
 let DSG={designs:[],tipos:[],marcas:[],detail:null};
 function dsgRoot(){return document.getElementById('dsgmount');}
-V.design=async()=>{try{const d=await J('/design');DSG.designs=d.designs||[];DSG.tipos=d.tipos||[];DSG.estilos=d.estilos||[];DSG.sistemas=d.sistemas||[];DSG.templates=d.templates||[];}catch(e){}try{DSG.marcas=(await J('/marca')).marcas||[];}catch(e){DSG.marcas=[];}return dsgHtml();};
+function dsgSetSys(d){const od=(d&&d.sistemas_od)||[];const odn=new Set(od.map(x=>(x.nome||'').toLowerCase().split(/[ (\/]/)[0]));const leg=((d&&d.sistemas)||[]).filter(x=>x.custom||!odn.has((x.nome||'').toLowerCase().split(/[ (\/]/)[0]));DSG.sistemas=leg.concat(od);if(d&&d.kit)DSG.kit=d.kit;}
+V.design=async()=>{try{const d=await J('/design');DSG.designs=d.designs||[];DSG.tipos=d.tipos||[];DSG.estilos=d.estilos||[];dsgSetSys(d);DSG.templates=d.templates||[];}catch(e){}if(DSG.kit&&DSG.kit.ok&&!DSG.kitCat){try{DSG.kitCat=await J('/design/kit');}catch(e){}}try{DSG.marcas=(await J('/marca')).marcas||[];}catch(e){DSG.marcas=[];}return dsgHtml();};
 function dsgTpl(i){const t=(DSG.templates||[])[i];if(!t)return;DSG.tplSel=i;const pt=document.getElementById('dsg_prompt');if(pt)pt.value=t.prompt;const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
 function dsgIcon(t,sz){sz=sz||30;const A='width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"';const I={landing:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/><rect x="6" y="11" width="12" height="3" rx="1"/><rect x="6" y="16" width="6" height="1.6" rx="0.8"/>',deck:'<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M7 8h4M7 11h7"/>',dashboard:'<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/><path d="M13 17l2-2 2 3"/>',onepager:'<path d="M6 2h9l4 4v16H6z"/><path d="M15 2v4h4"/><path d="M9 12h6M9 15h6M9 18h4"/>',email:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/>',prototype:'<rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M10.5 18.5h3"/>',social:'<rect x="4" y="6" width="12" height="12" rx="2"/><rect x="8" y="9" width="12" height="12" rx="2" fill="var(--panel2)"/><path d="M11 13h6M11 16h4"/>',blog:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M7 8h6M7 11h10M7 14h10M7 17h7"/>',curriculo:'<path d="M6 2h12v20H6z"/><circle cx="10" cy="8" r="2"/><path d="M14 7h3M14 10h3M8 14h9M8 17h9"/>',cardapio:'<path d="M6 2h12v20H6z"/><path d="M9 7h4M9 10h5M9 13h5"/>',convite:'<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12"/><path d="M13.5 10.5l1.5 1.5 3-3"/>'};return '<svg '+A+'>'+(I[t]||I.onepager)+'</svg>';}
 function _dsgLum(hex){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');if(hex.length<6)return .5;const r=parseInt(hex.slice(0,2),16)/255,g=parseInt(hex.slice(2,4),16)/255,b=parseInt(hex.slice(4,6),16)/255;return .299*r+.587*g+.114*b;}
@@ -11933,8 +13240,8 @@ function _dsgFF(fontes){const j=(fontes||[]).join(' ').toLowerCase();if(/mono|co
 function dsgThemeOf(item){if(!item||!item.paleta||!item.paleta.length){const t=_dsgTheme([],false);t.ff=_dsgFF((item&&item.fontes)||[]);return t;}const dark=(typeof item.dark==='boolean')?item.dark:(!item.paleta.some(c=>_dsgLum(c)>.80)&&item.paleta.some(c=>_dsgLum(c)<.16));const t=_dsgTheme(item.paleta,dark);t.ff=_dsgFF(item.fontes||[]);return t;}
 function dsgCurItem(){const id=DSG.estilo||'';if(!id)return {id:'',nome:'Automático (design livre)',paleta:[],fontes:[]};return (DSG.estilos||[]).find(x=>x.id===id)||(DSG.sistemas||[]).find(x=>x.id===id)||{id:'',nome:'Automático',paleta:[]};}
 function dsgPal(){return dsgThemeOf(dsgCurItem());}
-function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:'')}</div></button>`;}
-function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysBrand=sysF.filter(s=>!s.custom);let h='';const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
+function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.od?'<span class="tag" title="Open Design Agent Kit — DESIGN.md + tokens">OD</span>':(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:''))}</div></button>`;}
+function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysOD=sysF.filter(s=>s.od),sysBrand=sysF.filter(s=>!s.custom&&!s.od);let h='';if(DSG.rec&&DSG.rec.length&&!q){h+='<div class="dsgseclbl">✨ Recomendados para o seu briefing <span style="text-transform:none;font-weight:400;letter-spacing:0">— Open Design</span></div><div class="dsggrid">'+DSG.rec.map(r=>{const it=(DSG.sistemas||[]).find(x=>x.id===r.id)||r;return '<div title="'+esc(r.motivo||'')+'">'+dsgSysCard(it,cur===it.id)+'<div class="faint" style="font-size:10.5px;padding:4px 4px 0;line-height:1.35">'+esc(r.motivo||'')+'</div></div>';}).join('')+'</div>';}const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';const odG=sysOD.filter(s=>s.kind!=='brand'),odB=sysOD.filter(s=>s.kind==='brand');if(odG.length)h+='<div class="dsgseclbl">📐 Open Design · estilos ('+odG.length+')</div><div class="dsggrid">'+odG.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(odB.length)h+='<div class="dsgseclbl">📐 Open Design · inspirados em marcas ('+odB.length+')</div><div class="dsggrid">'+odB.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
 function _dsgGalFilter(){const q=(DSG.galQ||'').toLowerCase().trim();const match=x=>!q||(x.nome||'').toLowerCase().includes(q)||(x.categoria||'').toLowerCase().includes(q);const estF=(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).filter(match);const sysF=(DSG.sistemas||[]).filter(match);return [estF,sysF];}
 function dsgGalBody(){const f=_dsgGalFilter();const b=document.getElementById('dsg_galbody');if(b)b.innerHTML=dsgGalGrids(f[0],f[1]);}
 function dsgGalModal(){const f=_dsgGalFilter();const n=(DSG.sistemas||[]).length+(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).length;return `<div class="dsgov" onclick="if(event.target===this)dsgGalClose()"><div class="dsggalm"><div class="hd"><div style="font-weight:700;font-size:15px;flex:none">Design systems</div><input id="dsg_galq" class="field" placeholder="Buscar entre ${n} por nome ou categoria…" style="margin:0;flex:1" value="${esc(DSG.galQ||'')}" oninput="DSG.galQ=this.value;dsgGalBody()"><button class="btn ghost" style="padding:6px 11px;flex:none" onclick="dsgGalClose()">✕</button></div><div id="dsg_galbody" class="bd">${dsgGalGrids(f[0],f[1])}</div></div></div>`;}
@@ -11955,12 +13262,12 @@ function dsgMock(t,p){const box='height:120px;border-radius:8px;overflow:hidden;
  return `<div style="${box};background:${p.bg};display:flex;flex-direction:column">${hero}<div style="padding:8px 9px;flex:1;overflow:hidden">${rows}</div></div>`;}
 function dsgModels(){const p=dsgPal();const out=[];(DSG.templates||[]).forEach((t,i)=>{if(t.tipo!==DSG.tipo)return;out.push(`<button class="dsgmcard${DSG.tplSel===i?' on':''}" onclick="dsgTpl(${i})" title="${esc(t.nome)}"><div class="mkwrap">${dsgMock(t,p)}</div><div class="mnm">${DSG.tplSel===i?'✓ ':''}${esc(t.nome)}</div></button>`);});if(!out.length)out.push('<div class="faint" style="font-size:12px;padding:14px;grid-column:1/-1">Sem modelos para este tipo — descreva livremente no campo acima.</div>');return out.join('');}
 function dsgRestyle(){const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
-function dsgPickType(id){DSG.tipo=id;DSG.tplSel=null;[...document.querySelectorAll('.dsgtype')].forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')===id));const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
+function dsgPickType(id){DSG.tipo=id;DSG.tplSel=null;DSG.receita='';const rs=document.getElementById('dsg_receita');if(rs)rs.innerHTML=dsgReceitaOpts();[...document.querySelectorAll('.dsgtype')].forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')===id));const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
 async function dsgReload(){try{const d=await J('/design');DSG.designs=d.designs||[];}catch(e){}const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
 function dsgRe(){const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
-async function dsgSistemaCriar(){const b=document.getElementById('dsy_btn'),msg=document.getElementById('dsy_msg');const nome=(document.getElementById('dsy_nome').value||'').trim();if(!nome){if(msg)msg.textContent='dê um nome ao design system.';return;}if(b)b.disabled=true;if(msg)msg.textContent='criando… (se informou URL, extraio o site — ~20s)';const body={nome:nome,blurb:(document.getElementById('dsy_blurb')||{}).value||'',url:(document.getElementById('dsy_url')||{}).value||'',notas:(document.getElementById('dsy_notas')||{}).value||''};try{const r=await P('/design/sistema',body);if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);if(b)b.disabled=false;return;}const s=await r.json();try{DSG.sistemas=(await J('/design')).sistemas||DSG.sistemas;}catch(e){}DSG.estilo=s.id;DSG.showNovoSys=false;dsgRe();}catch(e){if(msg)msg.textContent='erro: '+e;if(b)b.disabled=false;}}
-async function dsgSistemaDel(sid){if(!confirm('Excluir este design system?'))return;await fetch('/design/sistema/'+sid,{method:'DELETE',credentials:'include'});try{DSG.sistemas=(await J('/design')).sistemas||DSG.sistemas;}catch(e){}dsgRe();}
-function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo||'landing';DSG.estilo=DSG.estilo||'';
+async function dsgSistemaCriar(){const b=document.getElementById('dsy_btn'),msg=document.getElementById('dsy_msg');const nome=(document.getElementById('dsy_nome').value||'').trim();if(!nome){if(msg)msg.textContent='dê um nome ao design system.';return;}if(b)b.disabled=true;if(msg)msg.textContent='criando… (se informou URL, extraio o site — ~20s)';const body={nome:nome,blurb:(document.getElementById('dsy_blurb')||{}).value||'',url:(document.getElementById('dsy_url')||{}).value||'',notas:(document.getElementById('dsy_notas')||{}).value||''};try{const r=await P('/design/sistema',body);if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);if(b)b.disabled=false;return;}const s=await r.json();try{dsgSetSys(await J('/design'));}catch(e){}DSG.estilo=s.id;DSG.showNovoSys=false;dsgRe();}catch(e){if(msg)msg.textContent='erro: '+e;if(b)b.disabled=false;}}
+async function dsgSistemaDel(sid){if(!confirm('Excluir este design system?'))return;await fetch('/design/sistema/'+sid,{method:'DELETE',credentials:'include'});try{dsgSetSys(await J('/design'));}catch(e){}dsgRe();}
+function dsgHtml(){dsgKitCss();if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo||'landing';DSG.estilo=DSG.estilo||'';
  const marcaOpts='<option value="">— sem marca (design livre) —</option>'+(DSG.marcas||[]).map(m=>`<option value="${m.id}">${esc((m.dna&&m.dna.nome_marca)||m.site||m.id)}</option>`).join('');
  const list=(DSG.designs||[]).map(dsgCard).join('')||('<div style="grid-column:1/-1">'+emptyState('image','Nenhum design ainda','Descreva o que você quer no campo acima — landing, apresentação, dashboard, e-mail, protótipo… — e o Cerne gera o HTML real com prévia ao vivo, pronto para exportar.')+'</div>');
  return `<style>
@@ -11999,7 +13306,7 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
 @media(max-width:760px){.dsg2col{grid-template-columns:1fr!important}.dsgsplit{grid-template-columns:1fr}.dsgtypes{flex-direction:row;flex-wrap:wrap;max-height:none}.dsgtype{width:auto}}
 </style>
   <div style="max-width:1000px"><h2 style="margin:0 0 4px;font-size:20px">Design Studio</h2>
-  <div class="faint" style="font-size:12.5px;margin-bottom:16px;max-width:74ch">Descreva o que quer e o Cerne gera o design REAL (HTML) com preview ao vivo — landing pages, apresentações, dashboards, one-pagers, e-mails e protótipos. Itere por chat e exporte. Escolha uma marca para virar o design system.</div>
+  <div class="faint" style="font-size:12.5px;margin-bottom:16px;max-width:74ch">Descreva o que quer e o Cerne gera o design REAL (HTML) com preview ao vivo — landing pages, apresentações, dashboards, one-pagers, e-mails e protótipos. Itere por chat e exporte. Escolha uma marca para virar o design system.${DSG.kit&&DSG.kit.ok?' Com o <b>Open Design Agent Kit</b>: design systems com tokens reais, receitas por tipo, exemplos para remixar e checagem anti-AI-slop.':''}</div>
   <div class="panel" style="padding:18px">
    <label class="dsglbl" style="margin-bottom:7px">Descreva seu design</label>
    <textarea class="field" id="dsg_prompt" placeholder="Ex.: uma landing page para um curso de barista, com preços e depoimentos" style="width:100%;box-sizing:border-box;min-height:84px;margin:0 0 16px"></textarea>
@@ -12012,9 +13319,10 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
     </div>
    </div>
    <div class="dsg2col" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
-    <div class="dsgfield"><label class="dsglbl" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Estilo / Design system<span class="dsglink" onclick="DSG.showNovoSys=!DSG.showNovoSys;dsgRe()">＋ criar o meu</span></label><button type="button" class="field dsgpick" id="dsg_estbtn" onclick="dsgGalOpen()" title="Abrir a galeria de design systems — a prévia dos modelos usa a paleta e a fonte escolhidas">${dsgEstBtnInner()}</button></div>
+    <div class="dsgfield"><label class="dsglbl" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Estilo / Design system<span style="display:flex;gap:12px">${DSG.kit&&DSG.kit.ok?'<span class="dsglink" onclick="dsgRecomendar()" title="Sugere design systems do Open Design para o briefing e o tipo">✨ recomendar</span>':''}<span class="dsglink" onclick="DSG.showNovoSys=!DSG.showNovoSys;dsgRe()">＋ criar o meu</span></span></label><button type="button" class="field dsgpick" id="dsg_estbtn" onclick="dsgGalOpen()" title="Abrir a galeria de design systems — a prévia dos modelos usa a paleta e a fonte escolhidas">${dsgEstBtnInner()}</button></div>
     <div class="dsgfield"><label class="dsglbl">Sua marca <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">(opcional)</span></label><select class="field" id="dsg_marca">${marcaOpts}</select></div>
    </div>
+   ${dsgKitPanel()}
    <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px">
     <label class="dsgcapa" title="Gera uma imagem de capa/hero por IA (requer chave de imagem)"><input type="checkbox" id="dsg_capa"> ${ico('image')} Gerar capa/hero por IA</label>
     <div class="row" style="gap:12px;align-items:center"><span id="dsg_msg" class="faint" style="font-size:12px"></span><button class="btn" id="dsg_gerar" onclick="dsgGerar()" style="padding:10px 22px;font-size:14px">${ico('spark')} Gerar design</button></div>
@@ -12030,7 +13338,54 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
    ${(DSG.sistemas||[]).filter(s=>s.custom).length?`<div style="margin-top:12px"><div class="faint" style="font-size:11px;margin-bottom:5px">MEUS DESIGN SYSTEMS</div>${(DSG.sistemas||[]).filter(s=>s.custom).map(s=>`<div class="row" style="gap:8px;align-items:center;padding:3px 0"><b style="font-size:12px;min-width:110px">${esc(s.nome)}</b><span class="mkswatches">${(s.paleta||[]).slice(0,5).map(c=>`<span class="mksw" style="background:${esc(c)}"></span>`).join('')}</span><button class="tbt crit" onclick="dsgSistemaDel('${s.id}')">✕</button></div>`).join('')}</div>`:''}
   </div>`:''}
   <div class="lstitle" style="margin:18px 0 8px">MEUS DESIGNS</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">${list}</div></div>`;}
-function dsgCard(d){return `<div class="panel" style="padding:12px"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.titulo)}</div><div class="faint" style="font-size:11px;margin:3px 0 8px">${esc(d.tipo_nome)} · ${d.iteracoes} iteração(ões)</div><div class="row" style="gap:6px"><button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="dsgSel('${d.id}')">abrir</button><button class="tbt crit" onclick="dsgDel('${d.id}')">✕</button></div></div>`;}
+function dsgCard(d){return `<div class="panel" style="padding:12px"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.titulo)}</div><div class="faint" style="font-size:11px;margin:3px 0 8px">${esc(d.tipo_nome)} · ${d.iteracoes} iteração(ões)${d.checagem?` · <span title="nota da checagem Open Design" style="color:${d.checagem.score>=85?'var(--cyan,#22d3ee)':d.checagem.score>=65?'#f0a020':'#ff6b6b'}">✓ ${d.checagem.score}</span>`:''}${d.exemplo?' · remix':''}</div><div class="row" style="gap:6px"><button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="dsgSel('${d.id}')">abrir</button><button class="tbt crit" onclick="dsgDel('${d.id}')">✕</button></div></div>`;}
+/* ---- Open Design Agent Kit: receitas, remix de exemplos, recomendação e checagem ---- */
+function dsgKitCss(){if(document.getElementById('dsgkitcss'))return;const st=document.createElement('style');st.id='dsgkitcss';st.textContent=`.dsgkit{margin-top:14px;padding:12px 14px;border:1px dashed var(--line);border-radius:12px;background:var(--panel2)}
+.dsgkit .hd{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;margin-bottom:10px}
+.dsgkit .hd .bdg{font-size:9.5px;font-weight:600;color:var(--faint);border:1px solid var(--line);border-radius:20px;padding:2px 8px}
+.dsgchip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--iris);border-radius:9px;font-size:12px;color:var(--iris);background:transparent}
+.dsgchip button{border:0;background:none;color:inherit;cursor:pointer;font-size:12px;padding:0}
+.dsgexgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}
+.dsgexcard{border:1px solid var(--line);background:var(--panel2);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;transition:border-color .12s,transform .08s}
+.dsgexcard:hover{border-color:var(--iris);transform:translateY(-2px)}
+.dsgexcard.on{border-color:var(--iris);box-shadow:0 0 0 1px var(--iris) inset}
+.dsgexthumb{position:relative;height:140px;overflow:hidden;background:#fff;border-bottom:1px solid var(--line)}
+.dsgexthumb iframe{position:absolute;top:0;left:0;width:1280px;height:780px;border:0;transform:scale(.18);transform-origin:0 0;pointer-events:none}
+.dsgexcard .bd2{padding:9px 11px;display:flex;flex-direction:column;gap:4px;flex:1}
+.dsgexcard .nm{font-size:12.5px;font-weight:600;line-height:1.25;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.dsgexcard .ds{font-size:10.5px;color:var(--faint);line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.dsgexcard .ac{display:flex;gap:6px;padding:0 11px 10px}
+.dsgfilt{display:flex;gap:5px;flex-wrap:wrap;padding:0 16px 10px}
+.dsgfilt button{border:1px solid var(--line);background:transparent;color:var(--faint);border-radius:20px;padding:3px 10px;font-size:11px;cursor:pointer}
+.dsgfilt button.on{border-color:var(--iris);color:var(--iris)}
+.dsgchk{border-bottom:1px solid var(--line);padding:10px 12px;font-size:12px}
+.dsgchk .sc{font-size:20px;font-weight:800;line-height:1}
+.dsgchk .it{display:flex;gap:7px;align-items:flex-start;padding:4px 0;font-size:11.5px;line-height:1.4}
+.dsgchk .sv{flex:none;font-size:9.5px;font-weight:700;border-radius:5px;padding:1px 5px;margin-top:1px}
+.dsgchk .P0{background:#ff5d5d22;color:#ff6b6b}.dsgchk .P1{background:#ffb02022;color:#f0a020}.dsgchk .P2{background:#8a93a522;color:var(--faint)}
+`;document.head.appendChild(st);}
+function dsgExFit(){[...document.querySelectorAll('.dsgexthumb')].forEach(t=>{const f=t.querySelector('iframe');if(f&&t.clientWidth)f.style.transform='scale('+(t.clientWidth/1280).toFixed(4)+')';});}
+function dsgReceitaOpts(){const cat=DSG.kitCat||{};const t=DSG.tipo||'landing';const rs=(cat.receitas||{})[t]||[];const pad=(cat.padrao||{})[t]||'';const pn=(rs.find(r=>r.id===pad)||{}).nome||pad;return `<option value=""${!DSG.receita?' selected':''}>Padrão do tipo${pad?' ('+esc(pn)+')':''}</option><option value="none"${DSG.receita==='none'?' selected':''}>Nenhuma — só o prompt</option>`+rs.filter(r=>r.id!==pad).map(r=>`<option value="${esc(r.id)}"${DSG.receita===r.id?' selected':''} title="${esc(r.desc||'')}">${esc(r.nome)}</option>`).join('');}
+function dsgKitPanel(){if(!(DSG.kit&&DSG.kit.ok))return '';const c=DSG.kit.contagem||{};const rx=DSG.remix;return `<div class="dsgkit"><div class="hd">📐 Open Design Agent Kit <span class="bdg">${c.sistemas||0} design systems · ${c.receitas||0} receitas · ${c.exemplos||0} exemplos</span><span style="flex:1"></span><span class="faint" style="font-weight:400;font-size:10.5px">${esc(DSG.kit.versao||'')}</span></div>
+ <div class="dsg2col" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:end">
+  <div class="dsgfield"><label class="dsglbl">Receita (workflow + checklist do tipo)</label><select class="field" id="dsg_receita" onchange="DSG.receita=this.value" ${rx?'disabled title="o remix usa o exemplo como base"':''}>${dsgReceitaOpts()}</select></div>
+  <div class="dsgfield"><label class="dsglbl">Ponto de partida</label>${rx?`<span class="dsgchip">🔁 Remix: <b>${esc(rx.nome)}</b><button onclick="dsgExView('${esc(rx.id)}')" title="ver o exemplo">↗</button><button onclick="DSG.remix=null;dsgRe()" title="remover">✕</button></span>`:`<button type="button" class="field dsgpick" onclick="dsgExOpen()"><span style="font-size:13px">🔁 Remixar um exemplo pronto…</span><span style="flex:none;opacity:.55;font-size:11px">${c.exemplos||0} exemplos ▾</span></button>`}</div>
+ </div>
+ <label style="display:inline-flex;gap:7px;align-items:center;font-size:12px;margin-top:10px;cursor:pointer" title="Injeta no prompt as regras de craft do Open Design: anti-AI-slop, cor, tipografia, acessibilidade, estados… e checa o resultado"><input type="checkbox" id="dsg_craft" ${DSG.craft===false?'':'checked'} onchange="DSG.craft=this.checked"> Aplicar regras de craft (anti-AI-slop, tipografia, cor, acessibilidade) e checar o resultado</label>
+</div>`;}
+function dsgKitBody(){if(!(DSG.kit&&DSG.kit.ok))return {};return {receita:DSG.remix?'':(DSG.receita||''),exemplo:DSG.remix?DSG.remix.id:'',craft:DSG.craft!==false};}
+async function dsgRecomendar(){const p=((document.getElementById('dsg_prompt')||{}).value||'').trim();if(p.length<4){toast('Descreva o design primeiro — a recomendação usa o briefing.','error');return;}try{const r=await P('/design/kit/recomendar',{prompt:p,tipo:DSG.tipo||'landing'});DSG.rec=((await r.json()).sistemas)||[];}catch(e){DSG.rec=[];}dsgGalOpen();}
+function _dsgExFilter(){const q=(DSG.exQ||'').toLowerCase().trim(),m=DSG.exMode||'';const pri=new Set((((DSG.kitCat||{}).receitas||{})[DSG.tipo||'landing']||[]).map(r=>r.id));const rk=e=>pri.has(e.id)?0:(['prototype','deck','template'].includes(e.mode)&&!/^3d|audio|video|sprite|gif/.test(e.id)?1:2);return ((DSG.kitCat||{}).exemplos||[]).slice().sort((a,b)=>rk(a)-rk(b)).filter(e=>(!m||e.mode===m)&&(!q||(e.nome+' '+e.desc+' '+e.id+' '+(e.tags||[]).join(' ')).toLowerCase().includes(q)));}
+function dsgExCards(){const all=_dsgExFilter();const n=DSG.exN||24;const cur=DSG.remix&&DSG.remix.id;if(!all.length)return '<div class="faint" style="padding:24px;text-align:center">Nenhum exemplo encontrado.</div>';return '<div class="dsgexgrid">'+all.slice(0,n).map(e=>`<div class="dsgexcard${cur===e.id?' on':''}"><div class="dsgexthumb"><iframe loading="lazy" sandbox="allow-scripts" src="/design/kit/exemplo/${encodeURIComponent(e.id)}/html" tabindex="-1" aria-hidden="true"></iframe></div><div class="bd2"><div class="nm">${esc(e.nome)}</div><div class="ds">${esc(e.desc||'')}</div><div class="faint" style="font-size:9.5px">${esc(e.mode||'')}${e.scenario?' · '+esc(e.scenario):''} · ${e.kb} KB</div></div><div class="ac"><button class="btn" style="padding:5px 11px;font-size:11.5px;flex:1" onclick="dsgExPick('${esc(e.id)}')">Remixar</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExView('${esc(e.id)}')" title="abrir em tela cheia">↗</button></div></div>`).join('')+'</div>'+(all.length>n?`<div style="text-align:center;margin-top:14px"><button class="btn ghost" onclick="DSG.exN=(DSG.exN||24)+24;dsgExBody()">mostrar mais (${all.length-n})</button></div>`:'');}
+function dsgExBody(){const b=document.getElementById('dsg_exbody');if(b)b.innerHTML=dsgExCards();setTimeout(dsgExFit,0);const f=document.getElementById('dsg_exfilt');if(f)f.innerHTML=dsgExFiltHtml();}
+function dsgExFiltHtml(){const ms={};((DSG.kitCat||{}).exemplos||[]).forEach(e=>{if(e.mode)ms[e.mode]=(ms[e.mode]||0)+1;});const lbl={prototype:'Páginas & apps',deck:'Apresentações',template:'Templates',image:'Imagens',video:'Vídeo',audio:'Áudio','design-system':'Design systems',utility:'Utilitários'};return [['','Todos']].concat(Object.keys(ms).sort((a,b)=>ms[b]-ms[a]).map(k=>[k,(lbl[k]||k)+' ('+ms[k]+')'])).map(x=>`<button class="${(DSG.exMode||'')===x[0]?'on':''}" onclick="DSG.exMode='${x[0]}';DSG.exN=24;dsgExBody()">${esc(x[1])}</button>`).join('');}
+async function dsgExOpen(){dsgKitCss();if(!DSG.kitCat){try{DSG.kitCat=await J('/design/kit');}catch(e){}}DSG.exQ='';DSG.exN=24;if(DSG.exMode==null)DSG.exMode=(DSG.tipo==='deck'?'deck':'');let r=document.getElementById('dsg_exroot');if(!r){r=document.createElement('div');r.id='dsg_exroot';document.body.appendChild(r);}const n=((DSG.kitCat||{}).exemplos||[]).length;r.innerHTML=`<div class="dsgov" onclick="if(event.target===this)dsgExClose()"><div class="dsggalm" style="width:min(1120px,96vw)"><div class="hd"><div style="font-weight:700;font-size:15px;flex:none">Exemplos Open Design</div><input id="dsg_exq" class="field" placeholder="Buscar entre ${n} exemplos (pitch, dashboard, poster, revista…)" style="margin:0;flex:1" oninput="DSG.exQ=this.value;DSG.exN=24;dsgExBody()"><button class="btn ghost" style="padding:6px 11px;flex:none" onclick="dsgExClose()">✕</button></div><div class="faint" style="font-size:11.5px;padding:10px 16px 8px">Escolha um ponto de partida: o Cerne mantém a <b>assinatura visual</b> do exemplo e troca todo o conteúdo pelo seu briefing (e pela sua marca/design system, se escolhidos).</div><div id="dsg_exfilt" class="dsgfilt">${dsgExFiltHtml()}</div><div id="dsg_exbody" class="bd">${dsgExCards()}</div></div></div>`;const i=document.getElementById('dsg_exq');if(i)i.focus();setTimeout(dsgExFit,0);}
+function dsgExClose(){const r=document.getElementById('dsg_exroot');if(r&&r.parentNode)r.parentNode.removeChild(r);}
+function dsgExView(id){window.open('/design/kit/exemplo/'+encodeURIComponent(id)+'/html','_blank','noopener');}
+function dsgExPick(id){const e=((DSG.kitCat||{}).exemplos||[]).find(x=>x.id===id);if(!e)return;const pv=((document.getElementById('dsg_prompt')||{}).value)||'';DSG.remix={id:e.id,nome:e.nome};dsgExClose();if(e.mode==='deck'&&DSG.tipo!=='deck')DSG.tipo='deck';dsgRe();const pt=document.getElementById('dsg_prompt');if(pt){pt.value=pv;pt.placeholder='Descreva o SEU conteúdo (assunto, dados, público) — o layout vem do exemplo «'+e.nome+'»';pt.focus();}toast('Exemplo selecionado — descreva seu conteúdo e clique em Gerar','ok');}
+function dsgChkHtml(d){const c=d&&d.checagem;if(!(DSG.kit&&DSG.kit.ok))return '';if(!c)return `<div class="dsgchk faint">Ainda não checado. <span class="dsglink" onclick="dsgChecar('${d.id}')">Rodar checagem Open Design</span></div>`;const col=c.score>=85?'var(--cyan,#22d3ee)':c.score>=65?'#f0a020':'#ff6b6b';const r=c.resumo||{};const open=DSG.chkOpen;const itens=(c.achados||[]).map(a=>`<div class="it"><span class="sv ${a.sev}">${a.sev}</span><span>${esc(a.msg)}</span></div>`).join('')||'<div class="faint" style="font-size:11.5px">Nenhum problema encontrado. 🎯</div>';const fix=((r.P0||0)+(r.P1||0))>0;return `<div class="dsgchk"><div class="row" style="gap:10px;align-items:center"><span class="sc" style="color:${col}">${c.score}</span><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:11.5px">Checagem Open Design</div><div class="faint" style="font-size:10.5px">${r.P0||0} P0 · ${r.P1||0} P1 · ${r.P2||0} P2</div></div><button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="DSG.chkOpen=!DSG.chkOpen;document.getElementById('dsg_chk').innerHTML=dsgChkHtml(DSG.detail)">${open?'ocultar':'detalhes'}</button>${fix?`<button class="btn" style="padding:3px 9px;font-size:11px" onclick="dsgCorrigir('${d.id}',this)" title="Pede ao modelo para corrigir os achados P0/P1">Corrigir</button>`:''}</div>${open?'<div style="margin-top:8px;max-height:190px;overflow:auto">'+itens+'</div>':''}</div>`;}
+async function dsgChecar(id,btn){const o=btn?btn.textContent:'';if(btn){btn.disabled=true;btn.textContent='⟳…';}try{const r=await P('/design/'+id+'/checar',{});if(!r.ok){toast(await jerr(r),'error');return;}const c=await r.json();if(DSG.detail&&DSG.detail.id===id){DSG.detail.checagem=c;DSG.chkOpen=true;const el=document.getElementById('dsg_chk');if(el)el.innerHTML=dsgChkHtml(DSG.detail);}if(btn)btn.textContent='✓ Checar · '+c.score;toast('Nota '+c.score+' — '+((c.resumo||{}).P0||0)+' P0, '+((c.resumo||{}).P1||0)+' P1','ok');}catch(e){toast('erro: '+e,'error');if(btn)btn.textContent=o;}finally{if(btn)btn.disabled=false;}}
+async function dsgCorrigir(id,btn){if(btn){btn.disabled=true;btn.textContent='⟳ corrigindo… (~40s)';}const lt=toast('Corrigindo os achados da checagem…','load');try{const r=await P('/design/'+id+'/corrigir',{});if(!r.ok){toastKill(lt);toast(await jerr(r),'error');return;}const d=await r.json();DSG.detail=d;DSG.chkOpen=true;const el=dsgRoot();if(el){el.innerHTML=dsgHtml();dsgPreview();}toastKill(lt);toast(d.aviso?d.aviso:('Nota '+(d.antes!=null?d.antes+' → ':'')+((d.checagem||{}).score??'?')),'ok');}catch(e){toastKill(lt);toast('erro: '+e,'error');}finally{if(btn){btn.disabled=false;}}}
 async function dsgSel(id){try{DSG.detail=await J('/design/'+id);}catch(e){return;}const el=dsgRoot();if(el){el.innerHTML=dsgHtml();dsgPreview();}}
 function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'400px':dev==='tablet'?'820px':'100%';
  const chat=(d.historico||[]).map(h=>`<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">${esc(h.texto)}</div>`).join('')||'<div class="faint" style="font-size:12px">Descreva mudanças abaixo — o Cerne reescreve o design e atualiza a prévia ao lado.</div>';
@@ -12040,10 +13395,11 @@ function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'4
    <button class="btn ghost" style="padding:5px 10px;font-size:13px" onclick="dsgBack()" title="voltar">←</button>
    <div style="min-width:0"><div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px">${esc(d.titulo)}</div><div class="faint" style="font-size:10.5px">${esc(d.tipo_nome)}${d.iteracoes?' · '+d.iteracoes+' iterações':''}</div></div>
    <span style="flex:1"></span>
-   <div class="row" style="gap:5px;flex-wrap:wrap;align-items:center"><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgOpen()">↗ Abrir</button>${eb('png','PNG','Imagem fiel (Chromium)')}${eb('pdf','PDF','PDF fiel (Chromium)')}${eb('mp4','MP4','Vídeo walkthrough')}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExport('${d.id}')" title="HTML">HTML</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgPptx('${d.id}',this)" title="PowerPoint">PPTX</button><span style="width:1px;height:18px;background:var(--line);margin:0 2px"></span><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgVar('${d.id}',this)" title="Versão alternativa do zero">${ico('shuffle')}</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgDup('${d.id}')" title="Duplicar">${ico('copy')}</button>${d.marca_id?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgSaveLib('${d.id}',this)" title="Salvar na biblioteca da marca">${ico('check')}</button>`:''}</div>
+   <div class="row" style="gap:5px;flex-wrap:wrap;align-items:center"><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgOpen()">↗ Abrir</button>${eb('png','PNG','Imagem fiel (Chromium)')}${eb('pdf','PDF','PDF fiel (Chromium)')}${eb('mp4','MP4','Vídeo walkthrough')}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExport('${d.id}')" title="HTML">HTML</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgPptx('${d.id}',this)" title="PowerPoint">PPTX</button><span style="width:1px;height:18px;background:var(--line);margin:0 2px"></span>${DSG.kit&&DSG.kit.ok?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgChecar('${d.id}',this)" title="Checagem de qualidade Open Design (anti-AI-slop, tokens, acessibilidade)">✓ Checar${d.checagem?' · '+d.checagem.score:''}</button>`:''}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgVar('${d.id}',this)" title="Versão alternativa do zero">${ico('shuffle')}</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgDup('${d.id}')" title="Duplicar">${ico('copy')}</button>${d.marca_id?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgSaveLib('${d.id}',this)" title="Salvar na biblioteca da marca">${ico('check')}</button>`:''}</div>
   </div>
   <div style="flex:1;display:flex;gap:14px;min-height:0;padding-top:12px">
    <div style="width:330px;display:flex;flex-direction:column;min-height:0;background:var(--panel2);border:1px solid var(--line);border-radius:12px;overflow:hidden">
+    <div id="dsg_chk">${dsgChkHtml(d)}</div>
     <div style="padding:10px 13px;border-bottom:1px solid var(--line);font-size:12px;font-weight:600">💬 Conversa</div>
     <div id="dsg_hist" style="flex:1;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:12px">${chat}</div>
     <div id="dsg_itmsg" class="faint" style="font-size:11px;padding:0 12px"></div>
@@ -12059,12 +13415,12 @@ function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'4
     </div>
    </div>
   </div></div>`;}
-function dsgPreview(){const fr=document.getElementById('dsg_frame');if(fr&&DSG.detail){try{const b=new Blob([DSG.detail.html||''],{type:'text/html'});fr.src=URL.createObjectURL(b);}catch(e){}}}
+function dsgPreview(){const fr=document.getElementById('dsg_frame');if(fr&&DSG.detail){try{const b=new Blob([DSG.detail.html||''],{type:'text/html;charset=utf-8'});fr.src=URL.createObjectURL(b);}catch(e){}}}
 function dsgDev(v){DSG.device=v;dsgRe();dsgPreview();}
 function dsgAccent(id){const col=(document.getElementById('dsg_accent')||{}).value||'#6c8cff';dsgIterar(id,'Troque a COR DE DESTAQUE/acento do design para '+col+' (botões, links, realces), mantendo todo o resto do layout igual.');}
 function dsgBack(){DSG.detail=null;const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
-async function dsgGerar(){const b=document.getElementById('dsg_gerar'),msg=document.getElementById('dsg_msg');const p=(document.getElementById('dsg_prompt').value||'').trim();if(p.length<6){msg.textContent='descreva melhor o que quer.';return;}const tipo=DSG.tipo||'landing';const marca=(document.getElementById('dsg_marca')||{}).value||'';b.disabled=true;msg.textContent='gerando o design… (pode levar ~30-60s)';const capa=(document.getElementById('dsg_capa')||{}).checked;if(capa)msg.textContent='gerando capa por IA + design… (~1 min)';const lt=toast(capa?'Gerando capa + design…':'Gerando o design…','load');try{const r=await P('/design',{prompt:p,tipo:tipo,marca_id:marca,estilo:DSG.estilo||'',capa_ia:capa});if(!r.ok){const em=await jerr(r);msg.textContent='⚠ '+em;toastKill(lt);toast(em,'error');b.disabled=false;return;}DSG.detail=await r.json();if(DSG.detail.aviso)setTimeout(function(){alert(DSG.detail.aviso);},300);await dsgReload();dsgPreview();toastKill(lt);toast('Design gerado','ok');}catch(e){msg.textContent='erro: '+e;toastKill(lt);toast('Erro ao gerar: '+e,'error');b.disabled=false;}}
-async function dsgIterar(id,forced){const inp=document.getElementById('dsg_it'),msg=document.getElementById('dsg_itmsg');const m=((forced!=null?forced:(inp?inp.value:''))||'').trim();if(!m)return;if(forced==null&&inp)inp.value='';if(msg)msg.textContent='⟳ aplicando a mudança… (~30s)';const hist=document.getElementById('dsg_hist');if(hist){hist.innerHTML+='<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">'+esc(m)+'</div>';hist.scrollTop=hist.scrollHeight;}try{const r=await P('/design/'+id+'/iterar',{mensagem:m});if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);return;}DSG.detail=await r.json();dsgPreview();if(msg)msg.textContent='';}catch(e){if(msg)msg.textContent='erro: '+e;}}
+async function dsgGerar(){const b=document.getElementById('dsg_gerar'),msg=document.getElementById('dsg_msg');const p=(document.getElementById('dsg_prompt').value||'').trim();if(p.length<6){msg.textContent='descreva melhor o que quer.';return;}const tipo=DSG.tipo||'landing';const marca=(document.getElementById('dsg_marca')||{}).value||'';b.disabled=true;msg.textContent='gerando o design… (pode levar ~30-60s)';const capa=(document.getElementById('dsg_capa')||{}).checked;if(capa)msg.textContent='gerando capa por IA + design… (~1 min)';const lt=toast(capa?'Gerando capa + design…':'Gerando o design…','load');try{const kb=dsgKitBody();if(kb.exemplo){msg.textContent='remixando o exemplo Open Design… (~40-90s)';}const r=await P('/design',Object.assign({prompt:p,tipo:tipo,marca_id:marca,estilo:DSG.estilo||'',capa_ia:capa},kb));if(!r.ok){const em=await jerr(r);msg.textContent='⚠ '+em;toastKill(lt);toast(em,'error');b.disabled=false;return;}DSG.detail=await r.json();DSG.remix=null;if(DSG.detail.aviso)setTimeout(function(){alert(DSG.detail.aviso);},300);await dsgReload();dsgPreview();toastKill(lt);toast('Design gerado','ok');}catch(e){msg.textContent='erro: '+e;toastKill(lt);toast('Erro ao gerar: '+e,'error');b.disabled=false;}}
+async function dsgIterar(id,forced){const inp=document.getElementById('dsg_it'),msg=document.getElementById('dsg_itmsg');const m=((forced!=null?forced:(inp?inp.value:''))||'').trim();if(!m)return;if(forced==null&&inp)inp.value='';if(msg)msg.textContent='⟳ aplicando a mudança… (~30s)';const hist=document.getElementById('dsg_hist');if(hist){hist.innerHTML+='<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">'+esc(m)+'</div>';hist.scrollTop=hist.scrollHeight;}try{const r=await P('/design/'+id+'/iterar',{mensagem:m});if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);return;}DSG.detail=await r.json();dsgPreview();const ck=document.getElementById('dsg_chk');if(ck)ck.innerHTML=dsgChkHtml(DSG.detail);if(msg)msg.textContent='';}catch(e){if(msg)msg.textContent='erro: '+e;}}
 function dsgOpen(){if(!DSG.detail)return;try{const w=window.open('','_blank');if(w){w.document.open();w.document.write(DSG.detail.html||'');w.document.close();}}catch(e){}}
 function dsgPdf(){if(!DSG.detail)return;try{const w=window.open('','_blank');if(w){w.document.open();w.document.write(DSG.detail.html||'');w.document.close();setTimeout(function(){try{w.focus();w.print();}catch(e){}},700);}}catch(e){}}
 async function dsgRender(id,fmt,btn){const o=btn?btn.textContent:'';if(btn){btn.disabled=true;btn.textContent=fmt==='mp4'?'⟳ vídeo… (~40s)':'⟳…';}try{const r=await P('/design/'+id+'/render/'+fmt,{});if(!r.ok){alert('⚠ '+await jerr(r));return;}const a=((await r.json()).artefatos||[])[0];if(a)agBaixar(a.url,a.nome||('design.'+fmt));}catch(e){alert('erro: '+e);}finally{if(btn){btn.disabled=false;btn.textContent=o;}}}
@@ -12212,7 +13568,7 @@ async function navUnpair(){if(!confirm('Desparear o navegador? A extensão perde
 let AGMCP=new Set(),MCPFCAT='';
 // ---- card por TIPO: mostra quantas CONTAS existem e quantas estão anexadas a este agente ----
 function mcpTypeCard(m){const insts=INSTS.filter(i=>i.tipo===m.id);const anex=insts.filter(i=>AGMCP.has(i.id)).length;
- return `<button type="button" class="mcpcard${anex?' on':''}" data-tipo="${m.id}" data-cat="${escq(m.cat||'Outros')}" data-name="${escq((m.nome+' '+(m.acoes||'')+' '+(m.cat||'')).toLowerCase())}" onclick="mcpTypeOpen('${m.id}')" title="${escq(m.acoes||'')}">${anex?`<span class="mcpbadge">${anex}</span>`:''}<div class="mcphd"><span class="mcpico">${m.icon||'🔌'}</span><span class="mcpnm">${esc(m.nome)}</span></div><div class="mcpdesc">${esc(m.acoes||'ferramenta de ação via MCP')}</div><div class="mcpfoot"><span class="mcptag">${m.tipo==='custom'?'★ custom':esc(m.cat||'Outros')}</span><span class="mcpcred">${insts.length?insts.length+' conta(s)':'configurar'}</span></div></button>`;}
+ return `<button type="button" class="mcpcard${anex?' on':''}" data-tipo="${m.id}" data-cat="${escq(m.cat||'Outros')}" data-name="${escq((m.nome+' '+(m.acoes||'')+' '+(m.cat||'')).toLowerCase())}" onclick="mcpTypeOpen('${m.id}')" title="${escq(m.acoes||'')}">${anex?`<span class="mcpbadge">${anex}</span>`:''}<div class="mcphd"><span class="mcpico">${m.icon||'🔌'}</span><span class="mcpnm">${esc(m.nome)}</span></div><div class="mcpdesc">${esc(m.acoes||'ferramenta de ação via MCP')}</div><div class="mcpfoot"><span class="mcptag">${m.tipo==='custom'?'★ custom':esc(m.cat||'Outros')}</span>${m.nativo?'<span class="mcptag" style="color:var(--cyan)" title="executa no motor do Cerne">⚡ nativo</span>':(m.executa===false?'<span class="mcptag" style="opacity:.7" title="só executa com o runtime NanoClaw ativo">⏸ requer runtime</span>':'')}<span class="mcpcred">${insts.length?insts.length+' conta(s)':'configurar'}</span></div></button>`;}
 function mcpTypeRefresh(){const g=document.getElementById('mcpgrid');if(!g)return;g.innerHTML=Object.values(MCPLIB).map(mcpTypeCard).join('');mcpApplyFilter();}
 function mcpFilter(btn,cat){MCPFCAT=cat;document.querySelectorAll('.mcpfchip').forEach(c=>c.classList.toggle('on',c===btn));mcpApplyFilter();}
 function mcpApplyFilter(){const qi=document.getElementById('mcpq');const q=(qi?qi.value:'').trim().toLowerCase();let shown=0;document.querySelectorAll('.mcpcard').forEach(el=>{const okc=!MCPFCAT||el.dataset.cat===MCPFCAT;const okq=!q||(el.dataset.name||'').indexOf(q)>=0;const vis=okc&&okq;el.style.display=vis?'':'none';if(vis)shown++;});const g=document.getElementById('mcpgrid');if(!g)return;let e=document.getElementById('mcpempty');if(!shown){if(!e){e=document.createElement('div');e.id='mcpempty';e.className='mcpempty';e.textContent='nenhum conector encontrado';g.appendChild(e);}}else if(e){e.remove();}}
@@ -12496,7 +13852,7 @@ async function memDel(id,btn){await fetch('/memoria/'+id,{method:'DELETE'});cons
 async function jobsOpen(){const wrap=document.createElement('div');wrap.innerHTML='<div class="modal" id="modal"><div class="modalbox" style="max-width:660px"><div class="modalh"><b>🗂 Fila de tarefas · execução durável</b><button class="cvbtn" onclick="jobsClose()">✕</button></div><div class="faint" style="font-size:11.5px;margin-bottom:10px">Orquestrações longas rodam em 2º plano — você não fica preso esperando. Marque <b>exigir aprovação</b> para revisar antes de executar (human-in-the-loop). Usa as coleções e o skill selecionados no chat.</div><div class="row" style="gap:8px;margin-bottom:8px"><input class="field" id="job_txt" placeholder="Ex.: elabore um plano de implantação do Cerne para 90 dias" style="flex:1" onkeydown="if(event.key===\'Enter\')jobCreate()"></div><div class="row" style="gap:12px;align-items:center;margin-bottom:12px"><label class="faint" style="font-size:12px;display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="job_apr"> exigir aprovação antes de executar</label><button class="btn" onclick="jobCreate()">Enfileirar ▸</button></div><div class="lstitle" style="margin:0 0 6px">TAREFAS</div><div id="jobs_list" style="max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:7px"><div class="faint" style="font-size:12px">carregando…</div></div></div></div>';document.body.appendChild(wrap.firstChild);await jobsRefresh();WS._jobsTimer=setInterval(jobsRefresh,3000);}
 function jobsClose(){if(WS._jobsTimer){clearInterval(WS._jobsTimer);WS._jobsTimer=null;}closeModal();}
 async function jobsRefresh(){const el=document.getElementById('jobs_list');if(!el){if(WS._jobsTimer){clearInterval(WS._jobsTimer);WS._jobsTimer=null;}return;}let js=[];try{const r=await J('/jobs');js=r.jobs||[];}catch(e){}if(!js.length){el.innerHTML='<div class="faint" style="font-size:12px;padding:6px">Nenhuma tarefa ainda. Enfileire uma acima — ela roda em 2º plano.</div>';return;}el.innerHTML=js.map(jobRow).join('');}
-function jobStatus(s){return {aguardando_aprovacao:['⏳ aguarda aprovação','var(--warn)'],na_fila:['• na fila','var(--dim)'],rodando:['⟳ rodando','var(--iris)'],concluido:['✓ concluído','#39d98a'],erro:['⚠ erro','var(--crit)'],recusado:['✕ recusado','var(--dim)']}[s]||[s,'var(--dim)'];}
+function jobStatus(s){return {aguardando_aprovacao:['⏳ aguarda aprovação','var(--warn)'],na_fila:['• na fila','var(--dim)'],rodando:['⟳ rodando','var(--iris)'],concluido:['✓ concluído','#39d98a'],erro:['⚠ erro','var(--crit)'],recusado:['✕ recusado','var(--dim)'],aprovado:['✓ aprovado','#39d98a']}[s]||[s,'var(--dim)'];}
 function jobRow(j){const st=jobStatus(j.status);const when=new Date((j.atualizado||j.criado)*1000).toLocaleTimeString().slice(0,5);let acts='';if(j.status==='aguardando_aprovacao')acts='<button class="btn" style="padding:4px 10px;font-size:11px" onclick="jobAprovar(\''+j.id+'\')">Aprovar</button><button class="pjdx" onclick="jobRecusar(\''+j.id+'\')">Recusar</button>';else if(j.status==='concluido')acts='<button class="sel" style="padding:4px 10px;font-size:11px" onclick="jobVer(\''+j.id+'\')">Ver resultado ▸</button>';else if(j.status==='rodando')acts='<span class="spin"></span>';return '<div class="poprow" style="justify-content:space-between;align-items:center;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:10px"><div style="min-width:0"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px">'+esc(j.titulo||j.pergunta||'tarefa')+'</div><div style="font-size:11px;color:'+st[1]+'">'+st[0]+' · '+when+(j.erro?(' · '+esc(j.erro)):'')+'</div></div><div style="display:flex;gap:6px;align-items:center">'+acts+'</div></div>';}
 async function jobCreate(){const i=document.getElementById('job_txt');const t=(i.value||'').trim();if(!t)return;const apr=!!(document.getElementById('job_apr')||{}).checked;i.value='';try{await P('/jobs',{message:t,colecoes:WS.colecoes||[],skill_ids:WS.skills||[],aprovacao:apr});}catch(e){}await jobsRefresh();}
 async function jobAprovar(id){try{await P('/jobs/'+id+'/aprovar',{});}catch(e){}await jobsRefresh();}
@@ -12553,9 +13909,67 @@ async function streamLocal(th,msg){const bub=th.querySelector('.bub');bub.innerH
  const sealB='<div class="trace" style="margin-bottom:3px">'+provSeal('local')+'</div>';
  renderAns(bub,ans||'(sem resposta)',sealB+orqB+cacheB+stepsHtml,WS.task||'Resultado');if(meta.fontes)showSources(meta.fontes);}
 function detectIntent(m){m=(m||'').toLowerCase();const gen=/(ger[ea]r?|cri[ea]r?|fa[çc]a|elabor|redij|monte|escrev|desenh|prepar)/;const site=/(site|p[aá]gina|landing|portal|html|web ?site)/;const doc=/(documento|relat[oó]rio|resumo|contrato|memorando|of[ií]cio|minuta|parecer|ata|planilha|carta|proposta|laudo)/;if(gen.test(m)&&site.test(m))return 'site';if(gen.test(m)&&doc.test(m))return 'documento';return 'perguntar';}
-async function wSend(){const inp=document.getElementById("amsg"),msg=inp.value.trim();if(!msg)return;ensureSid();inp.value="";inp.placeholder="Peça algo — Enter envia, Shift+Enter quebra linha…";WS._lastMsg=msg;bubble("u",esc(msg));const th=bubble("a","");const tk=startThink(th,'interpretando pedido');await wRun(msg,th,tk);}
+async function wSend(){const inp=document.getElementById("amsg"),msg=inp.value.trim();if(!msg)return;ensureSid();inp.value="";inp.placeholder="Peça algo — Enter envia, Shift+Enter quebra linha…";WS._lastMsg=msg;bubble("u",esc(msg));const th=bubble("a","");const tk=startThink(th,'interpretando pedido');await lerPastaLocal(msg,th,tk);await wRun(msg,th,tk);}
+// ===== Pasta local citada no chat (Cerne Desktop): pede permissão nativa, lê e anexa; depois oferece gravar =====
+const LOCAL_PATH_RE=/(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\)[^\n<>|?*]*/;
+function tauriInvoke(){try{const T=window.__TAURI__;if(T&&T.core&&T.core.invoke)return T.core.invoke;const I=window.__TAURI_INTERNALS__;if(I&&I.invoke)return I.invoke.bind(I);}catch(e){}return null;}
+function noteBefore(th,html){const n=document.createElement('div');n.className='msg a';n.innerHTML='<span class="who">CERNE DESKTOP</span><div class="bub">'+html+'</div>';th.parentNode.insertBefore(n,th);return n;}
+async function lerPastaLocal(msg,th,tk){const m=(msg||'').match(LOCAL_PATH_RE);if(!m)return;
+ if(!isDesk()){noteBefore(th,'📁 Você citou um caminho do seu computador (<code>'+esc(m[0].trim())+'</code>). Pelo navegador eu não tenho acesso ao seu disco — abra no <b>Cerne Desktop</b> (ele pede sua permissão e lê a pasta) ou anexe os arquivos com 📎.');return;}
+ const inv=tauriInvoke();if(!inv){noteBefore(th,'📁 Para eu ler <code>'+esc(m[0].trim())+'</code>, atualize o Cerne Desktop (ícone na bandeja → <b>Verificar atualização</b>) e reinicie.');return;}
+ relabel(tk,'aguardando sua permissão para ler a pasta');
+ try{const r=await inv('ler_pasta_projeto',{candidato:m[0],consulta:msg.replace(m[0],' ')});relabel(tk,'anexando a pasta à conversa');
+  const fd=new FormData();fd.append('file',new Blob([r.texto],{type:'text/plain'}),'pasta-'+(r.nome||'local').replace(/[^\w.-]+/g,'_')+'.txt');
+  const a=await(await fetch('/anexo?tipo=pasta&sid='+encodeURIComponent(ensureSid()),{method:'POST',body:fd})).json();
+  if(a&&a.id){WS.anexos=WS.anexos||[];WS.anexos.push({id:a.id,nome:a.nome});WS.pastaLocal=r.pasta;const t=curTask();if(t){t.anexos=WS.anexos;t.pastaLocal=r.pasta;saveTasks();}renderAxChips();}
+  noteBefore(th,'📁 Li <b>'+esc(r.pasta)+'</b> com sua permissão — '+r.arquivos_lidos+' arquivo(s) de código/texto de '+r.total_arquivos+(r.truncado?' (parte truncada por tamanho)':'')+'. Anexado só a esta conversa.');relabel(tk,'interpretando pedido');}
+ catch(e){noteBefore(th,'📁 Não li a pasta: '+esc(String(e&&e.message||e)));relabel(tk,'interpretando pedido');}}
+const PROJ_PEND={};
+function arquivosPropostos(ans){const re=/<<<ARQUIVO:\s*([^>\n]+?)\s*>>>\r?\n([\s\S]*?)\r?\n?<<<FIM>>>/g;const out=[];let m;while((m=re.exec(ans||''))){out.push({caminho:m[1].trim(),conteudo:m[2]});}return out;}
+function gravarBar(ans){const arqs=arquivosPropostos(ans);const t=curTask&&curTask();const pasta=(t&&t.pastaLocal)||WS.pastaLocal;if(!arqs.length||!pasta||!isDesk()||!tauriInvoke())return '';const id='gp'+Math.random().toString(36).slice(2,9);PROJ_PEND[id]={pasta:pasta,arquivos:arqs};
+ return '<div class="trace" id="'+id+'" style="margin-top:8px"><button class="btn" onclick="gravarProjeto(\''+id+'\')">💾 Gravar '+arqs.length+' arquivo(s) em '+esc(pasta)+'</button> <span class="faint">'+arqs.map(a=>esc(a.caminho)).join(' · ')+'</span></div>';}
+// ===== Agente de IMPLEMENTAÇÃO: o chat reconhece pedido de dev sobre a pasta e segue sozinho este caminho =====
+function isDevRequest(m){const s=(m||'').toLowerCase();
+ if(isAplicarRequest(s))return false;
+ if(/^\s*(analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|qual|quais|como funciona|resum)/.test(s))return false;
+ return /\b(implement\w*|adicion\w*|acrescent\w*|cri[ae]r?|desenvolv[ae]\w*|ajust\w*|corrij\w*|corrig\w*|refator\w*|alter[ae]\w*|modifi\w*|inclu[ai]\w*|remov\w*|integr[ae]\w*|migr[ae]\w*|atualiz\w*|conserte|consert\w*|mude|mudar|troque|trocar|otimiz\w*|escrev\w* (os )?testes?)\b/.test(s)
+   && !/\b(documento|relat[oó]rio|apresenta[cç][aã]o|planilha|pdf|docx|slides?)\b/.test(s);}
+function isAplicarRequest(m){return /\b(aplic\w*|apliqu\w*|pode aplicar|leve|levar|passe|passar|copi\w*)\b[\s\S]{0,60}\b(original|projeto|altera[cç][oõ]es|mudan[cç]as)\b/i.test(m||'');}
+async function devTemDesktop(inv){if(!inv)return false;try{await inv('computador_chat',{op:'ping',args:{}});return true;}catch(e){return false;}}
+async function devFlow(msg,th,tk,pasta){const inv=tauriInvoke();const bub=th.querySelector('.bub');
+ if(!(await devTemDesktop(inv))){relabel(tk,'implementando (proposta em arquivos)');
+  try{const r=await(await P('/dev/propor',{mensagem:msg,session_id:WS.sid,modelo:WS.model||''})).json();stopThink(tk);
+   if(r.error){bub.innerHTML=friendlyErr(r.error);return;}
+   renderAns(bub,(r.resposta||'')+'\n\n_(Para eu aplicar, compilar e testar sozinho na sua máquina, atualize o Cerne Desktop: bandeja → Verificar atualização.)_','<div class="trace">↳ '+esc(r.modelo||'')+' · '+(r.arquivos||0)+' arquivo(s)</div>',WS.task||'Implementação');}
+  catch(e){stopThink(tk);bub.innerHTML=friendlyErr(e);}return;}
+ stopThink(tk);const feitos=[];const t0=Date.now();
+ const pinta=(atual,modelo)=>{bub.innerHTML='<div class="faint" style="margin-bottom:6px">🛠️ Implementando no projeto'+(modelo?' · '+esc(String(modelo).replace('ext-',''))+'':'')+' — passos ao vivo</div><div class="steps">'+feitos.slice(-14).map(p=>'<div class="stp done"><span class="ck">✓</span> '+esc(p)+'</div>').join('')+(atual?'<div class="stp on"><span class="spin"></span> '+esc(atual)+' <span class="faint">· '+Math.round((Date.now()-t0)/1000)+'s</span></div>':'')+'</div>';scrollTh();};
+ let r;try{r=await(await P('/dev/iniciar',{mensagem:msg,session_id:WS.sid,modelo:WS.model||'',pasta:pasta})).json();}catch(e){bub.innerHTML=friendlyErr(e);return;}
+ let modelo=r.modelo||'';
+ while(r&&!r.fim&&r.acao){pinta(r.passo,modelo);let res;
+  try{res=await inv('computador_chat',{op:r.acao.op,args:r.acao});}catch(e){res={erro:String(e&&e.message||e)};}
+  feitos.push(r.passo+(res&&res.erro?' — ⚠️ '+String(res.erro).slice(0,90):(res&&res.codigo!==undefined&&r.acao.op==='rodar'?(' — saída '+res.codigo):'')));
+  try{r=await(await P('/dev/passo',{run:r.run,resultado:res||{}})).json();if(r.modelo)modelo=r.modelo;}catch(e){bub.innerHTML=friendlyErr(e);return;}}
+ if(!r){return;}
+ const t=curTask&&curTask();if(r.copia){WS.devCopia=r.copia;if(t){t.devCopia=r.copia;saveTasks();}}
+ const passosHtml='<details class="stepsx"><summary>↳ '+feitos.length+' passos · '+Math.round((Date.now()-t0)/1000)+'s'+(modelo?' · '+esc(String(modelo).replace('ext-','')):'')+'</summary>'+feitos.map(p=>'<div class="stp done"><span class="ck">✓</span> '+esc(p)+'</div>').join('')+'</details>';
+ bub.innerHTML=mdToHtml(r.resposta||'(sem resposta)')+passosHtml+fbBar();scrollTh();}
+async function devAplicar(th,copia){const bub=th.querySelector('.bub');const inv=tauriInvoke();
+ if(!inv){bub.innerHTML='Só consigo aplicar pelo Cerne Desktop.';return;}
+ bub.innerHTML=thinkHTML('aguardando sua confirmação no computador');
+ try{const r=await inv('computador_chat',{op:'aplicar',args:{copia:copia}});
+  if(r&&r.erro){bub.innerHTML='Não apliquei: '+esc(r.erro);return;}
+  bub.innerHTML='✅ Apliquei no original <b>'+esc(r.original||'')+'</b>: '+((r.gravados||[]).map(x=>'<code>'+esc(x)+'</code>').join(' · ')||'nenhuma diferença')+(r.backup?'<div class="faint" style="margin-top:4px">Originais guardados em '+esc(r.backup)+'</div>':'');}
+ catch(e){bub.innerHTML='Não apliquei: '+esc(String(e&&e.message||e));}}
+async function gravarProjeto(id){const p=PROJ_PEND[id];const el=document.getElementById(id);if(!p||!el)return;const inv=tauriInvoke();
+ try{const r=await inv('gravar_arquivos_projeto',{pasta:p.pasta,arquivos:p.arquivos});el.innerHTML='✅ Gravado: '+r.gravados.map(esc).join(' · ')+(r.backup?' <span class="faint">· originais em '+esc(r.backup)+'</span>':'');}
+ catch(e){el.insertAdjacentHTML('beforeend',' <span style="color:var(--crit)">'+esc(String(e&&e.message||e))+'</span>');}}
 async function wRun(msg,th,tk){
  if(/^\s*(lembr|guard[ae]|anot[ae]|memoriz)/i.test(msg)){try{await P('/memoria',{texto:msg});}catch(e){}const s=stopThink(tk);th.querySelector('.bub').innerHTML='🧠 <b>Anotado na memória.</b> Vou lembrar disso nas próximas conversas. <span class="faint">Gerencie em 🧠 Memória.</span><div class="trace">↳ memória · '+s+'s</div>';return;}
+ // pedido de DESENVOLVIMENTO sobre a pasta do projeto → agente de implementação (decisão do próprio chat, sem botão)
+ {const _t=curTask&&curTask();const _pasta=(_t&&_t.pastaLocal)||WS.pastaLocal;const _cop=(_t&&_t.devCopia)||WS.devCopia;
+  if(_cop&&isAplicarRequest(msg)){stopThink(tk);await devAplicar(th,_cop);return;}
+  if(_pasta&&isDevRequest(msg)){await devFlow(msg,th,tk,_pasta);return;}}
  if(WS.orquestrar){stopThink(tk);await streamLocal(th,msg);return;}
  if(isCodeRequest(msg)){await codeFlow(msg,th,tk);return;}
  let intent='perguntar',texto='',opcoes=[];try{const ir=await(await P('/interpretar',{mensagem:msg,colecoes:WS.colecoes,sem_opcoes:!!WS._skipChoice,session_id:WS.sid})).json();intent=ir.intent||'perguntar';texto=ir.texto||'';opcoes=ir.opcoes||[];}catch(e){intent=detectIntent(msg);}
@@ -12571,11 +13985,11 @@ function showSources(fs){const el=document.getElementById("cvSources");if(!el)re
 // Decide se a resposta é um DOCUMENTO longo (plano/relatório) — melhor lido na Prévia — ou conversa curta (chat).
 /* ---- Modo agente: plano -> aprovação -> execução (só gasta o modelo após o OK) ---- */
 let _PLANS={};
-async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
+async function wPlanGate(msg,intent,th,tk){relabel(tk,'montando o plano');let p={};try{p=await(await P('/plano',{mensagem:msg,tipo:intent,colecoes:WS.colecoes,session_id:WS.sid,modelo:WS.model||''})).json();}catch(e){}stopThink(tk);const passos=(p&&p.passos)||[];const bub=th.querySelector('.bub');if(!passos.length){await wGerarExec({msg:msg,intent:intent,externo:!!(p&&p.externo),provider:(p&&p.provider)||''},bub);return;}const k='p'+Date.now().toString(36)+Math.floor(Math.random()*1e4);_PLANS[k]={msg:msg,intent:intent,externo:!!p.externo,provider:p.provider||''};const seal=p.externo?('<span class="prov prov-ext" title="Vai usar um provedor externo, com a PII mascarada antes de sair.">'+ico('globe')+'Externo'+(p.provider?' · '+esc(p.provider):'')+'</span>'):('<span class="prov prov-sov" title="Vai rodar no seu próprio servidor — nenhum dado sai da máquina.">'+ico('shieldc')+'Soberano · local</span>');bub.innerHTML='<div class="plan"><div class="plan-h">'+ico('list')+'<b>Plano proposto</b>'+seal+'</div>'+(p.resumo?'<div class="plan-r">'+esc(p.resumo)+'</div>':'')+'<ol class="plan-steps">'+passos.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ol><div class="plan-act"><button class="btn" onclick="wPlanRun(\''+k+'\',this)">'+ico('check')+' Aprovar e executar</button><button class="btn ghost" onclick="wPlanEdit(\''+k+'\')">'+ico('pen')+' Ajustar</button><button class="btn ghost" onclick="wPlanCancel(\''+k+'\',this)">Cancelar</button></div><div class="faint" style="font-size:11px;margin-top:8px">Nada foi gerado ainda — o Cerne só gasta o modelo depois do seu OK.</div></div>';scrollTh();}
 function wPlanRun(k,btn){const it=_PLANS[k];if(!it)return;delete _PLANS[k];const bub=btn.closest('.bub');wGerarExec(it,bub);}
 function wPlanEdit(k){const it=_PLANS[k];if(!it)return;const inp=document.getElementById('amsg');if(inp){inp.value=it.msg;inp.focus();}try{toast('Ajuste o pedido e envie de novo.','info');}catch(e){}}
 function wPlanCancel(k,btn){delete _PLANS[k];const bub=btn.closest('.bub');if(bub)bub.innerHTML='<span class="faint">Plano cancelado — nada foi gerado.</span>';}
-async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.<div class="trace" style="margin-top:5px">'+provSeal(it.externo?'ext':'local',{model:it.provider})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
+async function wGerarExec(it,bub){const t0=Date.now();bub.innerHTML=thinkHTML('gerando '+(it.intent==='site'?'site':'documento'));try{const r=await(await P('/gerar',{tipo:it.intent,instrucao:it.msg,colecoes:WS.colecoes,session_id:WS.sid,modelo:WS.model||''})).json();const s=Math.round((Date.now()-t0)/1000);if(r.error){bub.textContent='erro: '+esc(r.error);return;}const tok=r.tokens?(r.tokens+' tokens · '):'';const ext=(r.externo!==undefined)?r.externo:it.externo;const pn=(r.provedor_nome!==undefined)?r.provedor_nome:it.provider;bub.innerHTML='Pronto — gerei o '+(it.intent==='site'?'site':'documento')+' <span class="faint">('+tok+s+'s)</span>. Veja a prévia ao lado → revise e peça ajustes.'+(r.escolhido_falhou?'<div class="faint" style="margin-top:4px">⚠️ o modelo escolhido falhou (limite/erro do provedor) — usei '+esc(pn||'o modelo local')+'.</div>':'')+'<div class="trace" style="margin-top:5px">'+provSeal(ext?'ext':'local',{model:pn})+'</div>';showArtifact(it.intent,r.conteudo);showSources((r.fontes||[]).map(function(s2){return {source:s2,trecho:'',score:''};}));}catch(e){bub.innerHTML=friendlyErr(e);}}
 let _DOCS={};
 function isLongDoc(t){t=t||'';if(t.length<1400)return false;
  const heads=(t.match(/^#{1,4}\s+\S/gm)||[]).length;
@@ -12591,7 +14005,7 @@ function longDocBubble(bub,ans,traceHtml){const k='d'+Date.now().toString(36)+Ma
    +'<div class="row" style="gap:7px;margin:9px 0 0"><button class="sel" onclick="cvOpen();cvTab(\'prev\')">▢ Abrir prévia</button><button class="sel" onclick="docExpand(\''+k+'\',this)">▾ ler no chat</button></div>'
    +traceHtml+fbBar();}
 function docExpand(k,btn){const ans=_DOCS[k];if(!ans)return;const bub=btn.closest('.bub');const tr=bub.querySelector('.trace');const trh=tr?tr.outerHTML:'';bub.innerHTML=mdToHtml(ans)+trh+fbBar();scrollTh();}
-function renderAns(bub,ans,traceHtml,title){ans=ans||'(sem resposta)';if(isLongDoc(ans)){answerDoc(ans,title);longDocBubble(bub,ans,traceHtml);}else{bub.innerHTML=mdToHtml(ans)+traceHtml+fbBar();}scrollTh();}
+function renderAns(bub,ans,traceHtml,title){ans=ans||'(sem resposta)';if(isLongDoc(ans)){answerDoc(ans,title);longDocBubble(bub,ans,traceHtml);}else{bub.innerHTML=mdToHtml(ans)+traceHtml+fbBar();}const gb=gravarBar(ans);if(gb)bub.insertAdjacentHTML('beforeend',gb);scrollTh();}
 function mdInline(s){
  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
  s=s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
@@ -12622,7 +14036,7 @@ let LAST={ext:'md',content:''};
 function showArtifact(kind,content){cvOpen();cvTab('prev');LAST={ext:kind==="site"?"html":"md",content:content};document.getElementById("cvTitle").innerHTML=kind==="site"?"◐ Site gerado":"▤ Documento gerado";const el=document.getElementById("cvPreview");
  if(kind==="site"){el.innerHTML=`<iframe class="iframe" sandbox="allow-same-origin"></iframe>`;const f=el.querySelector('iframe');f.srcdoc=content;}else{el.innerHTML=`<div class="paper">${mdToHtml(content)}</div>`;}}
 function showActionResult(fmt,content){cvOpen();cvTab('prev');LAST={ext:fmt==='json'?'json':'md',content:content};document.getElementById('cvTitle').innerHTML='▤ Resultado';const el=document.getElementById('cvPreview');if(fmt==='json'){el.innerHTML='<div class="paper"><pre style="white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:#111826;margin:0">'+esc(content)+'</pre></div>';}else{el.innerHTML='<div class="paper">'+mdToHtml(content)+'</div>';}}
-function isCodeRequest(m){if(/```|(^|\n)\s*(def |class |import |function |const |let |#include)/.test(m))return true;const s=(m||'').toLowerCase();const verbo=/(cri[ae]|ger[ae]|monte|montar|escrev|fa[çc]a|implement|desenvolv|corrig|ajust|melhor|refator|otimiz|conserta|debug|revis)/;const alvo=/(c[oó]digo|script|programa|fun[çc][aã]o|classe|\bapi\b|\bbot\b|scraper|crawler|automa|playwright|selenium|puppeteer|python|javascript|typescript|\bnode\b|\bsql\b|regex|\bhtml\b|\bcss\b|\bcli\b|endpoint|comando)/;return verbo.test(s)&&alvo.test(s);}
+function isCodeRequest(m){if(/```|(^|\n)\s*(def |class |import |function |const |let |#include)/.test(m))return true;const s=(m||'').toLowerCase();if(/(analis|explique|explica|me (fale|diga|conte)|o que (é|e|faz)|entend|descrev|resum|arquitetura|avalie)/.test(s)&&!/^\s*(cri[ae]|ger[ae]|escrev|implement|corrij|corrig|refator|fa[çc]a)/.test(s))return false;const verbo=/(cri[ae]|ger[ae]|monte|montar|escrev|fa[çc]a|implement|desenvolv|corrig|corrij|ajust|melhor|refator|otimiz|conserta|debug|revis)/;const alvo=/(c[oó]digo|script|programa|fun[çc][aã]o|classe|\bapi\b|\bbot\b|scraper|crawler|automa|playwright|selenium|puppeteer|python|javascript|typescript|\bnode\b|\bsql\b|regex|\bhtml\b|\bcss\b|\bcli\b|endpoint|comando)/;return verbo.test(s)&&alvo.test(s);}
 const CODE_EXT={python:'py',py:'py',javascript:'js',js:'js',typescript:'ts',ts:'ts',bash:'sh',sh:'sh',shell:'sh',sql:'sql',html:'html',css:'css',json:'json',java:'java',go:'go',rust:'rs',c:'c','c++':'cpp',cpp:'cpp',ruby:'rb',php:'php',yaml:'yaml'};
 function codeHtml(code,lang){return '<div class="codewrap"><div class="codehead"><span>'+esc(lang||'code')+'</span><button class="codecopy" onclick="copyCode(this)">copiar</button></div><pre class="codeblk"><code>'+esc(code||'')+'</code></pre></div>';}
 function copyCode(b){const c=b.closest('.codewrap').querySelector('code');try{navigator.clipboard.writeText(c.textContent);}catch(e){}b.textContent='copiado ✓';setTimeout(()=>{b.textContent='copiar';},1500);}
@@ -12636,7 +14050,7 @@ function showCode(d){cvOpen();cvTab('prev');const lang=(d.linguagem||'python').t
  }else{LAST={ext:(CODE_EXT[lang]||'txt'),content:(d.codigo||'')};document.getElementById('cvTitle').innerHTML='💻 Código gerado';
   el.innerHTML='<div class="codepane">'+(d.explicacao?('<div class="codemsg codeexpl"><b>ℹ Sobre este código</b><div>'+esc(d.explicacao)+'</div></div>'):'')+codeHtml(d.codigo||'',lang)+'</div>';}}
 async function codeFlow(msg,th,tk){relabel(tk,'escrevendo o código');
- try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes})).json();const s=stopThink(tk);
+ try{const r=await(await P('/codigo',{instrucao:msg,colecoes:WS.colecoes,sid:WS.sid||'',modelo:WS.model||''})).json();const s=stopThink(tk);
   if(r.error){th.querySelector('.bub').innerHTML=friendlyErr(r.error);return;}
   if(r.modo==='sem_codigo'){th.querySelector('.bub').innerHTML=esc(r.mensagem||'O modelo não retornou código para este pedido.').replace(/\n/g,'<br>')+'<div class="trace">↳ '+esc(r.modelo||'')+' · não gerou código · '+s+'s</div>';return;}
   showCode(r);const mod=r.modo==='ajuste'?'Analisei e ajustei o código':'Gerei o código';

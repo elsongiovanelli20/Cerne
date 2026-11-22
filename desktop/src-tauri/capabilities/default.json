@@ -2,7 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Permissões do Cerne Desktop (janela principal + ingestão + agente + navegador).",
-  "windows": ["main", "ingest", "agente", "navegador"],
+  "windows": [
+    "ingest",
+    "agente",
+    "navegador"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -11,6 +15,20 @@
     "core:window:allow-close",
     "core:event:default",
     "dialog:default",
-    "shell:allow-open"
+    "shell:allow-open",
+    "allow-conectar",
+    "allow-escolher-pasta",
+    "allow-ingerir-pasta",
+    "allow-listar-dir",
+    "allow-ler-arquivo",
+    "allow-escrever-arquivo",
+    "allow-abrir-caminho",
+    "allow-rodar-comando",
+    "allow-digitar-texto",
+    "allow-pressionar-tecla",
+    "allow-verificar-atualizacao",
+    "allow-abrir-navegador",
+    "allow-configurar-navegador",
+    "allow-status-navegador"
   ]
 }
