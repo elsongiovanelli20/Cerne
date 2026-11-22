@@ -34,6 +34,11 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
+try:
+    import odkit  # Open Design Agent Kit — catálogo LOCAL de design systems, receitas, exemplos e craft
+except Exception as _odk_e:  # o Design Studio continua funcionando sem o kit
+    print("[cerne] odkit indisponível:", str(_odk_e)[:120])
+    odkit = None
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:4000")
 GATEWAY_KEY = os.getenv("GATEWAY_KEY", "")
@@ -4809,6 +4814,8 @@ MCP_CATALOGO = {
                     "command": "npx", "args": ["-y", "@modelcontextprotocol/server-excel"], "env": []},
     "desktop":     {"nome": "Desktop · automação (pyautogui)", "cat": "Automação", "icon": "🖥️", "acoes": "controla mouse, teclado e aplicativos do computador — requer o Cerne Desktop (máquina local)",
                     "command": "npx", "args": ["-y", "mcp-pyautogui-server"], "env": []},
+    "opendesign":  {"nome": "Open Design Agent Kit", "cat": "Design", "icon": "🎨", "acoes": "design systems de marca, receitas e exemplos remixáveis do Open Design; gera e checa landing pages, decks, posters e dashboards em HTML",
+                    "command": "npx", "args": ["-y", "@feimacode/open-design-agent-kit-mcp"], "env": []},
 }
 _PERFIL_RANK = {"colaborador": 1, "gestor": 2, "admin": 3}
 
@@ -10313,6 +10320,8 @@ def _design_estilo_txt(estilo):
     """Contrato do estilo/design-system escolhido (abstrato, marca famosa OU customizado) injetado no prompt."""
     if not estilo:
         return ""
+    if estilo.startswith("od:"):
+        return odkit.sistema_contrato(estilo, rico=_design_rico()) if _design_odkit_ok() else ""
     if estilo in _DESIGN_ESTILOS:
         g = (_DESIGN_ESTILOS[estilo] or {}).get("guia")
         return f"\nESTILO VISUAL (aplique): {g}" if g else ""
@@ -10348,19 +10357,54 @@ def _design_html(resp):
     return re.sub(r"^```[a-z]*\n?|\n?```$", "", html.strip())
 
 
-def _design_gerar(prompt, tipo, dna, estilo="", html_atual=None, instrucao=None, capa_url=None):
+def _design_odkit_ok():
+    return bool(odkit is not None and odkit.disponivel())
+
+
+def _design_rico():
+    """True quando há modelo pago configurado (contexto grande) — o kit injeta conteúdo completo;
+    no modelo local soberano (contexto curto) injeta versões resumidas."""
+    return len(_design_cands()) > 1
+
+
+def _design_receita_id(tipo, receita):
+    """receita None/"" → padrão do tipo; "none" → sem receita; senão o id pedido."""
+    if not _design_odkit_ok():
+        return ""
+    if receita in (None, ""):
+        return odkit.receita_padrao(tipo)
+    return "" if receita == "none" else receita
+
+
+def _design_gerar(prompt, tipo, dna, estilo="", html_atual=None, instrucao=None, capa_url=None,
+                  receita=None, exemplo="", craft=True):
     tp = _DESIGN_TIPOS.get(tipo) or _DESIGN_TIPOS["landing"]
     ds = _design_sistema(dna)
     ds += _design_estilo_txt(estilo)
     if capa_url:
         ds += (f"\nIMAGEM DE CAPA: use EXATAMENTE este src como hero (em <img> ou background-image cobrindo a área), "
                f"com bom scrim/legibilidade do texto por cima; NÃO invente outras imagens externas. SRC: {capa_url}")
+    rico = _design_rico()
+    sys_p = _DESIGN_SYS
+    rid = _design_receita_id(tipo, receita)
+    kit_ok = _design_odkit_ok()
+    if kit_ok and craft:
+        sys_p += odkit.craft_txt(odkit.craft_ids(rid), rico=rico)
     if html_atual and instrucao:
         user = ("Aqui está o HTML atual do design. Aplique a MUDANÇA pedida e devolva o HTML COMPLETO atualizado.\n\n"
                 "MUDANÇA: " + instrucao + "\n\n" + ds + "\n\nHTML ATUAL:\n" + html_atual[:60000])
+    elif exemplo and kit_ok and odkit.exemplo(exemplo):
+        ref = odkit.exemplo_html(exemplo)
+        user = (f"REMIX de um exemplo Open Design. Crie um(a) {tp['nome']} NOVO a partir do HTML de referência abaixo: "
+                "preserve a ASSINATURA VISUAL (grid, ritmo, tratamento tipográfico, componentes, micro-interações) e "
+                "SUBSTITUA TODO o conteúdo pelo briefing — textos reais em português do Brasil, nada do conteúdo original. "
+                "Se houver marca/design system abaixo, eles mandam nas cores e fontes.\n\n"
+                f"BRIEFING DO USUÁRIO: {prompt}\n\n{ds}\n\nNOTAS DO EXEMPLO:\n{odkit.exemplo_skill(exemplo, rico=rico)}"
+                f"\n\nHTML DE REFERÊNCIA:\n{ref[:60000 if rico else 14000]}")
     else:
-        user = f"Crie um(a) {tp['nome']}. Especificação: {tp['guia']}\n\nBRIEFING DO USUÁRIO: {prompt}\n\n{ds}"
-    msgs = [{"role": "system", "content": _DESIGN_SYS}, {"role": "user", "content": user}]
+        extra = odkit.receita_txt(rid, rico=rico) if (kit_ok and rid) else ""
+        user = f"Crie um(a) {tp['nome']}. Especificação: {tp['guia']}\n\nBRIEFING DO USUÁRIO: {prompt}\n\n{ds}{extra}"
+    msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": user}]
     resp = ""
     for mdl in _design_cands():                           # tenta os pagos em ordem e cai no local soberano
         try:
@@ -10384,7 +10428,9 @@ def _design_pub(d, full=False):
     base = {"id": d["id"], "titulo": d.get("titulo") or "(sem título)", "tipo": d.get("tipo"),
             "tipo_nome": (_DESIGN_TIPOS.get(d.get("tipo")) or {}).get("nome", d.get("tipo")),
             "marca_id": d.get("marca_id") or "", "estilo": d.get("estilo") or "",
-            "criado": d.get("criado"), "iteracoes": len(d.get("historico") or [])}
+            "criado": d.get("criado"), "iteracoes": len(d.get("historico") or []),
+            "receita": d.get("receita") or "", "exemplo": d.get("exemplo") or "",
+            "checagem": d.get("checagem") or None}
     if full:
         base.update({"html": d.get("html") or "", "prompt": d.get("prompt") or "", "historico": d.get("historico") or []})
     return base
@@ -10397,6 +10443,9 @@ class DesignReq(BaseModel):
     marca_id: str = ""
     estilo: str = ""
     capa_ia: bool = False        # gera uma imagem de capa/hero por IA e embute no design
+    receita: str = ""            # Open Design: id da receita ("" = padrão do tipo, "none" = sem receita)
+    exemplo: str = ""            # Open Design: id do exemplo a REMIXAR (vazio = do zero)
+    craft: bool = True           # Open Design: injeta as regras de craft (anti-AI-slop, cor, tipografia, a11y…)
 
 
 class DesignIterarReq(BaseModel):
@@ -10410,7 +10459,18 @@ def design_list():
             "estilos": [{"id": k, "nome": v["nome"], "paleta": v.get("paleta", []), "fontes": v.get("fontes", []), "dark": v.get("dark", False)} for k, v in _DESIGN_ESTILOS.items()],
             "sistemas": [{"id": k, "nome": v["nome"], "categoria": v.get("categoria", ""), "paleta": v.get("paleta", []), "fontes": v.get("fontes", []), "custom": False} for k, v in _DESIGN_SYSTEMS.items()]
                        + [{"id": x["id"], "nome": x["nome"], "categoria": x.get("categoria", "Meus"), "paleta": x.get("paleta", []), "fontes": x.get("fontes", []), "custom": True} for x in _design_sistemas_custom()],
-            "templates": _DESIGN_TEMPLATES}
+            "templates": _DESIGN_TEMPLATES} | _design_kit_lista()
+
+
+def _design_kit_lista():
+    """Acrescenta ao GET /design os design systems do Open Design Agent Kit (e esconde os legados duplicados)."""
+    if not _design_odkit_ok():
+        return {"kit": {"ok": False}}
+    od = odkit.sistemas()
+    return {"kit": odkit.info(),
+            "sistemas_od": [{"id": x["id"], "nome": x["nome"], "categoria": x["categoria"], "paleta": x["paleta"],
+                             "fontes": x["fontes"], "dark": x["dark"], "blurb": x["blurb"], "kind": x["kind"],
+                             "od": True, "custom": False} for x in od]}
 
 
 class SistemaReq(BaseModel):
@@ -10454,6 +10514,91 @@ def design_sistema_del(sid: str):
     return {"ok": True}
 
 
+# ---- Open Design Agent Kit: catálogo, remix, recomendação e checagem de qualidade ----
+def _design_checagem(d):
+    r = odkit.checar(d.get("html") or "", sistema_id=(d.get("estilo") or "") if str(d.get("estilo") or "").startswith("od:") else "", tipo=d.get("tipo") or "")
+    return {"score": r["score"], "resumo": r["resumo"], "achados": r["achados"][:30], "quando": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+class KitRecReq(BaseModel):
+    prompt: str = ""
+    tipo: str = ""
+
+
+@app.get("/design/kit")
+def design_kit(tipo: str = "", q: str = ""):
+    """Catálogo do Open Design Agent Kit: exemplos remixáveis + receitas por tipo de design."""
+    if not _design_odkit_ok():
+        return {"kit": {"ok": False, "erro": "conteúdo do Open Design Agent Kit não encontrado (ODKIT_DIR)"}, "exemplos": [], "receitas": {}}
+    return {"kit": odkit.info(),
+            "exemplos": [{k: e[k] for k in ("id", "nome", "desc", "mode", "surface", "scenario", "tags", "prompt", "kb")}
+                         for e in odkit.exemplos(q=q, tipo=tipo)],
+            "receitas": {t: [{"id": r["id"], "nome": r["nome"], "desc": r["desc"]} for r in odkit.receitas(t)] for t in _DESIGN_TIPOS},
+            "padrao": {t: odkit.receita_padrao(t) for t in _DESIGN_TIPOS}}
+
+
+@app.get("/design/kit/exemplo/{eid}/html")
+def design_kit_exemplo_html(eid: str):
+    """HTML do exemplo (para a prévia da galeria). Servido com CSP sandbox — roda isolado mesmo se aberto direto."""
+    if not _design_odkit_ok() or not odkit.exemplo(eid):
+        raise HTTPException(status_code=404, detail="exemplo não encontrado")
+    return HTMLResponse(odkit.exemplo_html(eid), headers={"Content-Security-Policy": "sandbox allow-scripts",
+                                                          "Cache-Control": "private, max-age=3600"})
+
+
+@app.post("/design/kit/recomendar")
+def design_kit_recomendar(body: KitRecReq):
+    """Sugere 5 design systems do kit para o briefing (setor, tom, superfície, claro/escuro, marca citada)."""
+    if not _design_odkit_ok():
+        return {"sistemas": []}
+    return {"sistemas": odkit.recomendar(body.prompt, body.tipo, n=5)}
+
+
+@app.post("/design/kit/recarregar")
+def design_kit_recarregar():
+    _assert_admin_sessao()
+    if odkit is None:
+        raise HTTPException(status_code=503, detail="módulo odkit ausente")
+    odkit.recarregar()
+    return odkit.info()
+
+
+@app.post("/design/{did}/checar")
+def design_checar(did: str):
+    """Checagem de qualidade Open Design (anti-AI-slop, tokens, acessibilidade, responsivo) — determinística, local."""
+    d = _design_por_id(did)
+    if not d:
+        raise HTTPException(status_code=404, detail="design não encontrado")
+    if not _design_odkit_ok():
+        raise HTTPException(status_code=503, detail="Open Design Agent Kit não instalado")
+    d["checagem"] = _design_checagem(d)
+    _appstate_save(APPSTATE)
+    return d["checagem"]
+
+
+@app.post("/design/{did}/corrigir")
+def design_corrigir(did: str):
+    """Roda a checagem e pede ao modelo para corrigir os achados P0/P1; devolve o design atualizado + nova nota."""
+    _assert_admin_sessao()
+    d = _design_por_id(did)
+    if not d:
+        raise HTTPException(status_code=404, detail="design não encontrado")
+    if not _design_odkit_ok():
+        raise HTTPException(status_code=503, detail="Open Design Agent Kit não instalado")
+    antes = _design_checagem(d)
+    instr = odkit.instrucao_correcao(antes)
+    if not instr:
+        d["checagem"] = antes
+        return {**_design_pub(d, full=True), "aviso": "nada a corrigir — a checagem não encontrou problemas."}
+    out = design_iterar(did, DesignIterarReq(mensagem=instr))
+    if d.get("historico"):
+        d["historico"][-1]["texto"] = f"🛠 Corrigir os achados da checagem Open Design (nota {antes['score']}: {antes['resumo']['P0']} P0, {antes['resumo']['P1']} P1)"
+        _appstate_save(APPSTATE)
+        out = _design_pub(d, full=True)
+    _event("design corrigido (Open Design)", f"{d.get('titulo') or ''} · {antes['score']}→{(d.get('checagem') or {}).get('score')}", actor=_actor())
+    return {**out, "antes": antes["score"]}
+
+
 @app.get("/design/asset/{nome}")
 def design_asset(nome: str):
     """Imagem de capa gerada por IA — PÚBLICA (o preview em iframe/blob e o HTML exportado precisam carregá-la)."""
@@ -10489,7 +10634,8 @@ def design_criar(body: DesignReq):
         if not capa_url:
             aviso = "capa por IA indisponível (" + (cerr or "sem provedor de imagem") + ") — gerei sem imagem."
     try:
-        html = _design_gerar(body.prompt, body.tipo, dna, estilo=body.estilo, capa_url=capa_url)
+        html = _design_gerar(body.prompt, body.tipo, dna, estilo=body.estilo, capa_url=capa_url,
+                             receita=body.receita, exemplo=body.exemplo, craft=body.craft)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao gerar: {str(e)[:160]}")
     if "<" not in html:
@@ -10498,7 +10644,10 @@ def design_criar(body: DesignReq):
     d = {"id": did, "org": _tenant(), "criado": time.strftime("%Y-%m-%dT%H:%M:%S"),
          "titulo": (body.titulo or body.prompt[:60]), "tipo": body.tipo, "marca_id": body.marca_id or "",
          "estilo": body.estilo or "", "prompt": body.prompt, "html": html[:400000], "capa_url": capa_url or "",
-         "historico": [{"papel": "user", "texto": body.prompt}]}
+         "receita": _design_receita_id(body.tipo, body.receita), "exemplo": body.exemplo or "", "craft": body.craft,
+         "historico": [{"papel": "user", "texto": (("[remix: " + body.exemplo + "] ") if body.exemplo else "") + body.prompt}]}
+    if _design_odkit_ok():
+        d["checagem"] = _design_checagem(d)
     APPSTATE.setdefault("designs", []).append(d)
     _appstate_save(APPSTATE)
     _event("design gerado", f"{(_DESIGN_TIPOS.get(body.tipo) or {}).get('nome', body.tipo)} · {str(d['titulo'])[:40]}", actor=_actor())
@@ -10520,11 +10669,14 @@ def design_iterar(did: str, body: DesignIterarReq):
         if mm:
             dna = _marca_pub(mm)["dna"]
     try:
-        html = _design_gerar(d.get("prompt"), d.get("tipo"), dna, estilo=d.get("estilo", ""), html_atual=d.get("html"), instrucao=msg, capa_url=d.get("capa_url") or None)
+        html = _design_gerar(d.get("prompt"), d.get("tipo"), dna, estilo=d.get("estilo", ""), html_atual=d.get("html"), instrucao=msg,
+                             capa_url=d.get("capa_url") or None, receita=d.get("receita") or "none", craft=d.get("craft", True))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao iterar: {str(e)[:160]}")
     if "<" in html:
         d["html"] = html[:400000]
+        if _design_odkit_ok():
+            d["checagem"] = _design_checagem(d)
     d.setdefault("historico", []).append({"papel": "user", "texto": msg})
     _appstate_save(APPSTATE)
     return _design_pub(d, full=True)
@@ -10691,7 +10843,8 @@ def design_variacao(did: str):
         if mm:
             dna = _marca_pub(mm)["dna"]
     try:
-        html = _design_gerar((d.get("prompt") or "") + " (gere uma variação visual diferente da anterior)", d.get("tipo"), dna, estilo=d.get("estilo", ""))
+        html = _design_gerar((d.get("prompt") or "") + " (gere uma variação visual diferente da anterior)", d.get("tipo"), dna, estilo=d.get("estilo", ""),
+                             receita=d.get("receita") or "none", craft=d.get("craft", True))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"falha ao gerar variação: {str(e)[:160]}")
     if "<" not in html:
@@ -13077,7 +13230,8 @@ function mkPecaSimular(id,i){const g=k=>(document.getElementById(k+i)||{}).value
 /* ===== Design Studio (motor de design estilo Open Design / Claude Design) ===== */
 let DSG={designs:[],tipos:[],marcas:[],detail:null};
 function dsgRoot(){return document.getElementById('dsgmount');}
-V.design=async()=>{try{const d=await J('/design');DSG.designs=d.designs||[];DSG.tipos=d.tipos||[];DSG.estilos=d.estilos||[];DSG.sistemas=d.sistemas||[];DSG.templates=d.templates||[];}catch(e){}try{DSG.marcas=(await J('/marca')).marcas||[];}catch(e){DSG.marcas=[];}return dsgHtml();};
+function dsgSetSys(d){const od=(d&&d.sistemas_od)||[];const odn=new Set(od.map(x=>(x.nome||'').toLowerCase().split(/[ (\/]/)[0]));const leg=((d&&d.sistemas)||[]).filter(x=>x.custom||!odn.has((x.nome||'').toLowerCase().split(/[ (\/]/)[0]));DSG.sistemas=leg.concat(od);if(d&&d.kit)DSG.kit=d.kit;}
+V.design=async()=>{try{const d=await J('/design');DSG.designs=d.designs||[];DSG.tipos=d.tipos||[];DSG.estilos=d.estilos||[];dsgSetSys(d);DSG.templates=d.templates||[];}catch(e){}if(DSG.kit&&DSG.kit.ok&&!DSG.kitCat){try{DSG.kitCat=await J('/design/kit');}catch(e){}}try{DSG.marcas=(await J('/marca')).marcas||[];}catch(e){DSG.marcas=[];}return dsgHtml();};
 function dsgTpl(i){const t=(DSG.templates||[])[i];if(!t)return;DSG.tplSel=i;const pt=document.getElementById('dsg_prompt');if(pt)pt.value=t.prompt;const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
 function dsgIcon(t,sz){sz=sz||30;const A='width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"';const I={landing:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/><rect x="6" y="11" width="12" height="3" rx="1"/><rect x="6" y="16" width="6" height="1.6" rx="0.8"/>',deck:'<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M7 8h4M7 11h7"/>',dashboard:'<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/><path d="M13 17l2-2 2 3"/>',onepager:'<path d="M6 2h9l4 4v16H6z"/><path d="M15 2v4h4"/><path d="M9 12h6M9 15h6M9 18h4"/>',email:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/>',prototype:'<rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M10.5 18.5h3"/>',social:'<rect x="4" y="6" width="12" height="12" rx="2"/><rect x="8" y="9" width="12" height="12" rx="2" fill="var(--panel2)"/><path d="M11 13h6M11 16h4"/>',blog:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M7 8h6M7 11h10M7 14h10M7 17h7"/>',curriculo:'<path d="M6 2h12v20H6z"/><circle cx="10" cy="8" r="2"/><path d="M14 7h3M14 10h3M8 14h9M8 17h9"/>',cardapio:'<path d="M6 2h12v20H6z"/><path d="M9 7h4M9 10h5M9 13h5"/>',convite:'<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12"/><path d="M13.5 10.5l1.5 1.5 3-3"/>'};return '<svg '+A+'>'+(I[t]||I.onepager)+'</svg>';}
 function _dsgLum(hex){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');if(hex.length<6)return .5;const r=parseInt(hex.slice(0,2),16)/255,g=parseInt(hex.slice(2,4),16)/255,b=parseInt(hex.slice(4,6),16)/255;return .299*r+.587*g+.114*b;}
@@ -13086,8 +13240,8 @@ function _dsgFF(fontes){const j=(fontes||[]).join(' ').toLowerCase();if(/mono|co
 function dsgThemeOf(item){if(!item||!item.paleta||!item.paleta.length){const t=_dsgTheme([],false);t.ff=_dsgFF((item&&item.fontes)||[]);return t;}const dark=(typeof item.dark==='boolean')?item.dark:(!item.paleta.some(c=>_dsgLum(c)>.80)&&item.paleta.some(c=>_dsgLum(c)<.16));const t=_dsgTheme(item.paleta,dark);t.ff=_dsgFF(item.fontes||[]);return t;}
 function dsgCurItem(){const id=DSG.estilo||'';if(!id)return {id:'',nome:'Automático (design livre)',paleta:[],fontes:[]};return (DSG.estilos||[]).find(x=>x.id===id)||(DSG.sistemas||[]).find(x=>x.id===id)||{id:'',nome:'Automático',paleta:[]};}
 function dsgPal(){return dsgThemeOf(dsgCurItem());}
-function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:'')}</div></button>`;}
-function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysBrand=sysF.filter(s=>!s.custom);let h='';const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
+function dsgSysCard(item,on){const t=dsgThemeOf(item);const sw=(item.paleta||[]).slice(0,5).map(c=>`<span style="width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('');const fgAc=_dsgLum(t.ac)>.62?'#111':'#fff';return `<button class="dsgsyscard${on?' on':''}" onclick="dsgPickEstilo('${item.id}')" title="${esc(item.nome)}"><div style="background:${t.bg};font-family:${t.ff};padding:11px 12px;height:106px;box-sizing:border-box;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:7px"><div style="font-size:17px;font-weight:800;color:${t.ac};line-height:1.02;overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical">${esc(item.nome)}</div><div style="display:flex;gap:3px;flex:none">${sw}</div></div><div style="font-size:8.5px;color:${t.tx};opacity:.82;line-height:1.4;margin-bottom:auto;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">The quick brown fox jumps over the lazy dog.</div><div style="display:inline-flex;align-self:flex-start;background:${t.ac};color:${fgAc};font-size:8px;font-weight:700;padding:4px 11px;border-radius:5px">Continue →</div></div><div class="ftr"><span class="nm">${esc(item.nome)}</span>${item.custom?'<span class="tag">meu</span>':(item.od?'<span class="tag" title="Open Design Agent Kit — DESIGN.md + tokens">OD</span>':(item.categoria?`<span class="cat">${esc(item.categoria)}</span>`:''))}</div></button>`;}
+function dsgGalGrids(estF,sysF){const cur=DSG.estilo||'';const q=(DSG.galQ||'').trim();const sysCustom=sysF.filter(s=>s.custom),sysOD=sysF.filter(s=>s.od),sysBrand=sysF.filter(s=>!s.custom&&!s.od);let h='';if(DSG.rec&&DSG.rec.length&&!q){h+='<div class="dsgseclbl">✨ Recomendados para o seu briefing <span style="text-transform:none;font-weight:400;letter-spacing:0">— Open Design</span></div><div class="dsggrid">'+DSG.rec.map(r=>{const it=(DSG.sistemas||[]).find(x=>x.id===r.id)||r;return '<div title="'+esc(r.motivo||'')+'">'+dsgSysCard(it,cur===it.id)+'<div class="faint" style="font-size:10.5px;padding:4px 4px 0;line-height:1.35">'+esc(r.motivo||'')+'</div></div>';}).join('')+'</div>';}const auto=`<button class="dsgsyscard${cur===''?' on':''}" onclick="dsgPickEstilo('')"><div style="height:106px;background:linear-gradient(135deg,#1b2230,#12151c);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:#aeb4c2"><div style="font-size:22px">🎲</div><div style="font-size:10px">design livre</div></div><div class="ftr"><span class="nm">Automático</span></div></button>`;const estCards=(!q?[auto]:[]).concat(estF.map(e=>dsgSysCard(e,cur===e.id)));if(estCards.length)h+='<div class="dsgseclbl">🎨 Estilos</div><div class="dsggrid">'+estCards.join('')+'</div>';if(sysCustom.length)h+='<div class="dsgseclbl">⭐ Meus design systems</div><div class="dsggrid">'+sysCustom.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(sysBrand.length)h+='<div class="dsgseclbl">🏷️ Marcas ('+sysBrand.length+')</div><div class="dsggrid">'+sysBrand.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';const odG=sysOD.filter(s=>s.kind!=='brand'),odB=sysOD.filter(s=>s.kind==='brand');if(odG.length)h+='<div class="dsgseclbl">📐 Open Design · estilos ('+odG.length+')</div><div class="dsggrid">'+odG.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(odB.length)h+='<div class="dsgseclbl">📐 Open Design · inspirados em marcas ('+odB.length+')</div><div class="dsggrid">'+odB.map(s=>dsgSysCard(s,cur===s.id)).join('')+'</div>';if(!h)h='<div class="faint" style="padding:24px;text-align:center">Nada encontrado para "'+esc(q)+'".</div>';return h;}
 function _dsgGalFilter(){const q=(DSG.galQ||'').toLowerCase().trim();const match=x=>!q||(x.nome||'').toLowerCase().includes(q)||(x.categoria||'').toLowerCase().includes(q);const estF=(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).filter(match);const sysF=(DSG.sistemas||[]).filter(match);return [estF,sysF];}
 function dsgGalBody(){const f=_dsgGalFilter();const b=document.getElementById('dsg_galbody');if(b)b.innerHTML=dsgGalGrids(f[0],f[1]);}
 function dsgGalModal(){const f=_dsgGalFilter();const n=(DSG.sistemas||[]).length+(DSG.estilos||[]).filter(e=>e.id&&e.paleta&&e.paleta.length).length;return `<div class="dsgov" onclick="if(event.target===this)dsgGalClose()"><div class="dsggalm"><div class="hd"><div style="font-weight:700;font-size:15px;flex:none">Design systems</div><input id="dsg_galq" class="field" placeholder="Buscar entre ${n} por nome ou categoria…" style="margin:0;flex:1" value="${esc(DSG.galQ||'')}" oninput="DSG.galQ=this.value;dsgGalBody()"><button class="btn ghost" style="padding:6px 11px;flex:none" onclick="dsgGalClose()">✕</button></div><div id="dsg_galbody" class="bd">${dsgGalGrids(f[0],f[1])}</div></div></div>`;}
@@ -13108,12 +13262,12 @@ function dsgMock(t,p){const box='height:120px;border-radius:8px;overflow:hidden;
  return `<div style="${box};background:${p.bg};display:flex;flex-direction:column">${hero}<div style="padding:8px 9px;flex:1;overflow:hidden">${rows}</div></div>`;}
 function dsgModels(){const p=dsgPal();const out=[];(DSG.templates||[]).forEach((t,i)=>{if(t.tipo!==DSG.tipo)return;out.push(`<button class="dsgmcard${DSG.tplSel===i?' on':''}" onclick="dsgTpl(${i})" title="${esc(t.nome)}"><div class="mkwrap">${dsgMock(t,p)}</div><div class="mnm">${DSG.tplSel===i?'✓ ':''}${esc(t.nome)}</div></button>`);});if(!out.length)out.push('<div class="faint" style="font-size:12px;padding:14px;grid-column:1/-1">Sem modelos para este tipo — descreva livremente no campo acima.</div>');return out.join('');}
 function dsgRestyle(){const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
-function dsgPickType(id){DSG.tipo=id;DSG.tplSel=null;[...document.querySelectorAll('.dsgtype')].forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')===id));const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
+function dsgPickType(id){DSG.tipo=id;DSG.tplSel=null;DSG.receita='';const rs=document.getElementById('dsg_receita');if(rs)rs.innerHTML=dsgReceitaOpts();[...document.querySelectorAll('.dsgtype')].forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')===id));const g=document.getElementById('dsg_models');if(g)g.innerHTML=dsgModels();}
 async function dsgReload(){try{const d=await J('/design');DSG.designs=d.designs||[];}catch(e){}const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
 function dsgRe(){const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
-async function dsgSistemaCriar(){const b=document.getElementById('dsy_btn'),msg=document.getElementById('dsy_msg');const nome=(document.getElementById('dsy_nome').value||'').trim();if(!nome){if(msg)msg.textContent='dê um nome ao design system.';return;}if(b)b.disabled=true;if(msg)msg.textContent='criando… (se informou URL, extraio o site — ~20s)';const body={nome:nome,blurb:(document.getElementById('dsy_blurb')||{}).value||'',url:(document.getElementById('dsy_url')||{}).value||'',notas:(document.getElementById('dsy_notas')||{}).value||''};try{const r=await P('/design/sistema',body);if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);if(b)b.disabled=false;return;}const s=await r.json();try{DSG.sistemas=(await J('/design')).sistemas||DSG.sistemas;}catch(e){}DSG.estilo=s.id;DSG.showNovoSys=false;dsgRe();}catch(e){if(msg)msg.textContent='erro: '+e;if(b)b.disabled=false;}}
-async function dsgSistemaDel(sid){if(!confirm('Excluir este design system?'))return;await fetch('/design/sistema/'+sid,{method:'DELETE',credentials:'include'});try{DSG.sistemas=(await J('/design')).sistemas||DSG.sistemas;}catch(e){}dsgRe();}
-function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo||'landing';DSG.estilo=DSG.estilo||'';
+async function dsgSistemaCriar(){const b=document.getElementById('dsy_btn'),msg=document.getElementById('dsy_msg');const nome=(document.getElementById('dsy_nome').value||'').trim();if(!nome){if(msg)msg.textContent='dê um nome ao design system.';return;}if(b)b.disabled=true;if(msg)msg.textContent='criando… (se informou URL, extraio o site — ~20s)';const body={nome:nome,blurb:(document.getElementById('dsy_blurb')||{}).value||'',url:(document.getElementById('dsy_url')||{}).value||'',notas:(document.getElementById('dsy_notas')||{}).value||''};try{const r=await P('/design/sistema',body);if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);if(b)b.disabled=false;return;}const s=await r.json();try{dsgSetSys(await J('/design'));}catch(e){}DSG.estilo=s.id;DSG.showNovoSys=false;dsgRe();}catch(e){if(msg)msg.textContent='erro: '+e;if(b)b.disabled=false;}}
+async function dsgSistemaDel(sid){if(!confirm('Excluir este design system?'))return;await fetch('/design/sistema/'+sid,{method:'DELETE',credentials:'include'});try{dsgSetSys(await J('/design'));}catch(e){}dsgRe();}
+function dsgHtml(){dsgKitCss();if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo||'landing';DSG.estilo=DSG.estilo||'';
  const marcaOpts='<option value="">— sem marca (design livre) —</option>'+(DSG.marcas||[]).map(m=>`<option value="${m.id}">${esc((m.dna&&m.dna.nome_marca)||m.site||m.id)}</option>`).join('');
  const list=(DSG.designs||[]).map(dsgCard).join('')||('<div style="grid-column:1/-1">'+emptyState('image','Nenhum design ainda','Descreva o que você quer no campo acima — landing, apresentação, dashboard, e-mail, protótipo… — e o Cerne gera o HTML real com prévia ao vivo, pronto para exportar.')+'</div>');
  return `<style>
@@ -13152,7 +13306,7 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
 @media(max-width:760px){.dsg2col{grid-template-columns:1fr!important}.dsgsplit{grid-template-columns:1fr}.dsgtypes{flex-direction:row;flex-wrap:wrap;max-height:none}.dsgtype{width:auto}}
 </style>
   <div style="max-width:1000px"><h2 style="margin:0 0 4px;font-size:20px">Design Studio</h2>
-  <div class="faint" style="font-size:12.5px;margin-bottom:16px;max-width:74ch">Descreva o que quer e o Cerne gera o design REAL (HTML) com preview ao vivo — landing pages, apresentações, dashboards, one-pagers, e-mails e protótipos. Itere por chat e exporte. Escolha uma marca para virar o design system.</div>
+  <div class="faint" style="font-size:12.5px;margin-bottom:16px;max-width:74ch">Descreva o que quer e o Cerne gera o design REAL (HTML) com preview ao vivo — landing pages, apresentações, dashboards, one-pagers, e-mails e protótipos. Itere por chat e exporte. Escolha uma marca para virar o design system.${DSG.kit&&DSG.kit.ok?' Com o <b>Open Design Agent Kit</b>: design systems com tokens reais, receitas por tipo, exemplos para remixar e checagem anti-AI-slop.':''}</div>
   <div class="panel" style="padding:18px">
    <label class="dsglbl" style="margin-bottom:7px">Descreva seu design</label>
    <textarea class="field" id="dsg_prompt" placeholder="Ex.: uma landing page para um curso de barista, com preços e depoimentos" style="width:100%;box-sizing:border-box;min-height:84px;margin:0 0 16px"></textarea>
@@ -13165,9 +13319,10 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
     </div>
    </div>
    <div class="dsg2col" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
-    <div class="dsgfield"><label class="dsglbl" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Estilo / Design system<span class="dsglink" onclick="DSG.showNovoSys=!DSG.showNovoSys;dsgRe()">＋ criar o meu</span></label><button type="button" class="field dsgpick" id="dsg_estbtn" onclick="dsgGalOpen()" title="Abrir a galeria de design systems — a prévia dos modelos usa a paleta e a fonte escolhidas">${dsgEstBtnInner()}</button></div>
+    <div class="dsgfield"><label class="dsglbl" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Estilo / Design system<span style="display:flex;gap:12px">${DSG.kit&&DSG.kit.ok?'<span class="dsglink" onclick="dsgRecomendar()" title="Sugere design systems do Open Design para o briefing e o tipo">✨ recomendar</span>':''}<span class="dsglink" onclick="DSG.showNovoSys=!DSG.showNovoSys;dsgRe()">＋ criar o meu</span></span></label><button type="button" class="field dsgpick" id="dsg_estbtn" onclick="dsgGalOpen()" title="Abrir a galeria de design systems — a prévia dos modelos usa a paleta e a fonte escolhidas">${dsgEstBtnInner()}</button></div>
     <div class="dsgfield"><label class="dsglbl">Sua marca <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">(opcional)</span></label><select class="field" id="dsg_marca">${marcaOpts}</select></div>
    </div>
+   ${dsgKitPanel()}
    <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px">
     <label class="dsgcapa" title="Gera uma imagem de capa/hero por IA (requer chave de imagem)"><input type="checkbox" id="dsg_capa"> ${ico('image')} Gerar capa/hero por IA</label>
     <div class="row" style="gap:12px;align-items:center"><span id="dsg_msg" class="faint" style="font-size:12px"></span><button class="btn" id="dsg_gerar" onclick="dsgGerar()" style="padding:10px 22px;font-size:14px">${ico('spark')} Gerar design</button></div>
@@ -13183,7 +13338,54 @@ function dsgHtml(){if(DSG.detail)return dsgEditor(DSG.detail);DSG.tipo=DSG.tipo|
    ${(DSG.sistemas||[]).filter(s=>s.custom).length?`<div style="margin-top:12px"><div class="faint" style="font-size:11px;margin-bottom:5px">MEUS DESIGN SYSTEMS</div>${(DSG.sistemas||[]).filter(s=>s.custom).map(s=>`<div class="row" style="gap:8px;align-items:center;padding:3px 0"><b style="font-size:12px;min-width:110px">${esc(s.nome)}</b><span class="mkswatches">${(s.paleta||[]).slice(0,5).map(c=>`<span class="mksw" style="background:${esc(c)}"></span>`).join('')}</span><button class="tbt crit" onclick="dsgSistemaDel('${s.id}')">✕</button></div>`).join('')}</div>`:''}
   </div>`:''}
   <div class="lstitle" style="margin:18px 0 8px">MEUS DESIGNS</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">${list}</div></div>`;}
-function dsgCard(d){return `<div class="panel" style="padding:12px"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.titulo)}</div><div class="faint" style="font-size:11px;margin:3px 0 8px">${esc(d.tipo_nome)} · ${d.iteracoes} iteração(ões)</div><div class="row" style="gap:6px"><button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="dsgSel('${d.id}')">abrir</button><button class="tbt crit" onclick="dsgDel('${d.id}')">✕</button></div></div>`;}
+function dsgCard(d){return `<div class="panel" style="padding:12px"><div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.titulo)}</div><div class="faint" style="font-size:11px;margin:3px 0 8px">${esc(d.tipo_nome)} · ${d.iteracoes} iteração(ões)${d.checagem?` · <span title="nota da checagem Open Design" style="color:${d.checagem.score>=85?'var(--cyan,#22d3ee)':d.checagem.score>=65?'#f0a020':'#ff6b6b'}">✓ ${d.checagem.score}</span>`:''}${d.exemplo?' · remix':''}</div><div class="row" style="gap:6px"><button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="dsgSel('${d.id}')">abrir</button><button class="tbt crit" onclick="dsgDel('${d.id}')">✕</button></div></div>`;}
+/* ---- Open Design Agent Kit: receitas, remix de exemplos, recomendação e checagem ---- */
+function dsgKitCss(){if(document.getElementById('dsgkitcss'))return;const st=document.createElement('style');st.id='dsgkitcss';st.textContent=`.dsgkit{margin-top:14px;padding:12px 14px;border:1px dashed var(--line);border-radius:12px;background:var(--panel2)}
+.dsgkit .hd{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;margin-bottom:10px}
+.dsgkit .hd .bdg{font-size:9.5px;font-weight:600;color:var(--faint);border:1px solid var(--line);border-radius:20px;padding:2px 8px}
+.dsgchip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--iris);border-radius:9px;font-size:12px;color:var(--iris);background:transparent}
+.dsgchip button{border:0;background:none;color:inherit;cursor:pointer;font-size:12px;padding:0}
+.dsgexgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}
+.dsgexcard{border:1px solid var(--line);background:var(--panel2);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;transition:border-color .12s,transform .08s}
+.dsgexcard:hover{border-color:var(--iris);transform:translateY(-2px)}
+.dsgexcard.on{border-color:var(--iris);box-shadow:0 0 0 1px var(--iris) inset}
+.dsgexthumb{position:relative;height:140px;overflow:hidden;background:#fff;border-bottom:1px solid var(--line)}
+.dsgexthumb iframe{position:absolute;top:0;left:0;width:1280px;height:780px;border:0;transform:scale(.18);transform-origin:0 0;pointer-events:none}
+.dsgexcard .bd2{padding:9px 11px;display:flex;flex-direction:column;gap:4px;flex:1}
+.dsgexcard .nm{font-size:12.5px;font-weight:600;line-height:1.25;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.dsgexcard .ds{font-size:10.5px;color:var(--faint);line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.dsgexcard .ac{display:flex;gap:6px;padding:0 11px 10px}
+.dsgfilt{display:flex;gap:5px;flex-wrap:wrap;padding:0 16px 10px}
+.dsgfilt button{border:1px solid var(--line);background:transparent;color:var(--faint);border-radius:20px;padding:3px 10px;font-size:11px;cursor:pointer}
+.dsgfilt button.on{border-color:var(--iris);color:var(--iris)}
+.dsgchk{border-bottom:1px solid var(--line);padding:10px 12px;font-size:12px}
+.dsgchk .sc{font-size:20px;font-weight:800;line-height:1}
+.dsgchk .it{display:flex;gap:7px;align-items:flex-start;padding:4px 0;font-size:11.5px;line-height:1.4}
+.dsgchk .sv{flex:none;font-size:9.5px;font-weight:700;border-radius:5px;padding:1px 5px;margin-top:1px}
+.dsgchk .P0{background:#ff5d5d22;color:#ff6b6b}.dsgchk .P1{background:#ffb02022;color:#f0a020}.dsgchk .P2{background:#8a93a522;color:var(--faint)}
+`;document.head.appendChild(st);}
+function dsgExFit(){[...document.querySelectorAll('.dsgexthumb')].forEach(t=>{const f=t.querySelector('iframe');if(f&&t.clientWidth)f.style.transform='scale('+(t.clientWidth/1280).toFixed(4)+')';});}
+function dsgReceitaOpts(){const cat=DSG.kitCat||{};const t=DSG.tipo||'landing';const rs=(cat.receitas||{})[t]||[];const pad=(cat.padrao||{})[t]||'';const pn=(rs.find(r=>r.id===pad)||{}).nome||pad;return `<option value=""${!DSG.receita?' selected':''}>Padrão do tipo${pad?' ('+esc(pn)+')':''}</option><option value="none"${DSG.receita==='none'?' selected':''}>Nenhuma — só o prompt</option>`+rs.filter(r=>r.id!==pad).map(r=>`<option value="${esc(r.id)}"${DSG.receita===r.id?' selected':''} title="${esc(r.desc||'')}">${esc(r.nome)}</option>`).join('');}
+function dsgKitPanel(){if(!(DSG.kit&&DSG.kit.ok))return '';const c=DSG.kit.contagem||{};const rx=DSG.remix;return `<div class="dsgkit"><div class="hd">📐 Open Design Agent Kit <span class="bdg">${c.sistemas||0} design systems · ${c.receitas||0} receitas · ${c.exemplos||0} exemplos</span><span style="flex:1"></span><span class="faint" style="font-weight:400;font-size:10.5px">${esc(DSG.kit.versao||'')}</span></div>
+ <div class="dsg2col" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:end">
+  <div class="dsgfield"><label class="dsglbl">Receita (workflow + checklist do tipo)</label><select class="field" id="dsg_receita" onchange="DSG.receita=this.value" ${rx?'disabled title="o remix usa o exemplo como base"':''}>${dsgReceitaOpts()}</select></div>
+  <div class="dsgfield"><label class="dsglbl">Ponto de partida</label>${rx?`<span class="dsgchip">🔁 Remix: <b>${esc(rx.nome)}</b><button onclick="dsgExView('${esc(rx.id)}')" title="ver o exemplo">↗</button><button onclick="DSG.remix=null;dsgRe()" title="remover">✕</button></span>`:`<button type="button" class="field dsgpick" onclick="dsgExOpen()"><span style="font-size:13px">🔁 Remixar um exemplo pronto…</span><span style="flex:none;opacity:.55;font-size:11px">${c.exemplos||0} exemplos ▾</span></button>`}</div>
+ </div>
+ <label style="display:inline-flex;gap:7px;align-items:center;font-size:12px;margin-top:10px;cursor:pointer" title="Injeta no prompt as regras de craft do Open Design: anti-AI-slop, cor, tipografia, acessibilidade, estados… e checa o resultado"><input type="checkbox" id="dsg_craft" ${DSG.craft===false?'':'checked'} onchange="DSG.craft=this.checked"> Aplicar regras de craft (anti-AI-slop, tipografia, cor, acessibilidade) e checar o resultado</label>
+</div>`;}
+function dsgKitBody(){if(!(DSG.kit&&DSG.kit.ok))return {};return {receita:DSG.remix?'':(DSG.receita||''),exemplo:DSG.remix?DSG.remix.id:'',craft:DSG.craft!==false};}
+async function dsgRecomendar(){const p=((document.getElementById('dsg_prompt')||{}).value||'').trim();if(p.length<4){toast('Descreva o design primeiro — a recomendação usa o briefing.','error');return;}try{const r=await P('/design/kit/recomendar',{prompt:p,tipo:DSG.tipo||'landing'});DSG.rec=((await r.json()).sistemas)||[];}catch(e){DSG.rec=[];}dsgGalOpen();}
+function _dsgExFilter(){const q=(DSG.exQ||'').toLowerCase().trim(),m=DSG.exMode||'';const pri=new Set((((DSG.kitCat||{}).receitas||{})[DSG.tipo||'landing']||[]).map(r=>r.id));const rk=e=>pri.has(e.id)?0:(['prototype','deck','template'].includes(e.mode)&&!/^3d|audio|video|sprite|gif/.test(e.id)?1:2);return ((DSG.kitCat||{}).exemplos||[]).slice().sort((a,b)=>rk(a)-rk(b)).filter(e=>(!m||e.mode===m)&&(!q||(e.nome+' '+e.desc+' '+e.id+' '+(e.tags||[]).join(' ')).toLowerCase().includes(q)));}
+function dsgExCards(){const all=_dsgExFilter();const n=DSG.exN||24;const cur=DSG.remix&&DSG.remix.id;if(!all.length)return '<div class="faint" style="padding:24px;text-align:center">Nenhum exemplo encontrado.</div>';return '<div class="dsgexgrid">'+all.slice(0,n).map(e=>`<div class="dsgexcard${cur===e.id?' on':''}"><div class="dsgexthumb"><iframe loading="lazy" sandbox="allow-scripts" src="/design/kit/exemplo/${encodeURIComponent(e.id)}/html" tabindex="-1" aria-hidden="true"></iframe></div><div class="bd2"><div class="nm">${esc(e.nome)}</div><div class="ds">${esc(e.desc||'')}</div><div class="faint" style="font-size:9.5px">${esc(e.mode||'')}${e.scenario?' · '+esc(e.scenario):''} · ${e.kb} KB</div></div><div class="ac"><button class="btn" style="padding:5px 11px;font-size:11.5px;flex:1" onclick="dsgExPick('${esc(e.id)}')">Remixar</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExView('${esc(e.id)}')" title="abrir em tela cheia">↗</button></div></div>`).join('')+'</div>'+(all.length>n?`<div style="text-align:center;margin-top:14px"><button class="btn ghost" onclick="DSG.exN=(DSG.exN||24)+24;dsgExBody()">mostrar mais (${all.length-n})</button></div>`:'');}
+function dsgExBody(){const b=document.getElementById('dsg_exbody');if(b)b.innerHTML=dsgExCards();setTimeout(dsgExFit,0);const f=document.getElementById('dsg_exfilt');if(f)f.innerHTML=dsgExFiltHtml();}
+function dsgExFiltHtml(){const ms={};((DSG.kitCat||{}).exemplos||[]).forEach(e=>{if(e.mode)ms[e.mode]=(ms[e.mode]||0)+1;});const lbl={prototype:'Páginas & apps',deck:'Apresentações',template:'Templates',image:'Imagens',video:'Vídeo',audio:'Áudio','design-system':'Design systems',utility:'Utilitários'};return [['','Todos']].concat(Object.keys(ms).sort((a,b)=>ms[b]-ms[a]).map(k=>[k,(lbl[k]||k)+' ('+ms[k]+')'])).map(x=>`<button class="${(DSG.exMode||'')===x[0]?'on':''}" onclick="DSG.exMode='${x[0]}';DSG.exN=24;dsgExBody()">${esc(x[1])}</button>`).join('');}
+async function dsgExOpen(){dsgKitCss();if(!DSG.kitCat){try{DSG.kitCat=await J('/design/kit');}catch(e){}}DSG.exQ='';DSG.exN=24;if(DSG.exMode==null)DSG.exMode=(DSG.tipo==='deck'?'deck':'');let r=document.getElementById('dsg_exroot');if(!r){r=document.createElement('div');r.id='dsg_exroot';document.body.appendChild(r);}const n=((DSG.kitCat||{}).exemplos||[]).length;r.innerHTML=`<div class="dsgov" onclick="if(event.target===this)dsgExClose()"><div class="dsggalm" style="width:min(1120px,96vw)"><div class="hd"><div style="font-weight:700;font-size:15px;flex:none">Exemplos Open Design</div><input id="dsg_exq" class="field" placeholder="Buscar entre ${n} exemplos (pitch, dashboard, poster, revista…)" style="margin:0;flex:1" oninput="DSG.exQ=this.value;DSG.exN=24;dsgExBody()"><button class="btn ghost" style="padding:6px 11px;flex:none" onclick="dsgExClose()">✕</button></div><div class="faint" style="font-size:11.5px;padding:10px 16px 8px">Escolha um ponto de partida: o Cerne mantém a <b>assinatura visual</b> do exemplo e troca todo o conteúdo pelo seu briefing (e pela sua marca/design system, se escolhidos).</div><div id="dsg_exfilt" class="dsgfilt">${dsgExFiltHtml()}</div><div id="dsg_exbody" class="bd">${dsgExCards()}</div></div></div>`;const i=document.getElementById('dsg_exq');if(i)i.focus();setTimeout(dsgExFit,0);}
+function dsgExClose(){const r=document.getElementById('dsg_exroot');if(r&&r.parentNode)r.parentNode.removeChild(r);}
+function dsgExView(id){window.open('/design/kit/exemplo/'+encodeURIComponent(id)+'/html','_blank','noopener');}
+function dsgExPick(id){const e=((DSG.kitCat||{}).exemplos||[]).find(x=>x.id===id);if(!e)return;const pv=((document.getElementById('dsg_prompt')||{}).value)||'';DSG.remix={id:e.id,nome:e.nome};dsgExClose();if(e.mode==='deck'&&DSG.tipo!=='deck')DSG.tipo='deck';dsgRe();const pt=document.getElementById('dsg_prompt');if(pt){pt.value=pv;pt.placeholder='Descreva o SEU conteúdo (assunto, dados, público) — o layout vem do exemplo «'+e.nome+'»';pt.focus();}toast('Exemplo selecionado — descreva seu conteúdo e clique em Gerar','ok');}
+function dsgChkHtml(d){const c=d&&d.checagem;if(!(DSG.kit&&DSG.kit.ok))return '';if(!c)return `<div class="dsgchk faint">Ainda não checado. <span class="dsglink" onclick="dsgChecar('${d.id}')">Rodar checagem Open Design</span></div>`;const col=c.score>=85?'var(--cyan,#22d3ee)':c.score>=65?'#f0a020':'#ff6b6b';const r=c.resumo||{};const open=DSG.chkOpen;const itens=(c.achados||[]).map(a=>`<div class="it"><span class="sv ${a.sev}">${a.sev}</span><span>${esc(a.msg)}</span></div>`).join('')||'<div class="faint" style="font-size:11.5px">Nenhum problema encontrado. 🎯</div>';const fix=((r.P0||0)+(r.P1||0))>0;return `<div class="dsgchk"><div class="row" style="gap:10px;align-items:center"><span class="sc" style="color:${col}">${c.score}</span><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:11.5px">Checagem Open Design</div><div class="faint" style="font-size:10.5px">${r.P0||0} P0 · ${r.P1||0} P1 · ${r.P2||0} P2</div></div><button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="DSG.chkOpen=!DSG.chkOpen;document.getElementById('dsg_chk').innerHTML=dsgChkHtml(DSG.detail)">${open?'ocultar':'detalhes'}</button>${fix?`<button class="btn" style="padding:3px 9px;font-size:11px" onclick="dsgCorrigir('${d.id}',this)" title="Pede ao modelo para corrigir os achados P0/P1">Corrigir</button>`:''}</div>${open?'<div style="margin-top:8px;max-height:190px;overflow:auto">'+itens+'</div>':''}</div>`;}
+async function dsgChecar(id,btn){const o=btn?btn.textContent:'';if(btn){btn.disabled=true;btn.textContent='⟳…';}try{const r=await P('/design/'+id+'/checar',{});if(!r.ok){toast(await jerr(r),'error');return;}const c=await r.json();if(DSG.detail&&DSG.detail.id===id){DSG.detail.checagem=c;DSG.chkOpen=true;const el=document.getElementById('dsg_chk');if(el)el.innerHTML=dsgChkHtml(DSG.detail);}if(btn)btn.textContent='✓ Checar · '+c.score;toast('Nota '+c.score+' — '+((c.resumo||{}).P0||0)+' P0, '+((c.resumo||{}).P1||0)+' P1','ok');}catch(e){toast('erro: '+e,'error');if(btn)btn.textContent=o;}finally{if(btn)btn.disabled=false;}}
+async function dsgCorrigir(id,btn){if(btn){btn.disabled=true;btn.textContent='⟳ corrigindo… (~40s)';}const lt=toast('Corrigindo os achados da checagem…','load');try{const r=await P('/design/'+id+'/corrigir',{});if(!r.ok){toastKill(lt);toast(await jerr(r),'error');return;}const d=await r.json();DSG.detail=d;DSG.chkOpen=true;const el=dsgRoot();if(el){el.innerHTML=dsgHtml();dsgPreview();}toastKill(lt);toast(d.aviso?d.aviso:('Nota '+(d.antes!=null?d.antes+' → ':'')+((d.checagem||{}).score??'?')),'ok');}catch(e){toastKill(lt);toast('erro: '+e,'error');}finally{if(btn){btn.disabled=false;}}}
 async function dsgSel(id){try{DSG.detail=await J('/design/'+id);}catch(e){return;}const el=dsgRoot();if(el){el.innerHTML=dsgHtml();dsgPreview();}}
 function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'400px':dev==='tablet'?'820px':'100%';
  const chat=(d.historico||[]).map(h=>`<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">${esc(h.texto)}</div>`).join('')||'<div class="faint" style="font-size:12px">Descreva mudanças abaixo — o Cerne reescreve o design e atualiza a prévia ao lado.</div>';
@@ -13193,10 +13395,11 @@ function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'4
    <button class="btn ghost" style="padding:5px 10px;font-size:13px" onclick="dsgBack()" title="voltar">←</button>
    <div style="min-width:0"><div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px">${esc(d.titulo)}</div><div class="faint" style="font-size:10.5px">${esc(d.tipo_nome)}${d.iteracoes?' · '+d.iteracoes+' iterações':''}</div></div>
    <span style="flex:1"></span>
-   <div class="row" style="gap:5px;flex-wrap:wrap;align-items:center"><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgOpen()">↗ Abrir</button>${eb('png','PNG','Imagem fiel (Chromium)')}${eb('pdf','PDF','PDF fiel (Chromium)')}${eb('mp4','MP4','Vídeo walkthrough')}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExport('${d.id}')" title="HTML">HTML</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgPptx('${d.id}',this)" title="PowerPoint">PPTX</button><span style="width:1px;height:18px;background:var(--line);margin:0 2px"></span><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgVar('${d.id}',this)" title="Versão alternativa do zero">${ico('shuffle')}</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgDup('${d.id}')" title="Duplicar">${ico('copy')}</button>${d.marca_id?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgSaveLib('${d.id}',this)" title="Salvar na biblioteca da marca">${ico('check')}</button>`:''}</div>
+   <div class="row" style="gap:5px;flex-wrap:wrap;align-items:center"><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgOpen()">↗ Abrir</button>${eb('png','PNG','Imagem fiel (Chromium)')}${eb('pdf','PDF','PDF fiel (Chromium)')}${eb('mp4','MP4','Vídeo walkthrough')}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgExport('${d.id}')" title="HTML">HTML</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgPptx('${d.id}',this)" title="PowerPoint">PPTX</button><span style="width:1px;height:18px;background:var(--line);margin:0 2px"></span>${DSG.kit&&DSG.kit.ok?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgChecar('${d.id}',this)" title="Checagem de qualidade Open Design (anti-AI-slop, tokens, acessibilidade)">✓ Checar${d.checagem?' · '+d.checagem.score:''}</button>`:''}<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgVar('${d.id}',this)" title="Versão alternativa do zero">${ico('shuffle')}</button><button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgDup('${d.id}')" title="Duplicar">${ico('copy')}</button>${d.marca_id?`<button class="btn ghost" style="padding:5px 9px;font-size:11.5px" onclick="dsgSaveLib('${d.id}',this)" title="Salvar na biblioteca da marca">${ico('check')}</button>`:''}</div>
   </div>
   <div style="flex:1;display:flex;gap:14px;min-height:0;padding-top:12px">
    <div style="width:330px;display:flex;flex-direction:column;min-height:0;background:var(--panel2);border:1px solid var(--line);border-radius:12px;overflow:hidden">
+    <div id="dsg_chk">${dsgChkHtml(d)}</div>
     <div style="padding:10px 13px;border-bottom:1px solid var(--line);font-size:12px;font-weight:600">💬 Conversa</div>
     <div id="dsg_hist" style="flex:1;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:12px">${chat}</div>
     <div id="dsg_itmsg" class="faint" style="font-size:11px;padding:0 12px"></div>
@@ -13212,12 +13415,12 @@ function dsgEditor(d){const dev=DSG.device||'desktop';const mw=dev==='mobile'?'4
     </div>
    </div>
   </div></div>`;}
-function dsgPreview(){const fr=document.getElementById('dsg_frame');if(fr&&DSG.detail){try{const b=new Blob([DSG.detail.html||''],{type:'text/html'});fr.src=URL.createObjectURL(b);}catch(e){}}}
+function dsgPreview(){const fr=document.getElementById('dsg_frame');if(fr&&DSG.detail){try{const b=new Blob([DSG.detail.html||''],{type:'text/html;charset=utf-8'});fr.src=URL.createObjectURL(b);}catch(e){}}}
 function dsgDev(v){DSG.device=v;dsgRe();dsgPreview();}
 function dsgAccent(id){const col=(document.getElementById('dsg_accent')||{}).value||'#6c8cff';dsgIterar(id,'Troque a COR DE DESTAQUE/acento do design para '+col+' (botões, links, realces), mantendo todo o resto do layout igual.');}
 function dsgBack(){DSG.detail=null;const el=dsgRoot();if(el)el.innerHTML=dsgHtml();}
-async function dsgGerar(){const b=document.getElementById('dsg_gerar'),msg=document.getElementById('dsg_msg');const p=(document.getElementById('dsg_prompt').value||'').trim();if(p.length<6){msg.textContent='descreva melhor o que quer.';return;}const tipo=DSG.tipo||'landing';const marca=(document.getElementById('dsg_marca')||{}).value||'';b.disabled=true;msg.textContent='gerando o design… (pode levar ~30-60s)';const capa=(document.getElementById('dsg_capa')||{}).checked;if(capa)msg.textContent='gerando capa por IA + design… (~1 min)';const lt=toast(capa?'Gerando capa + design…':'Gerando o design…','load');try{const r=await P('/design',{prompt:p,tipo:tipo,marca_id:marca,estilo:DSG.estilo||'',capa_ia:capa});if(!r.ok){const em=await jerr(r);msg.textContent='⚠ '+em;toastKill(lt);toast(em,'error');b.disabled=false;return;}DSG.detail=await r.json();if(DSG.detail.aviso)setTimeout(function(){alert(DSG.detail.aviso);},300);await dsgReload();dsgPreview();toastKill(lt);toast('Design gerado','ok');}catch(e){msg.textContent='erro: '+e;toastKill(lt);toast('Erro ao gerar: '+e,'error');b.disabled=false;}}
-async function dsgIterar(id,forced){const inp=document.getElementById('dsg_it'),msg=document.getElementById('dsg_itmsg');const m=((forced!=null?forced:(inp?inp.value:''))||'').trim();if(!m)return;if(forced==null&&inp)inp.value='';if(msg)msg.textContent='⟳ aplicando a mudança… (~30s)';const hist=document.getElementById('dsg_hist');if(hist){hist.innerHTML+='<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">'+esc(m)+'</div>';hist.scrollTop=hist.scrollHeight;}try{const r=await P('/design/'+id+'/iterar',{mensagem:m});if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);return;}DSG.detail=await r.json();dsgPreview();if(msg)msg.textContent='';}catch(e){if(msg)msg.textContent='erro: '+e;}}
+async function dsgGerar(){const b=document.getElementById('dsg_gerar'),msg=document.getElementById('dsg_msg');const p=(document.getElementById('dsg_prompt').value||'').trim();if(p.length<6){msg.textContent='descreva melhor o que quer.';return;}const tipo=DSG.tipo||'landing';const marca=(document.getElementById('dsg_marca')||{}).value||'';b.disabled=true;msg.textContent='gerando o design… (pode levar ~30-60s)';const capa=(document.getElementById('dsg_capa')||{}).checked;if(capa)msg.textContent='gerando capa por IA + design… (~1 min)';const lt=toast(capa?'Gerando capa + design…':'Gerando o design…','load');try{const kb=dsgKitBody();if(kb.exemplo){msg.textContent='remixando o exemplo Open Design… (~40-90s)';}const r=await P('/design',Object.assign({prompt:p,tipo:tipo,marca_id:marca,estilo:DSG.estilo||'',capa_ia:capa},kb));if(!r.ok){const em=await jerr(r);msg.textContent='⚠ '+em;toastKill(lt);toast(em,'error');b.disabled=false;return;}DSG.detail=await r.json();DSG.remix=null;if(DSG.detail.aviso)setTimeout(function(){alert(DSG.detail.aviso);},300);await dsgReload();dsgPreview();toastKill(lt);toast('Design gerado','ok');}catch(e){msg.textContent='erro: '+e;toastKill(lt);toast('Erro ao gerar: '+e,'error');b.disabled=false;}}
+async function dsgIterar(id,forced){const inp=document.getElementById('dsg_it'),msg=document.getElementById('dsg_itmsg');const m=((forced!=null?forced:(inp?inp.value:''))||'').trim();if(!m)return;if(forced==null&&inp)inp.value='';if(msg)msg.textContent='⟳ aplicando a mudança… (~30s)';const hist=document.getElementById('dsg_hist');if(hist){hist.innerHTML+='<div style="align-self:flex-end;max-width:90%;background:linear-gradient(135deg,var(--iris),#7b6cff);color:#fff;padding:8px 11px;border-radius:12px 12px 4px 12px;font-size:12.5px;line-height:1.45">'+esc(m)+'</div>';hist.scrollTop=hist.scrollHeight;}try{const r=await P('/design/'+id+'/iterar',{mensagem:m});if(!r.ok){if(msg)msg.textContent='⚠ '+await jerr(r);return;}DSG.detail=await r.json();dsgPreview();const ck=document.getElementById('dsg_chk');if(ck)ck.innerHTML=dsgChkHtml(DSG.detail);if(msg)msg.textContent='';}catch(e){if(msg)msg.textContent='erro: '+e;}}
 function dsgOpen(){if(!DSG.detail)return;try{const w=window.open('','_blank');if(w){w.document.open();w.document.write(DSG.detail.html||'');w.document.close();}}catch(e){}}
 function dsgPdf(){if(!DSG.detail)return;try{const w=window.open('','_blank');if(w){w.document.open();w.document.write(DSG.detail.html||'');w.document.close();setTimeout(function(){try{w.focus();w.print();}catch(e){}},700);}}catch(e){}}
 async function dsgRender(id,fmt,btn){const o=btn?btn.textContent:'';if(btn){btn.disabled=true;btn.textContent=fmt==='mp4'?'⟳ vídeo… (~40s)':'⟳…';}try{const r=await P('/design/'+id+'/render/'+fmt,{});if(!r.ok){alert('⚠ '+await jerr(r));return;}const a=((await r.json()).artefatos||[])[0];if(a)agBaixar(a.url,a.nome||('design.'+fmt));}catch(e){alert('erro: '+e);}finally{if(btn){btn.disabled=false;btn.textContent=o;}}}

@@ -149,6 +149,7 @@ services:
       - ADMIN_SENHA=${ADMIN_SENHA:-}          # senha inicial do admin do painel; vazio = gerada e impressa no log
       - AUTH_TTL_HORAS=${AUTH_TTL_HORAS:-12}  # validade da sessão de login (horas)
       - NANOCLAW_DB=/data/nanoclaw/v2.db      # estado do runtime de agentes (somente-leitura) p/ o painel Runtime
+      - ODKIT_DIR=${ODKIT_DIR:-/opt/odkit}    # Open Design Agent Kit (conteúdo baixado no build); aponte p/ outra pasta montada se quiser
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
