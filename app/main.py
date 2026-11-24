@@ -14397,6 +14397,53 @@ button:focus-visible,a:focus-visible,[role=button]:focus-visible,.sel:focus-visi
 @media(max-width:900px){:root{--rail:196px}}
 @media(max-width:820px){.deck{grid-template-columns:1fr}.rail{border-right:none;border-bottom:1px solid var(--line);display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;gap:6px;padding:8px 10px;align-items:center}.rail .rsec,.rail .railfoot{display:none}.rail .navi{flex:none;white-space:nowrap;padding:6px 11px}.main{min-width:0}}
 @media(max-width:640px){.shell{grid-template-rows:auto 1fr}.topbar{flex-wrap:wrap;height:auto;min-height:52px;padding:8px 12px;gap:8px}}
+/* ===== celular (≤640px): cabeçalho compacto, Workspace em 1 coluna, LinkedIn com menu em faixa ===== */
+@media(max-width:640px){
+ .shell{height:100vh;height:100dvh}
+ .topbar{padding:6px 10px 0;gap:6px 8px;min-height:0;align-items:center}
+ .linkchip,.telem,.clock,.rolebox,.topbar>.themebtn[title]{display:none!important}
+ .wordmark{font-size:14px}
+ #statuspill{font-size:9px;padding:2px 8px;gap:5px}
+ .topbar .themebtn{padding:4px 8px;font-size:11px}
+ .userbox .rl,.userrow .badge,.userrow b{display:none}.userbox{margin-left:auto}
+ .tabs{order:9;width:100%;margin:0 -10px;padding:0 10px 6px;overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+ .tabs::-webkit-scrollbar,.wsubbar::-webkit-scrollbar,.li-side .li-card::-webkit-scrollbar{display:none}
+ .tab{flex:none;padding:5px 11px}.tab .tu{display:none}.tab .tl{font-size:12px;white-space:nowrap}
+ .wsubbar{padding:0 6px;flex-wrap:nowrap!important;overflow-x:auto;scrollbar-width:none}
+ .wsubbar .agtab{flex:none;padding:9px 10px;font-size:12.5px;white-space:nowrap}
+ #limount,#mkmount,#dview,#simmount,#dsgmount,.wsbody>div[style*="padding"]{padding:12px 10px 70px!important}
+ .work,.work.cvhidden,.work.lcol,.work.lcol.cvhidden{grid-template-columns:minmax(0,1fr)!important;position:relative}
+ .work:not(.lcol) .wsL{display:block;position:absolute;inset:0;z-index:30;background:var(--void);overflow-y:auto}
+ .work .wsL{display:none}
+ .work:not(.cvhidden) .canvas{display:flex;position:fixed;inset:0;z-index:80;border-left:0}
+ .wsbar{padding:10px 12px 8px}.wssub{display:none}.composer{padding:8px 10px}
+ .lreopen{top:12px;left:8px;padding:5px 9px}.wsbar{padding-left:48px}
+ .modalbox{padding:16px}
+ /* LinkedIn */
+ .li-wrap{gap:12px;grid-template-columns:minmax(0,1fr)!important}.li-side,.li-main,.li-side .li-card{min-width:0;max-width:100%}
+ .li-side{position:static;gap:8px}
+ .li-side .li-card{display:flex;align-items:center;gap:6px;overflow-x:auto;padding:6px;scrollbar-width:none}
+ .li-brand{display:none}
+ .li-nav{flex:none;width:auto;padding:8px 12px;white-space:nowrap}
+ .li-conn{flex:none;margin:0;padding:7px 10px;white-space:nowrap}.li-conn span{display:none}
+ .li-head{padding:14px}.li-head h2{font-size:18px}
+ .li-acts{width:100%}.li-acts .btn,.li-acts .li-btn2{flex:1 1 auto;justify-content:center}
+ .li-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.li-stat{padding:11px 12px}.li-stat b{font-size:20px}.li-stat .ic{margin-bottom:8px}
+ .li-camp{grid-template-columns:minmax(0,1fr);gap:8px;padding:12px}.li-camp .ci{display:none}
+ .li-bar{padding:10px}.li-search{min-width:0;flex:1 1 100%}
+ .li-seg{max-width:100%;overflow-x:auto}.li-seg button{flex:none;white-space:nowrap}
+ .li-fila .chips{margin-left:0}
+ .li-tbl th,.li-tbl td{padding:8px}
+ .li-steps{justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto}.li-step{flex:none;padding:10px 12px}
+ .li-wtop{flex-wrap:wrap;padding:10px 12px}.li-wbody{padding:10px}.li-pane{padding:12px}
+ .li-pstep small{max-width:200px}
+ .li-objs{grid-template-columns:1fr}
+ .li-kanban{padding:10px;scroll-snap-type:x mandatory}.li-col{flex-basis:82vw;scroll-snap-align:start}
+ .li-drawer{width:100vw;max-width:100vw;padding:14px 14px 40px}
+ .li-drawer .li-dsec>div[style*="grid-template-columns:1fr 150px"]{grid-template-columns:1fr 1fr!important}
+ .li-cal{gap:3px;padding:8px}.li-cal .d{min-height:58px;padding:3px;font-size:10px}.li-cal .ev{font-size:9px;padding:2px 3px}
+ .li-improw{grid-template-columns:1fr}
+}
 </style></head><body>
 <div class="bg"></div><div class="scan"></div>
 <div id="login" style="display:none">
@@ -15993,7 +16040,7 @@ function cmdkKey(e){const f=cmdkFiltered();if(e.key==='ArrowDown'){e.preventDefa
 function skel(w,h,r){return '<span class="skel" style="width:'+w+';height:'+(h||14)+'px;border-radius:'+(r||6)+'px"></span>';}
 function skelPage(){let cards='';for(let i=0;i<6;i++)cards+='<div class="skelcard">'+skel('100%',86,8)+'<div style="height:8px"></div>'+skel('70%',11)+'</div>';return '<div style="max-width:1000px">'+skel('220px',24,7)+'<div style="height:12px"></div>'+skel('58%',12)+'<div style="height:22px"></div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px">'+cards+'</div></div>';}
 function emptyState(icn,title,desc,actionHtml){return '<div class="empty-st"><div class="es-ic">'+(ico(icn)||ico('spark'))+'</div><div class="es-t">'+esc(title)+'</div><div class="es-d">'+desc+'</div>'+(actionHtml?'<div class="es-a">'+actionHtml+'</div>':'')+'</div>';}
-function _stageWork(inner){document.getElementById("stage").innerHTML='<div class="wsplit">'+wSubBar()+'<div class="wsbody">'+inner+'</div></div>';}
+function _stageWork(inner){document.getElementById("stage").innerHTML='<div class="wsplit">'+wSubBar()+'<div class="wsbody">'+inner+'</div></div>';if(window.innerWidth<=640){const w=document.querySelector('#stage .work');if(w){w.classList.add('lcol');w.classList.add('cvhidden');}}}
 async function renderWork(){
  if(WSUB!=='chat'){const _s=document.getElementById("stage");if(_s)_s.innerHTML='<div class="wsplit">'+wSubBar()+'<div class="wsbody" style="overflow:auto"><div style="padding:22px 26px 60px">'+skelPage()+'</div></div></div>';}
  const c=await J('/colecoes'),cs=c.colecoes||[],sk=await J('/skills'),sks=sk.skills||[];
