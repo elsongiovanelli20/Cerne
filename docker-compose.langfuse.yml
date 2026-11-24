@@ -127,7 +127,7 @@ services:
   langfuse-clickhouse:
     image: clickhouse/clickhouse-server:26.3.62.3
     container_name: cerne-langfuse-clickhouse
-    user: "101:101"
+    # sem 'user:' fixo: o entrypoint da imagem ajusta o dono das pastas montadas (criadas como root) e depois baixa o privilégio
     environment:
       CLICKHOUSE_DB: default
       CLICKHOUSE_USER: clickhouse
@@ -147,6 +147,7 @@ services:
   langfuse-minio:
     image: cgr.dev/chainguard/minio
     container_name: cerne-langfuse-minio
+    user: "0:0"                                   # a pasta ./data/langfuse/minio nasce como root; o usuário padrão (65532) não grava nela
     entrypoint: sh
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:

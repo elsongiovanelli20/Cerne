@@ -126,7 +126,7 @@ services:
       - DOCLING_SERVE_MAX_FILE_SIZE=${DOCLING_MAX_FILE_SIZE:-104857600}
       - DOCLING_NUM_THREADS=${DOCLING_THREADS:-4}
       - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=1
-      - DOCLING_SERVE_API_KEY=${DOCLING_API_KEY:-}
+      - DOCLING_SERVE_API_KEY=${DOCLING_API_KEY:-cerne-docling-interno}   # NUNCA vazio: o docling-serve não sobe com chave vazia
     mem_limit: ${DOCLING_MEM:-4g}
     restart: unless-stopped                      # sem porta publicada: só o app (rede interna) acessa
 
@@ -168,7 +168,7 @@ services:
       - AUTH_TTL_HORAS=${AUTH_TTL_HORAS:-12}  # validade da sessão de login (horas)
       - NANOCLAW_DB=/data/nanoclaw/v2.db      # estado do runtime de agentes (somente-leitura) p/ o painel Runtime
       - DOCLING_URL=${DOCLING_URL:-}            # http://docling:5001 com o perfil "docling" ligado; vazio = extratores locais
-      - DOCLING_API_KEY=${DOCLING_API_KEY:-}
+      - DOCLING_API_KEY=${DOCLING_API_KEY:-cerne-docling-interno}
       - LANGFUSE_URL=${LANGFUSE_URL:-}          # preenchido pelo docker-compose.langfuse.yml
       - LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-}
       - ODKIT_DIR=${ODKIT_DIR:-/opt/odkit}    # Open Design Agent Kit (conteúdo baixado no build); aponte p/ outra pasta montada se quiser
