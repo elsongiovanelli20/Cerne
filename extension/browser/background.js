@@ -2,6 +2,8 @@
 // Conecta-se ao SEU servidor Cerne (soberano) por long-poll, executa comandos no navegador que você já usa
 // e mostra uma moldura enquanto atua. Sem token pareado, fica ocioso (não faz nada).
 
+importScripts("linkedin.js");   // automação do LinkedIn (aba própria em segundo plano)
+
 const DEFAULTS = { base: "https://cerne.orqion-ia.com.br", token: "", ligado: true };
 let cfg = { ...DEFAULTS };
 let polling = false;
@@ -159,6 +161,7 @@ async function injetar(tabId, fn, args) {
 // ---- executa um comando vindo do Cerne ----
 async function executar(cmd) {
   const acao = (cmd.acao || "").toLowerCase();
+  if (acao.startsWith("li_")) return await liExecutar(cmd);   // LinkedIn: não mexe na aba que você está usando
   const t = await abaAlvo();
   const tabId = t ? t.id : null;
   if (acao !== "status" && tabId != null) overlay(tabId, true, cmd.rotulo || "Cerne está operando este navegador");
@@ -214,7 +217,7 @@ async function pollLoop() {
       try {
         const r = await fetch(cfg.base + "/ext/poll", {
           method: "POST", headers: { "Content-Type": "application/json", "X-Ext-Token": cfg.token },
-          body: JSON.stringify({ v: "1.1.0" })
+          body: JSON.stringify({ v: "1.2.0" })
         });
         if (r.status === 401) { await chrome.storage.local.set({ token: "" }); break; }
         if (r.ok) { const j = await r.json(); cmd = j && j.comando ? j.comando : null; }

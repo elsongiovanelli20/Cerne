@@ -993,6 +993,7 @@ def startup():
     threading.Thread(target=_anexo_loop, daemon=True).start()   # rotina de expiração dos anexos de chat
     threading.Thread(target=_inbox_loop, daemon=True).start()   # conector: pasta monitorada (data/inbox)
     threading.Thread(target=_scheduler_loop, daemon=True).start()  # agendamento de agentes (gatilhos horário/pasta/e-mail)
+    threading.Thread(target=_li_worker, name="cerne-linkedin", daemon=True).start()  # LinkedIn: campanhas, sync e posts agendados
     try:                                                        # semeia o feed de eventos com o ledger persistido (sobrevive a restart)
         for e in _audit_read(40)["entradas"][::-1]:
             ts = e.get("ts", "")
@@ -6575,6 +6576,1595 @@ async def desktop_poll(request: Request):
     except queue.Empty:
         return {}
     return {"acao": acao}
+
+
+# ============ LinkedIn — prospecção (Outbound), conteúdo (Inbound), CRM e limites ============
+# Tudo por USUÁRIO (cada pessoa opera a própria conta do LinkedIn). As ações no LinkedIn rodam no navegador da
+# pessoa, pela extensão do Cerne (aba dedicada em segundo plano, na sessão que ela já tem logada) — o Cerne nunca
+# guarda senha nem cookie do LinkedIn. O motor (_li_worker) respeita limites diários, horário e intervalos
+# aleatórios para imitar uso humano. Dados em /data/app/linkedin.json (fora do appstate, que é reescrito inteiro).
+_LI_PATH = os.getenv("LINKEDIN_PATH", os.path.join(os.path.dirname(APPSTATE_PATH), "linkedin.json"))
+_LI_MEDIA = os.getenv("LINKEDIN_MEDIA", os.path.join(os.path.dirname(APPSTATE_PATH), "linkedin_midia"))
+_LI_LOCK = threading.RLock()
+_LI_WAKE = threading.Event()
+_LI_RUNNING = {}                                     # uid -> descrição da ação em andamento
+_LI_ETAPAS = ["Novo", "Em contato", "Qualificado", "Desqualificado", "Reunião", "Proposta", "Ganho", "Perdido"]
+_LI_PASSOS = {"conexao": "Pedido de conexão", "mensagem": "Enviar mensagem", "aguardar": "Aguardar",
+              "visitar": "Visitar perfil", "curtir": "Curtir publicação"}
+_LI_LIMITES_PADRAO = {"convites_dia": 25, "convites_semana": 100, "mensagens_dia": 40, "visitas_dia": 60,
+                      "curtidas_dia": 30, "extracao_dia": 500, "intervalo_min": 60, "intervalo_max": 180,
+                      "hora_inicio": 8, "hora_fim": 19, "dias": [0, 1, 2, 3, 4], "pausado": False,
+                      "image_creator_url": "https://chatgpt.com/"}
+_LI_TZ = None
+
+
+def _li_load():
+    try:
+        with open(_LI_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+_LI = _li_load()
+
+
+def _li_save():
+    with _LI_LOCK:
+        try:
+            os.makedirs(os.path.dirname(_LI_PATH), exist_ok=True)
+            tmp = _LI_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_LI, f, ensure_ascii=False)
+            os.replace(tmp, _LI_PATH)
+        except Exception as e:
+            print("[cerne] linkedin save:", str(e)[:120])
+
+
+def _li_user():
+    u = _usuario_atual()
+    if not u or not u.get("id"):
+        raise HTTPException(status_code=401, detail="faça login")
+    return u
+
+
+def _li_db(uid):
+    with _LI_LOCK:
+        d = _LI.setdefault(uid, {})
+        d.setdefault("conta", {})
+        lim = d.setdefault("limites", {})
+        for k, v in _LI_LIMITES_PADRAO.items():
+            lim.setdefault(k, v)
+        for k in ("campanhas", "posts", "automacoes", "avulsas", "jobs", "log"):
+            d.setdefault(k, [])
+        for k in ("leads", "crm", "uso", "sync", "estrategia", "vistos"):
+            d.setdefault(k, {})
+        return d
+
+
+def _li_now():
+    return time.time()
+
+
+def _li_local(ts=None):
+    """Hora local (America/Sao_Paulo) para janela de horário comercial."""
+    global _LI_TZ
+    import datetime as _dt
+    if _LI_TZ is None:
+        try:
+            from zoneinfo import ZoneInfo
+            _LI_TZ = ZoneInfo("America/Sao_Paulo")
+        except Exception:
+            _LI_TZ = _dt.timezone(_dt.timedelta(hours=-3))
+    return _dt.datetime.fromtimestamp(ts or time.time(), _LI_TZ)
+
+
+def _li_iso(ts):
+    return _li_local(ts).strftime("%Y-%m-%dT%H:%M:%S") if ts else None
+
+
+def _li_id():
+    return uuid.uuid4().hex[:12]
+
+
+def _li_slug(url):
+    m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", url or "", re.I)
+    return (m.group(1).strip().lower() if m else "").rstrip("/")
+
+
+def _li_norm_url(url):
+    s = _li_slug(url)
+    return f"https://www.linkedin.com/in/{s}/" if s else ""
+
+
+def _li_hoje():
+    return _li_local().strftime("%Y-%m-%d")
+
+
+def _li_uso(d, tipo, n=1):
+    with _LI_LOCK:
+        dia = d["uso"].setdefault(_li_hoje(), {})
+        dia[tipo] = dia.get(tipo, 0) + n
+        if len(d["uso"]) > 40:                                   # guarda ~40 dias
+            for k in sorted(d["uso"])[:-40]:
+                d["uso"].pop(k, None)
+
+
+def _li_uso_hoje(d, tipo):
+    return (d["uso"].get(_li_hoje()) or {}).get(tipo, 0)
+
+
+def _li_uso_semana(d, tipo):
+    import datetime as _dt
+    hoje = _li_local().date()
+    return sum((d["uso"].get((hoje - _dt.timedelta(days=i)).strftime("%Y-%m-%d")) or {}).get(tipo, 0) for i in range(7))
+
+
+_LI_TIPO_LIMITE = {"conexao": ("convites", "convites_dia"), "mensagem": ("mensagens", "mensagens_dia"),
+                   "visitar": ("visitas", "visitas_dia"), "curtir": ("curtidas", "curtidas_dia")}
+
+
+def _li_pode(d, tipo):
+    """(ok, motivo) — respeita limite diário (e semanal p/ convites) e bloqueio temporário do LinkedIn."""
+    if tipo not in _LI_TIPO_LIMITE:
+        return True, ""
+    chave, lim_k = _LI_TIPO_LIMITE[tipo]
+    lim = d["limites"]
+    if tipo == "conexao":
+        if (d["conta"].get("convites_bloqueados_ate") or 0) > _li_now():
+            return False, "LinkedIn sinalizou limite de convites — pausado até " + (_li_iso(d["conta"]["convites_bloqueados_ate"]) or "")
+        if _li_uso_semana(d, chave) >= int(lim.get("convites_semana") or 100):
+            return False, "limite semanal de convites atingido"
+    if _li_uso_hoje(d, chave) >= int(lim.get(lim_k) or 0):
+        return False, "limite diário atingido"
+    return True, ""
+
+
+def _li_na_janela(d):
+    lim = d["limites"]
+    t = _li_local()
+    return t.weekday() in (lim.get("dias") or [0, 1, 2, 3, 4]) and int(lim.get("hora_inicio", 8)) <= t.hour < int(lim.get("hora_fim", 19))
+
+
+def _li_log(d, tipo, detalhe, ok=True):
+    with _LI_LOCK:
+        d["log"].append({"t": _li_now(), "tipo": tipo, "detalhe": (detalhe or "")[:240], "ok": ok})
+        if len(d["log"]) > 400:
+            del d["log"][:-400]
+
+
+def _li_vars(txt, lead):
+    nome = (lead.get("nome") or "").strip()
+    rep = {"primeiro_nome": nome.split(" ")[0] if nome else "", "nome": nome,
+           "empresa": lead.get("empresa") or "", "cargo": lead.get("cargo") or ""}
+    return re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: rep.get(m.group(1).lower(), m.group(0)), txt or "").strip()
+
+
+# ---------- execução no navegador (extensão) ----------
+def _li_exec(uid, cmd, timeout=150):
+    cmd = dict(cmd, rotulo=cmd.get("rotulo") or "Cerne está operando o LinkedIn")
+    r = _browser_exec(uid, cmd, timeout=timeout)
+    return r if isinstance(r, dict) else {"erro": "resposta inválida da extensão"}
+
+
+def _li_conectado(uid):
+    return _browser_conectado(uid)
+
+
+# ---------- campanhas / leads ----------
+def _li_lead_novo(d, camp_id, p):
+    url = _li_norm_url(p.get("url") or p.get("linkedin_url") or p.get("linkedin") or "")
+    if not url:
+        return None
+    lid = _li_id()
+    lead = {"id": lid, "url": url, "slug": _li_slug(url), "nome": (p.get("nome") or "").strip()[:120],
+            "empresa": (p.get("empresa") or "").strip()[:120], "cargo": (p.get("cargo") or "").strip()[:200],
+            "campanha_id": camp_id, "passo_idx": 0, "status": "pendente", "prox_em": None, "tentativas": 0,
+            "convidado_em": None, "conectado_em": None, "respondeu_em": None, "historico": [], "criado": _li_now()}
+    d["leads"][lid] = lead
+    return lead
+
+
+def _li_camp(d, cid):
+    return next((c for c in d["campanhas"] if c["id"] == cid), None)
+
+
+def _li_camp_leads(d, c):
+    return [d["leads"][i] for i in c.get("leads") or [] if i in d["leads"]]
+
+
+_LI_FIM = ("concluido", "respondeu", "ignorado", "erro", "nao_aceitou")
+
+
+def _li_camp_pub(d, c):
+    leads = _li_camp_leads(d, c)
+    n = len(c.get("passos") or [])
+    total = len(leads) * n
+    feitos = sum((n if l["status"] in _LI_FIM else min(l.get("passo_idx", 0), n)) for l in leads)
+    return {"id": c["id"], "nome": c.get("nome"), "status": c.get("status"), "arquivada": bool(c.get("arquivada")),
+            "n_leads": len(leads), "n_passos": n, "acoes_total": total, "acoes_feitas": feitos,
+            "progresso": round(100.0 * feitos / total, 1) if total else 0.0,
+            "atualizado": _li_iso(c.get("atualizado")), "criado": _li_iso(c.get("criado")),
+            "passos": c.get("passos") or [], "config": c.get("config") or {}}
+
+
+def _li_metricas(d, camp_id=None):
+    leads = [l for l in d["leads"].values() if not camp_id or l.get("campanha_id") == camp_id]
+    conv = sum(1 for l in leads if l.get("convidado_em"))
+    ace = sum(1 for l in leads if l.get("convidado_em") and l.get("conectado_em"))
+    resp = sum(1 for l in leads if l.get("respondeu_em"))
+    return {"convites": conv, "aceitos": ace, "taxa_aceite": round(100.0 * ace / conv) if conv else 0,
+            "respostas": resp, "taxa_resposta": round(100.0 * resp / ace) if ace else 0}
+
+
+def _li_fila_stats(d):
+    ativas = {c["id"] for c in d["campanhas"] if c.get("status") == "ativa"}
+    agendadas = tentativas = 0
+    prox = None
+    for l in d["leads"].values():
+        if l.get("campanha_id") not in ativas or l["status"] in _LI_FIM:
+            continue
+        c = _li_camp(d, l["campanha_id"])
+        agendadas += max(0, len(c.get("passos") or []) - l.get("passo_idx", 0))
+        if l.get("tentativas"):
+            tentativas += 1
+        if l.get("prox_em") and (prox is None or l["prox_em"] < prox):
+            prox = l["prox_em"]
+    for a in d["avulsas"]:
+        if a.get("status") == "pendente":
+            agendadas += 1
+            if prox is None or (a.get("prox_em") or 0) < prox:
+                prox = a.get("prox_em") or _li_now()
+    concl = sum(1 for x in d["log"] if x.get("ok") and x.get("tipo") in _LI_PASSOS)
+    ign = sum(1 for l in d["leads"].values() if l["status"] in ("ignorado", "erro", "nao_aceitou"))
+    prox_real = max(prox, d["conta"].get("proxima_acao_em") or 0) if prox else None
+    return {"agendadas": agendadas, "em_andamento": 1 if _LI_RUNNING.get(d.get("_uid")) else 0,
+            "concluidas": concl, "ignoradas": ign, "tentativas": tentativas,
+            "proxima": _li_iso(prox_real), "executando": _LI_RUNNING.get(d.get("_uid")) or ""}
+
+
+# ---------- CRM ----------
+def _li_crm_upsert(d, url, nome="", cargo="", empresa="", origem=None, mensagem=None, nao_lido=True):
+    slug = _li_slug(url)
+    with _LI_LOCK:
+        ct = next((c for c in d["crm"].values() if slug and c.get("slug") == slug), None) \
+            or next((c for c in d["crm"].values() if not slug and nome and c.get("nome") == nome), None)
+        if not ct:
+            cid = _li_id()
+            ct = {"id": cid, "slug": slug, "url": _li_norm_url(url) if slug else (url or ""), "nome": nome or slug,
+                  "cargo": cargo, "empresa": empresa, "etapa": "Novo", "tags": [], "tarefas": [], "notas": [],
+                  "origens": [], "mensagens": [], "nao_lido": False, "criado": _li_now(), "atualizado": _li_now()}
+            d["crm"][cid] = ct
+        for k, v in (("nome", nome), ("cargo", cargo), ("empresa", empresa)):
+            if v and not ct.get(k):
+                ct[k] = v
+        if origem:
+            chave = (origem.get("tipo"), origem.get("detalhe"))
+            if not any((o.get("tipo"), o.get("detalhe")) == chave for o in ct["origens"]):
+                ct["origens"].append(dict(origem, em=_li_now()))
+        if mensagem:
+            if not any(m.get("texto") == mensagem.get("texto") and m.get("de") == mensagem.get("de") for m in ct["mensagens"][-5:]):
+                ct["mensagens"].append(dict(mensagem, em=mensagem.get("em") or _li_now()))
+                if nao_lido and mensagem.get("de") == "contato":
+                    ct["nao_lido"] = True
+        ct["atualizado"] = _li_now()
+        return ct
+
+
+def _li_crm_pub(c):
+    agora = _li_now()
+    o = (c.get("origens") or [{}])[-1]
+    return {"id": c["id"], "nome": c.get("nome"), "cargo": c.get("cargo") or "", "empresa": c.get("empresa") or "",
+            "url": c.get("url") or "", "etapa": c.get("etapa") or "Novo", "tags": c.get("tags") or [],
+            "nao_lido": bool(c.get("nao_lido")), "origem": o.get("tipo") or "", "origem_detalhe": o.get("detalhe") or "",
+            "origens": [dict(x, em=_li_iso(x.get("em"))) for x in c.get("origens") or []],
+            "tarefas": [dict(t, atrasada=bool(not t.get("feita") and t.get("quando") and t["quando"] < agora),
+                             quando_iso=_li_iso(t.get("quando"))) for t in c.get("tarefas") or []],
+            "notas": [dict(n, em=_li_iso(n.get("em"))) for n in c.get("notas") or []],
+            "mensagens": [dict(m, em=_li_iso(m.get("em"))) for m in (c.get("mensagens") or [])[-30:]],
+            "ultima": ((c.get("mensagens") or [{}])[-1].get("texto") or "")[:160],
+            "atualizado": _li_iso(c.get("atualizado")), "atualizado_ts": c.get("atualizado") or 0}
+
+
+# ---------- motor ----------
+def _li_proxima_acao(d):
+    lim = d["limites"]
+    import random as _r
+    a, b = int(lim.get("intervalo_min") or 60), int(lim.get("intervalo_max") or 180)
+    d["conta"]["proxima_acao_em"] = _li_now() + _r.randint(min(a, b), max(a, b))
+
+
+def _li_avanca(d, lead, c, quando=None):
+    lead["passo_idx"] = lead.get("passo_idx", 0) + 1
+    lead["tentativas"] = 0
+    if lead["passo_idx"] >= len(c.get("passos") or []):
+        lead["status"] = "concluido"
+        lead["prox_em"] = None
+    else:
+        lead["status"] = "em_andamento"
+        lead["prox_em"] = quando or _li_now()
+
+
+def _li_hist(lead, txt):
+    lead.setdefault("historico", []).append({"t": _li_now(), "txt": txt[:200]})
+    lead["historico"] = lead["historico"][-30:]
+
+
+def _li_falha(d, lead, c, passo, erro):
+    lead["tentativas"] = lead.get("tentativas", 0) + 1
+    _li_hist(lead, f"erro em {_LI_PASSOS.get(passo['tipo'], passo['tipo'])}: {erro}")
+    if lead["tentativas"] >= 3:
+        lead["status"] = "erro"
+        lead["prox_em"] = None
+        lead["erro"] = erro[:200]
+    else:
+        lead["prox_em"] = _li_now() + 2 * 3600                  # nova tentativa em 2h
+
+
+def _li_exec_passo(uid, d, lead, c):
+    passos = c.get("passos") or []
+    passo = passos[lead.get("passo_idx", 0)]
+    tipo, cfg = passo.get("tipo"), passo.get("cfg") or {}
+    if tipo == "aguardar":
+        dias = float(cfg.get("dias") or 1)
+        _li_hist(lead, f"aguardando {dias:g} dia(s)")
+        _li_avanca(d, lead, c, quando=_li_now() + dias * 86400)
+        return "aguardar"
+    if tipo == "mensagem" and not lead.get("conectado_em"):
+        # só dá para mandar mensagem a conexões: espera o aceite (sincronizado) por até 21 dias
+        if lead.get("convidado_em") and _li_now() - lead["convidado_em"] > 21 * 86400:
+            lead["status"] = "nao_aceitou"
+            lead["prox_em"] = None
+            _li_hist(lead, "convite não aceito em 21 dias — cadência encerrada")
+        else:
+            lead["prox_em"] = _li_now() + 6 * 3600
+            lead["status"] = "aguardando_aceite"
+        return "espera"
+    ok, motivo = _li_pode(d, tipo)
+    if not ok:
+        return "limite"
+    rot = f"{_LI_PASSOS.get(tipo, tipo)} · {lead.get('nome') or lead.get('slug')}"
+    _LI_RUNNING[uid] = rot
+    try:
+        if tipo == "visitar":
+            r = _li_exec(uid, {"acao": "li_visitar", "url": lead["url"]})
+        elif tipo == "curtir":
+            r = _li_exec(uid, {"acao": "li_curtir", "url": lead["url"]})
+        elif tipo == "conexao":
+            nota = _li_vars(cfg.get("nota") or "", lead)[:300]
+            r = _li_exec(uid, {"acao": "li_conectar", "url": lead["url"], "nota": nota})
+        elif tipo == "mensagem":
+            r = _li_exec(uid, {"acao": "li_mensagem", "url": lead["url"], "texto": _li_vars(cfg.get("texto") or "", lead)})
+        else:
+            r = {"erro": "passo desconhecido"}
+    finally:
+        _LI_RUNNING.pop(uid, None)
+    with _LI_LOCK:
+        if r.get("perfil"):
+            p = r["perfil"]
+            for k in ("nome", "cargo", "empresa"):
+                if p.get(k) and not lead.get(k):
+                    lead[k] = p[k][:200]
+            if p.get("conexao") == "conectado" and not lead.get("conectado_em"):
+                lead["conectado_em"] = _li_now()
+        if r.get("erro"):
+            err = str(r["erro"])
+            if "limite_semanal" in err or "limite semanal" in err:
+                d["conta"]["convites_bloqueados_ate"] = _li_now() + 24 * 3600
+                _li_log(d, tipo, "LinkedIn avisou limite de convites — convites pausados por 24h", ok=False)
+                return "limite"
+            if "nao_logado" in err:
+                d["conta"]["logado"] = False
+                _li_log(d, "conta", "LinkedIn não está logado no navegador", ok=False)
+                return "limite"
+            _li_falha(d, lead, c, passo, err)
+            _li_log(d, tipo, f"{lead.get('nome') or lead['slug']}: {err}", ok=False)
+            _li_uso(d, _LI_TIPO_LIMITE[tipo][0]) if tipo in _LI_TIPO_LIMITE and r.get("contou") else None
+            return "erro"
+        if tipo in _LI_TIPO_LIMITE and not r.get("ja"):
+            _li_uso(d, _LI_TIPO_LIMITE[tipo][0])
+        if tipo == "conexao":
+            if r.get("ja") == "conectado":
+                lead["conectado_em"] = lead.get("conectado_em") or _li_now()
+                _li_hist(lead, "já era conexão")
+            else:
+                lead["convidado_em"] = lead.get("convidado_em") or _li_now()
+                _li_hist(lead, "convite enviado" + (" (já estava pendente)" if r.get("ja") == "pendente" else ""))
+        elif tipo == "mensagem":
+            _li_hist(lead, "mensagem enviada")
+            _li_crm_upsert(d, lead["url"], lead.get("nome"), lead.get("cargo"), lead.get("empresa"),
+                           mensagem={"de": "eu", "texto": _li_vars(cfg.get("texto") or "", lead)}, nao_lido=False) \
+                if any(ct.get("slug") == lead["slug"] for ct in d["crm"].values()) else None
+        else:
+            _li_hist(lead, _LI_PASSOS.get(tipo, tipo).lower() + " ok")
+        _li_log(d, tipo, f"{lead.get('nome') or lead['slug']} · {c.get('nome')}")
+        _li_avanca(d, lead, c)
+        c["atualizado"] = _li_now()
+    return "ok"
+
+
+def _li_exec_avulsa(uid, d, a):
+    tipo = a.get("tipo")
+    ok, _m = _li_pode(d, tipo)
+    if not ok:
+        return "limite"
+    _LI_RUNNING[uid] = f"{_LI_PASSOS.get(tipo, tipo)} · {a.get('nome') or _li_slug(a.get('url'))}"
+    try:
+        if tipo == "mensagem":
+            r = _li_exec(uid, {"acao": "li_mensagem", "url": a["url"], "texto": a.get("texto") or ""})
+        elif tipo == "conexao":
+            r = _li_exec(uid, {"acao": "li_conectar", "url": a["url"], "nota": (a.get("nota") or "")[:300]})
+        else:
+            r = {"erro": "ação desconhecida"}
+    finally:
+        _LI_RUNNING.pop(uid, None)
+    with _LI_LOCK:
+        if r.get("erro"):
+            a["tentativas"] = a.get("tentativas", 0) + 1
+            a["erro"] = str(r["erro"])[:200]
+            if "nao_logado" in a["erro"] or "limite_semanal" in a["erro"]:
+                return "limite"
+            a["status"] = "erro" if a["tentativas"] >= 3 else "pendente"
+            a["prox_em"] = _li_now() + 3600
+            _li_log(d, tipo, f"{a.get('nome') or a['url']}: {a['erro']}", ok=False)
+            return "erro"
+        a["status"] = "feito"
+        a["feito_em"] = _li_now()
+        if not r.get("ja"):
+            _li_uso(d, _LI_TIPO_LIMITE[tipo][0])
+        if a.get("contato_id") and a["contato_id"] in d["crm"] and tipo == "mensagem":
+            ct = d["crm"][a["contato_id"]]
+            ct["mensagens"].append({"de": "eu", "texto": a.get("texto") or "", "em": _li_now()})
+            if ct.get("etapa") == "Novo":
+                ct["etapa"] = "Em contato"
+        _li_log(d, tipo, f"{a.get('nome') or a['url']} ({a.get('origem') or 'avulsa'})")
+    return "ok"
+
+
+def _li_sync_respostas(uid, d):
+    r = _li_exec(uid, {"acao": "li_conversas", "max": 40}, timeout=120)
+    d["sync"]["respostas"] = _li_now()
+    if r.get("erro"):
+        _li_log(d, "sync", "respostas: " + str(r["erro"]), ok=False)
+        return r
+    novos = 0
+    with _LI_LOCK:
+        por_slug = {l["slug"]: l for l in d["leads"].values() if l.get("slug")}
+        por_nome = {}
+        for l in d["leads"].values():
+            if l.get("nome"):
+                por_nome.setdefault(l["nome"].strip().lower(), l)
+        for cv in r.get("conversas") or []:
+            if cv.get("ultima_de") != "contato":
+                continue
+            lead = por_slug.get(_li_slug(cv.get("url") or "")) or por_nome.get((cv.get("nome") or "").strip().lower())
+            if not lead:
+                continue
+            if lead.get("respondeu_em"):
+                # já respondeu antes: só atualiza a conversa no CRM
+                _li_crm_upsert(d, lead["url"], lead.get("nome"), mensagem={"de": "contato", "texto": cv.get("texto") or ""},
+                               nao_lido=bool(cv.get("nao_lida")))
+                continue
+            c = _li_camp(d, lead.get("campanha_id")) or {}
+            lead["respondeu_em"] = _li_now()
+            lead["conectado_em"] = lead.get("conectado_em") or _li_now()
+            if (c.get("config") or {}).get("parar_ao_responder", True):
+                lead["status"] = "respondeu"
+                lead["prox_em"] = None
+            _li_hist(lead, "respondeu: " + (cv.get("texto") or "")[:120])
+            _li_crm_upsert(d, lead["url"], lead.get("nome"), lead.get("cargo"), lead.get("empresa"),
+                           origem={"tipo": "Resposta Outbound", "detalhe": c.get("nome") or "campanha"},
+                           mensagem={"de": "contato", "texto": cv.get("texto") or ""})
+            novos += 1
+    _li_log(d, "sync", f"respostas sincronizadas · {novos} nova(s)")
+    return {"ok": True, "novas": novos}
+
+
+def _li_sync_aceites(uid, d):
+    r = _li_exec(uid, {"acao": "li_conexoes", "max": 80}, timeout=120)
+    d["sync"]["aceites"] = _li_now()
+    if r.get("erro"):
+        _li_log(d, "sync", "aceites: " + str(r["erro"]), ok=False)
+        return r
+    slugs = {_li_slug(x.get("url")) for x in r.get("conexoes") or []}
+    n = 0
+    with _LI_LOCK:
+        for l in d["leads"].values():
+            if l.get("convidado_em") and not l.get("conectado_em") and l.get("slug") in slugs:
+                l["conectado_em"] = _li_now()
+                _li_hist(l, "convite aceito")
+                if l.get("status") == "aguardando_aceite":
+                    l["status"] = "em_andamento"
+                    l["prox_em"] = _li_now()
+                n += 1
+    _li_log(d, "sync", f"aceites sincronizados · {n} novo(s)")
+    return {"ok": True, "novos": n}
+
+
+def _li_sync_posts(uid, d):
+    r = _li_exec(uid, {"acao": "li_meus_posts", "max": 30}, timeout=150)
+    d["sync"]["posts"] = _li_now()
+    if r.get("erro"):
+        _li_log(d, "sync", "posts: " + str(r["erro"]), ok=False)
+        return r
+    with _LI_LOCK:
+        for p in r.get("posts") or []:
+            urn = p.get("urn") or ""
+            if not urn:
+                continue
+            post = next((x for x in d["posts"] if x.get("urn") == urn), None)
+            if not post:                                        # liga ao post publicado pelo Cerne pelo início do texto
+                ini = (p.get("texto") or "")[:60].strip()
+                post = next((x for x in d["posts"] if not x.get("urn") and x.get("status") == "publicado"
+                             and ini and (x.get("texto") or "").strip().startswith(ini[:40])), None)
+            if not post:
+                post = {"id": _li_id(), "texto": p.get("texto") or "", "status": "publicado", "origem": "sincronizado",
+                        "criado": _li_now(), "publicado_em": p.get("publicado_em") or _li_now(), "midias": []}
+                d["posts"].append(post)
+            post["urn"] = urn
+            post["li_url"] = p.get("url") or post.get("li_url")
+            post["metricas"] = {"impressoes": int(p.get("impressoes") or 0), "reacoes": int(p.get("reacoes") or 0),
+                                "comentarios": int(p.get("comentarios") or 0), "compartilhamentos": int(p.get("compartilhamentos") or 0)}
+            post["metricas_em"] = _li_now()
+    _li_log(d, "sync", f"posts sincronizados · {len(r.get('posts') or [])}")
+    return {"ok": True}
+
+
+def _li_rodar_automacoes(uid, d):
+    regras = [a for a in d["automacoes"] if a.get("ativo")]
+    d["sync"]["automacoes"] = _li_now()
+    if not regras:
+        return
+    recentes = [p for p in d["posts"] if p.get("status") == "publicado" and p.get("li_url")
+                and _li_now() - (p.get("publicado_em") or 0) < 14 * 86400][:6]
+    for p in recentes:
+        alvo = [a for a in regras if not a.get("post_url") or _li_slug_post(a["post_url"]) == _li_slug_post(p["li_url"])]
+        if not alvo:
+            continue
+        r = _li_exec(uid, {"acao": "li_extrair_post", "url": p["li_url"], "modo": "comentarios", "max": 100}, timeout=180)
+        if r.get("erro"):
+            _li_log(d, "automacao", f"comentários de um post: {r['erro']}", ok=False)
+            continue
+        with _LI_LOCK:
+            vistos = d["vistos"].setdefault(p["id"], [])
+            for pessoa in r.get("pessoas") or []:
+                slug = _li_slug(pessoa.get("url"))
+                if not slug or slug in vistos or slug == (d["conta"].get("slug") or ""):
+                    continue
+                txt = (pessoa.get("comentario") or "").lower()
+                for a in alvo:
+                    if a.get("gatilho") == "palavra" and (a.get("palavra") or "").strip().lower() not in txt:
+                        continue
+                    ct = _li_crm_upsert(d, pessoa["url"], pessoa.get("nome"), pessoa.get("cargo"),
+                                        origem={"tipo": "Comentário automatizado", "detalhe": a.get("nome") or "automação"},
+                                        mensagem={"de": "contato", "texto": "(comentário no post) " + (pessoa.get("comentario") or "")[:300]})
+                    ld = {"nome": pessoa.get("nome") or "", "cargo": pessoa.get("cargo") or "", "empresa": ""}
+                    if a.get("convite") and not _li_avulsa_existe(d, "conexao", pessoa["url"]):
+                        d["avulsas"].append({"id": _li_id(), "tipo": "conexao", "url": _li_norm_url(pessoa["url"]),
+                                             "nome": ld["nome"], "nota": _li_vars(a.get("nota") or "", ld), "status": "pendente",
+                                             "prox_em": _li_now(), "origem": "automação", "contato_id": ct["id"]})
+                    if a.get("mensagem") and a.get("texto") and not _li_avulsa_existe(d, "mensagem", pessoa["url"]):
+                        d["avulsas"].append({"id": _li_id(), "tipo": "mensagem", "url": _li_norm_url(pessoa["url"]),
+                                             "nome": ld["nome"], "texto": _li_vars(a["texto"], ld), "status": "pendente",
+                                             "prox_em": _li_now() + 600, "origem": "automação", "contato_id": ct["id"]})
+                    a["disparos"] = a.get("disparos", 0) + 1
+                    break
+                vistos.append(slug)
+            d["vistos"][p["id"]] = vistos[-2000:]
+
+
+def _li_avulsa_existe(d, tipo, url):
+    """Evita ação repetida para a mesma pessoa (ex.: comentou em 2 posts) — e não convida quem já está numa campanha."""
+    s = _li_slug(url)
+    if tipo == "conexao" and any(l.get("slug") == s and l.get("convidado_em") for l in d["leads"].values()):
+        return True
+    return any(x.get("tipo") == tipo and _li_slug(x.get("url")) == s for x in d["avulsas"])
+
+
+def _li_slug_post(u):
+    m = re.search(r"(activity[-:]\d+|ugcPost[-:]\d+|share[-:]\d+)", u or "")
+    return m.group(1).replace(":", "-") if m else (u or "").split("?")[0].rstrip("/")
+
+
+def _li_publicar(uid, d, post):
+    midia = None
+    for m in post.get("midias") or []:
+        if (m.get("tipo") or "").startswith("image/"):
+            p = os.path.join(_LI_MEDIA, uid, m["arquivo"])
+            if os.path.exists(p) and os.path.getsize(p) < 6 * 1048576:
+                import base64 as _b64
+                with open(p, "rb") as f:
+                    midia = {"nome": m.get("nome") or m["arquivo"], "tipo": m["tipo"], "b64": _b64.b64encode(f.read()).decode()}
+                break
+    _LI_RUNNING[uid] = "Publicando post"
+    try:
+        r = _li_exec(uid, {"acao": "li_publicar", "texto": post.get("texto") or "", "midia": midia,
+                           "visibilidade": post.get("visibilidade") or "qualquer"}, timeout=180)
+    finally:
+        _LI_RUNNING.pop(uid, None)
+    with _LI_LOCK:
+        if r.get("erro"):
+            post["status"] = "erro"
+            post["erro"] = str(r["erro"])[:200]
+            _li_log(d, "post", "publicação falhou: " + post["erro"], ok=False)
+        else:
+            post["status"] = "publicado"
+            post["publicado_em"] = _li_now()
+            post["erro"] = ""
+            if r.get("url"):
+                post["li_url"] = r["url"]
+            _li_log(d, "post", "post publicado")
+    return r
+
+
+def _li_job_run(uid, d, job):
+    """Jobs pedidos pela pessoa (importar leads, sincronizar, reconectar) — rodam fora da janela de horário."""
+    tipo = job.get("tipo")
+    job["status"] = "rodando"
+    job["inicio"] = _li_now()
+    _LI_RUNNING[uid] = {"importar": "Importando leads", "sync_respostas": "Sincronizando respostas",
+                        "sync_aceites": "Sincronizando aceites", "sync_posts": "Sincronizando posts",
+                        "status": "Verificando conta", "publicar": "Publicando post"}.get(tipo, tipo)
+    try:
+        if tipo == "importar":
+            mx = max(1, min(int(job.get("max") or 25), 500))
+            resto = int(d["limites"].get("extracao_dia") or 500) - _li_uso_hoje(d, "extracao")
+            if resto <= 0:
+                r = {"erro": "limite diário de extração atingido"}
+            else:
+                mx = min(mx, resto)
+                if job.get("fonte") == "post":
+                    r = _li_exec(uid, {"acao": "li_extrair_post", "url": job["url"], "modo": job.get("modo") or "ambos", "max": mx}, timeout=420)
+                else:
+                    r = _li_exec(uid, {"acao": "li_extrair_busca", "url": job["url"], "max": mx}, timeout=540)
+            if not r.get("erro"):
+                pessoas = []
+                vist = set()
+                for p in r.get("pessoas") or []:
+                    u = _li_norm_url(p.get("url") or "")
+                    if u and u not in vist:
+                        vist.add(u)
+                        pessoas.append({"url": u, "nome": (p.get("nome") or "")[:120], "cargo": (p.get("cargo") or "")[:200],
+                                        "empresa": (p.get("empresa") or "")[:120]})
+                job["leads"] = pessoas[:mx]
+                _li_uso(d, "extracao", len(job["leads"]))
+                job["aviso"] = r.get("aviso") or ""
+        elif tipo == "sync_respostas":
+            r = _li_sync_respostas(uid, d)
+        elif tipo == "sync_aceites":
+            r = _li_sync_aceites(uid, d)
+        elif tipo == "sync_posts":
+            r = _li_sync_posts(uid, d)
+        elif tipo == "status":
+            r = _li_exec(uid, {"acao": "li_status"}, timeout=60)
+            if not r.get("erro"):
+                d["conta"].update({"logado": bool(r.get("logado")), "nome": r.get("nome") or d["conta"].get("nome"),
+                                   "url": r.get("url") or d["conta"].get("url"), "slug": _li_slug(r.get("url") or ""),
+                                   "verificado": _li_now()})
+        elif tipo == "publicar":
+            post = next((p for p in d["posts"] if p["id"] == job.get("post_id")), None)
+            r = _li_publicar(uid, d, post) if post else {"erro": "post não encontrado"}
+        else:
+            r = {"erro": "job desconhecido"}
+    except Exception as e:
+        r = {"erro": str(e)[:200]}
+    finally:
+        _LI_RUNNING.pop(uid, None)
+    job["status"] = "erro" if r.get("erro") else "ok"
+    job["erro"] = str(r.get("erro") or "")[:240]
+    job["fim"] = _li_now()
+
+
+def _li_tick_user(uid, d):
+    d["_uid"] = uid
+    if not _li_conectado(uid):
+        return
+    # 1) jobs pedidos pela pessoa (sempre, mesmo fora do horário)
+    job = next((j for j in d["jobs"] if j.get("status") == "pendente"), None)
+    if job:
+        _li_job_run(uid, d, job)
+        return
+    if d["limites"].get("pausado"):
+        return
+    agora = _li_now()
+    forcar = (d["conta"].get("forcar_ate") or 0) > agora
+    # 2) posts agendados
+    post = next((p for p in d["posts"] if p.get("status") == "agendado" and (p.get("agendado_para") or 0) <= agora), None)
+    if post:
+        _li_publicar(uid, d, post)
+        return
+    if not (forcar or _li_na_janela(d)):
+        return
+    if d["conta"].get("logado") is False and agora - (d["conta"].get("verificado") or 0) < 1800:
+        return
+    # 3) sincronizações periódicas
+    s = d["sync"]
+    tem_conv = any(l.get("convidado_em") and not l.get("conectado_em") and l["status"] not in _LI_FIM for l in d["leads"].values())
+    tem_ativos = any(c.get("status") == "ativa" for c in d["campanhas"])
+    if (tem_ativos or d["crm"]) and agora - (s.get("respostas") or 0) > 3600:
+        _li_sync_respostas(uid, d)
+        return
+    if tem_conv and agora - (s.get("aceites") or 0) > 4 * 3600:
+        _li_sync_aceites(uid, d)
+        return
+    if any(p.get("status") == "publicado" for p in d["posts"]) and agora - (s.get("posts") or 0) > 6 * 3600:
+        _li_sync_posts(uid, d)
+        return
+    if any(a.get("ativo") for a in d["automacoes"]) and agora - (s.get("automacoes") or 0) > 2 * 3600:
+        _li_rodar_automacoes(uid, d)
+        return
+    # 4) ações (respeitando o intervalo aleatório entre ações)
+    if not forcar and (d["conta"].get("proxima_acao_em") or 0) > agora:
+        return
+    av = sorted([a for a in d["avulsas"] if a.get("status") == "pendente" and (a.get("prox_em") or 0) <= agora],
+                key=lambda a: a.get("prox_em") or 0)
+    for a in av:
+        res = _li_exec_avulsa(uid, d, a)
+        if res in ("ok", "erro"):
+            _li_proxima_acao(d)
+            return
+    ativas = {c["id"]: c for c in d["campanhas"] if c.get("status") == "ativa"}
+    cands = sorted([l for l in d["leads"].values() if l.get("campanha_id") in ativas and l["status"] not in _LI_FIM
+                    and l.get("prox_em") and l["prox_em"] <= agora], key=lambda l: l["prox_em"])
+    bloqueados = set()
+    for lead in cands[:60]:
+        c = ativas[lead["campanha_id"]]
+        passo = (c.get("passos") or [{}])[lead.get("passo_idx", 0)] if lead.get("passo_idx", 0) < len(c.get("passos") or []) else None
+        if not passo:
+            lead["status"] = "concluido"
+            continue
+        if passo.get("tipo") in bloqueados:
+            continue
+        res = _li_exec_passo(uid, d, lead, c)
+        if res == "limite":
+            bloqueados.add(passo.get("tipo"))
+            continue
+        if res in ("aguardar", "espera"):
+            continue                                            # não toca o LinkedIn: segue para o próximo lead
+        _li_proxima_acao(d)
+        return
+    # campanhas sem nada pendente → concluídas
+    for c in ativas.values():
+        if c.get("leads") and all(d["leads"].get(i, {}).get("status") in _LI_FIM for i in c["leads"]):
+            c["status"] = "concluida"
+            c["atualizado"] = agora
+
+
+def _li_worker():
+    time.sleep(15)
+    while True:
+        try:
+            for uid in list(_LI.keys()):
+                if uid in _LI_RUNNING:
+                    continue
+                d = _li_db(uid)
+                try:
+                    _li_tick_user(uid, d)
+                finally:
+                    _li_save()
+        except Exception as e:
+            print("[cerne] linkedin worker:", str(e)[:200])
+        _LI_WAKE.wait(20)
+        _LI_WAKE.clear()
+
+
+
+# ---------- conteúdo (IA) ----------
+_LI_OBJ_NEG = ["Aumentar seguidores", "Criar networking", "Recrutar talentos", "Aumentar engajamento",
+               "Construir autoridade", "Gerar leads"]
+
+
+def _li_calibragem(e):
+    obj = e.get("objetivo") or "negocio"
+    if obj == "carreira":
+        campos = ["linkedin_url", "cargo_atual", "area", "trajetoria", "conquistas", "objetivo_carreira", "tom_voz"]
+    else:
+        campos = ["linkedin_url", "site", "descricao", "proposta_valor", "produtos", "diferenciais", "tom_voz"]
+    campos += ["icp_cargos", "icp_setores", "icp_dores", "icp_desejos", "posts_ref", "extra_cta"]
+    pontos = sum(1 for k in campos if str(e.get(k) or "").strip()) + (1 if e.get("objetivos") else 0)
+    return round(100 * pontos / (len(campos) + 1))
+
+
+def _li_contexto(e):
+    obj = e.get("objetivo") or "negocio"
+    L = []
+    if obj == "carreira":
+        L.append("OBJETIVO NO LINKEDIN: carreira — construir autoridade, posicionamento e expandir a rede (profissional CLT).")
+        for k, rot in (("cargo_atual", "Cargo atual"), ("area", "Área de atuação"), ("trajetoria", "Trajetória"),
+                       ("conquistas", "Conquistas e resultados"), ("objetivo_carreira", "Onde quer chegar")):
+            if e.get(k):
+                L.append(f"{rot}: {e[k]}")
+    else:
+        L.append("OBJETIVO NO LINKEDIN: negócio — gerar leads e vendas.")
+        for k, rot in (("site", "Site"), ("descricao", "Descrição do negócio"), ("proposta_valor", "Proposta de valor"),
+                       ("produtos", "Produtos/serviços"), ("diferenciais", "Diferenciais")):
+            if e.get(k):
+                L.append(f"{rot}: {e[k]}")
+    if e.get("objetivos"):
+        L.append("Objetivos com o conteúdo: " + ", ".join(e["objetivos"]))
+    if e.get("tom_voz"):
+        L.append("Tom de voz: " + e["tom_voz"])
+    icp = [(k, r) for k, r in (("icp_cargos", "Cargos"), ("icp_setores", "Setores"), ("icp_porte", "Porte"),
+                               ("icp_dores", "Dores"), ("icp_desejos", "Desejos"), ("icp_objecoes", "Objeções")) if e.get(k)]
+    if icp:
+        L.append("PÚBLICO (ICP): " + " | ".join(f"{r}: {e[k]}" for k, r in icp))
+    if e.get("posts_ref"):
+        L.append("POSTS DE REFERÊNCIA (imite o estilo, não o conteúdo):\n" + str(e["posts_ref"])[:4000])
+    for k, rot in (("extra_cta", "CTA padrão"), ("extra_evitar", "Evite"), ("extra_hashtags", "Hashtags"),
+                   ("extra_info", "Outras informações")):
+        if e.get(k):
+            L.append(f"{rot}: {e[k]}")
+    L.append("Emojis: " + ("pode usar com moderação" if e.get("extra_emojis", True) else "não use emojis"))
+    return "\n".join(L)
+
+
+_LI_TIPOS_POST = {"livre": "Post livre", "storytelling": "Storytelling (história pessoal com aprendizado)",
+                  "lista": "Lista de dicas práticas", "opiniao": "Opinião forte / contraponto",
+                  "case": "Case de sucesso (problema → solução → resultado)", "bastidores": "Bastidores do trabalho",
+                  "tutorial": "Passo a passo / tutorial", "pergunta": "Pergunta para engajar a rede"}
+
+_LI_VICIOS = ("Reescreva o post abaixo para que pareça escrito por uma pessoa, não por IA. Remova os vícios de IA: "
+              "aberturas genéricas ('No mundo de hoje', 'Em um cenário cada vez mais'), travessões em excesso, frases "
+              "de efeito vazias ('não é sobre X, é sobre Y'), listas com emoji em todo item, palavras como 'jornada', "
+              "'desbloquear', 'potencializar', 'alavancar', 'crucial', 'fundamental', 'transformador', exagero de "
+              "adjetivos, conclusões moralistas e perguntas retóricas forçadas no fim. Mantenha a ideia, os fatos e o "
+              "tamanho; frases curtas, ritmo de conversa, parágrafos de 1-3 linhas, primeira pessoa. Não invente números. "
+              "Responda SOMENTE com o texto final do post, sem aspas e sem comentários.\n\nPOST:\n")
+
+
+def _li_modelos():
+    """Cadeia de modelos para escrita: LLM paga configurada → externos bons habilitados na org → local soberano.
+    (Uma chave paga inválida/sem saldo não pode derrubar a qualidade: cada um é tentado e o próximo assume.)"""
+    cands = []
+    m = _marca_best_text_model()
+    if m != "chat":
+        cands.append(m)
+    try:
+        perm = _ext_permitidos(None) or []
+    except Exception:
+        perm = []
+    for a in ("ext-nvidia-ultra", "ext-reason", "ext-nvidia-mistral", "ext-mistral", _best_provider()):
+        if a and a in perm and a not in cands:
+            cands.append(a)
+    cands.append("chat")
+    return cands
+
+
+def _li_modelo():
+    return _li_modelos()[0]
+
+
+def _li_gerar_texto(prompt, max_tokens=1400):
+    msgs = [{"role": "user", "content": prompt}]
+    for m in _li_modelos():
+        try:
+            t = _strip_think(chat_model(m, msgs, max_tokens=max_tokens) or "").strip().strip('"').strip()
+            if len(t) >= 40:
+                return t
+        except Exception as ex:
+            print(f"[cerne] linkedin: modelo '{m}' falhou ({str(ex)[:80]})")
+    return ""
+
+
+def _li_limpa_post(t):
+    t = re.sub(r"^\s*(entendido|claro|perfeito|certo|ok|aqui está|segue|vou criar)[^\n]{0,160}\n+", "", t or "", flags=re.I)
+    t = re.sub(r"^\s*(\*\*)?(post|texto do post|aqui está.*?)(\*\*)?\s*:\s*\n", "", t or "", flags=re.I)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)                      # LinkedIn publica texto puro
+    t = re.sub(r"(?m)^#{1,6}\s*", "", t)
+    return t.strip()[:3000]
+
+
+# ---------- endpoints ----------
+class LiCampanhaReq(BaseModel):
+    nome: str = ""
+    passos: list = []
+    leads: list = []
+    config: dict = {}
+    lancar: bool = False
+
+
+@app.get("/linkedin/estado")
+def li_estado(campanha: str = ""):
+    u = _li_user()
+    d = _li_db(u["id"])
+    d["_uid"] = u["id"]
+    camps = [_li_camp_pub(d, c) for c in sorted(d["campanhas"], key=lambda c: -(c.get("atualizado") or 0))]
+    nleads = len(d["leads"])
+    conta = dict(d["conta"])
+    conta.pop("forcar_ate", None)
+    conta["proxima_acao_em"] = _li_iso(conta.get("proxima_acao_em"))
+    conta["convites_bloqueados_ate"] = _li_iso(conta.get("convites_bloqueados_ate"))
+    conta["verificado"] = _li_iso(conta.get("verificado"))
+    return {"conta": conta, "extensao": _li_conectado(u["id"]), "metricas": _li_metricas(d, campanha or None),
+            "campanhas": camps, "n_leads": nleads, "fila": _li_fila_stats(d),
+            "sync": {k: _li_iso(v) for k, v in d["sync"].items()}, "na_janela": _li_na_janela(d),
+            "pausado": bool(d["limites"].get("pausado")), "passos": _LI_PASSOS, "etapas": _LI_ETAPAS}
+
+
+@app.get("/linkedin/leads")
+def li_leads(campanha: str = "", q: str = "", status: str = "", limite: int = 300):
+    u = _li_user()
+    d = _li_db(u["id"])
+    nomes = {c["id"]: c.get("nome") for c in d["campanhas"]}
+    q = (q or "").lower().strip()
+    out = []
+    for l in sorted(d["leads"].values(), key=lambda l: -(l.get("criado") or 0)):
+        if campanha and l.get("campanha_id") != campanha:
+            continue
+        if status and l.get("status") != status:
+            continue
+        if q and q not in " ".join([l.get("nome") or "", l.get("empresa") or "", l.get("cargo") or "", l.get("slug") or ""]).lower():
+            continue
+        out.append({"id": l["id"], "nome": l.get("nome") or l.get("slug"), "url": l["url"], "cargo": l.get("cargo") or "",
+                    "empresa": l.get("empresa") or "", "status": l["status"], "campanha": nomes.get(l.get("campanha_id"), "—"),
+                    "campanha_id": l.get("campanha_id"), "passo": l.get("passo_idx", 0), "prox_em": _li_iso(l.get("prox_em")),
+                    "convidado": bool(l.get("convidado_em")), "conectado": bool(l.get("conectado_em")),
+                    "respondeu": bool(l.get("respondeu_em")), "erro": l.get("erro") or "",
+                    "ultimo": ((l.get("historico") or [{}])[-1].get("txt") or "")})
+        if len(out) >= max(1, min(limite, 2000)):
+            break
+    return {"leads": out, "total": len(d["leads"])}
+
+
+@app.post("/linkedin/campanhas")
+def li_campanha_criar(body: LiCampanhaReq):
+    u = _li_user()
+    d = _li_db(u["id"])
+    passos = [{"id": p.get("id") or _li_id(), "tipo": p.get("tipo"), "cfg": p.get("cfg") or {}}
+              for p in body.passos if p.get("tipo") in _LI_PASSOS]
+    if not passos:
+        raise HTTPException(status_code=400, detail="monte a cadência com pelo menos um passo")
+    if not any(p["tipo"] != "aguardar" for p in passos):
+        raise HTTPException(status_code=400, detail="a cadência precisa de ao menos uma ação além de 'Aguardar'")
+    for p in passos:
+        if p["tipo"] == "mensagem" and not (p["cfg"].get("texto") or "").strip():
+            raise HTTPException(status_code=400, detail="há um passo 'Enviar mensagem' sem texto")
+    cfg = body.config or {}
+    with _LI_LOCK:
+        cid = _li_id()
+        c = {"id": cid, "nome": (body.nome or "").strip()[:120] or f"Campanha {len(d['campanhas']) + 1}",
+             "status": "rascunho", "passos": passos, "leads": [], "criado": _li_now(), "atualizado": _li_now(),
+             "config": {"parar_ao_responder": cfg.get("parar_ao_responder", True),
+                        "pular_existentes": cfg.get("pular_existentes", True), "notas": (cfg.get("notas") or "")[:500]}}
+        existentes = {l["slug"] for l in d["leads"].values() if l.get("slug")} if c["config"]["pular_existentes"] else set()
+        pulados = 0
+        vist = set()
+        for p in body.leads[:2000]:
+            s = _li_slug(p.get("url") or "")
+            if not s or s in vist:
+                continue
+            vist.add(s)
+            if s in existentes:
+                pulados += 1
+                continue
+            lead = _li_lead_novo(d, cid, p)
+            if lead:
+                c["leads"].append(lead["id"])
+        if not c["leads"]:
+            raise HTTPException(status_code=400, detail="nenhum lead válido" + (f" ({pulados} já estão em outras campanhas)" if pulados else ""))
+        d["campanhas"].append(c)
+        if body.lancar:
+            _li_lancar(d, c)
+    _li_save()
+    _event("linkedin · campanha criada", f"{c['nome']} · {len(c['leads'])} leads", actor=_actor())
+    _LI_WAKE.set()
+    return {"ok": True, "id": cid, "pulados": pulados, "campanha": _li_camp_pub(d, c)}
+
+
+def _li_lancar(d, c):
+    agora = _li_now()
+    import random as _r
+    for i, lid in enumerate(c["leads"]):
+        l = d["leads"].get(lid)
+        if l and l["status"] == "pendente":
+            l["status"] = "na_fila"
+            l["prox_em"] = agora + i * _r.randint(5, 20)
+    c["status"] = "ativa"
+    c["atualizado"] = agora
+
+
+@app.post("/linkedin/campanhas/{cid}")
+def li_campanha_acao(cid: str, body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    acao = (body or {}).get("acao")
+    with _LI_LOCK:
+        c = _li_camp(d, cid)
+        if not c:
+            raise HTTPException(status_code=404, detail="campanha não encontrada")
+        if acao == "lancar" or acao == "retomar":
+            if c["status"] == "rascunho":
+                _li_lancar(d, c)
+            else:
+                c["status"] = "ativa"
+                for l in _li_camp_leads(d, c):
+                    if l["status"] not in _LI_FIM and not l.get("prox_em"):
+                        l["prox_em"] = _li_now()
+        elif acao == "pausar":
+            c["status"] = "pausada"
+        elif acao == "arquivar":
+            c["arquivada"] = True
+            if c["status"] == "ativa":
+                c["status"] = "pausada"
+        elif acao == "desarquivar":
+            c["arquivada"] = False
+        elif acao == "renomear":
+            c["nome"] = (body.get("nome") or c["nome"])[:120]
+        elif acao == "editar_passos":
+            passos = [{"id": p.get("id") or _li_id(), "tipo": p.get("tipo"), "cfg": p.get("cfg") or {}}
+                      for p in body.get("passos") or [] if p.get("tipo") in _LI_PASSOS]
+            if passos:
+                c["passos"] = passos
+                for l in _li_camp_leads(d, c):
+                    if l.get("passo_idx", 0) >= len(passos) and l["status"] not in _LI_FIM:
+                        l["status"] = "concluido"
+        elif acao == "adicionar_leads":
+            n = 0
+            existentes = {l["slug"] for l in _li_camp_leads(d, c)}
+            for p in body.get("leads") or []:
+                s = _li_slug(p.get("url") or "")
+                if s and s not in existentes:
+                    lead = _li_lead_novo(d, cid, p)
+                    if lead:
+                        existentes.add(s)
+                        c["leads"].append(lead["id"])
+                        if c["status"] == "ativa":
+                            lead["status"] = "na_fila"
+                            lead["prox_em"] = _li_now() + n * 10
+                        n += 1
+        elif acao == "duplicar":
+            nc = {"id": _li_id(), "nome": c["nome"] + " (cópia)", "status": "rascunho", "passos": json.loads(json.dumps(c["passos"])),
+                  "leads": [], "criado": _li_now(), "atualizado": _li_now(), "config": dict(c.get("config") or {})}
+            d["campanhas"].append(nc)
+        elif acao == "excluir":
+            for lid in c.get("leads") or []:
+                d["leads"].pop(lid, None)
+            d["campanhas"].remove(c)
+            _li_save()
+            return {"ok": True}
+        else:
+            raise HTTPException(status_code=400, detail="ação inválida")
+        c["atualizado"] = _li_now()
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "campanha": _li_camp_pub(d, c)}
+
+
+@app.get("/linkedin/campanhas/{cid}")
+def li_campanha_get(cid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    c = _li_camp(d, cid)
+    if not c:
+        raise HTTPException(status_code=404, detail="campanha não encontrada")
+    st = {}
+    for l in _li_camp_leads(d, c):
+        st[l["status"]] = st.get(l["status"], 0) + 1
+    return {"campanha": _li_camp_pub(d, c), "metricas": _li_metricas(d, cid), "por_status": st}
+
+
+@app.post("/linkedin/leads/{lid}")
+def li_lead_acao(lid: str, body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        l = d["leads"].get(lid)
+        if not l:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        acao = (body or {}).get("acao")
+        if acao == "remover":
+            c = _li_camp(d, l.get("campanha_id"))
+            if c and lid in c["leads"]:
+                c["leads"].remove(lid)
+            d["leads"].pop(lid, None)
+        elif acao == "pular":
+            l["status"] = "ignorado"
+            l["prox_em"] = None
+        elif acao == "crm":
+            _li_crm_upsert(d, l["url"], l.get("nome"), l.get("cargo"), l.get("empresa"),
+                           origem={"tipo": "Manual", "detalhe": "adicionado da lista de leads"}, nao_lido=False)
+        else:
+            raise HTTPException(status_code=400, detail="ação inválida")
+    _li_save()
+    return {"ok": True}
+
+
+@app.post("/linkedin/importar")
+def li_importar(body: dict):
+    """Extrai leads de uma busca do LinkedIn / Sales Navigator / publicação (comentários e reações) pela extensão."""
+    u = _li_user()
+    d = _li_db(u["id"])
+    url = (body.get("url") or "").strip()
+    fonte = body.get("fonte") or "busca"
+    if not re.match(r"https?://(www\.)?linkedin\.com/", url):
+        raise HTTPException(status_code=400, detail="cole uma URL completa do LinkedIn")
+    if fonte == "post" and not re.search(r"/(posts|feed/update)/", url):
+        raise HTTPException(status_code=400, detail="essa não parece a URL de uma publicação (use 'Copiar link para a publicação')")
+    if fonte in ("busca", "sales") and "/search/" not in url and "/sales/" not in url:
+        raise HTTPException(status_code=400, detail="essa não parece a URL de uma busca de pessoas do LinkedIn")
+    if not _li_conectado(u["id"]):
+        raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada neste navegador — instale/pareie em Baixar Extensão")
+    job = {"id": _li_id(), "tipo": "importar", "fonte": fonte, "url": url, "max": int(body.get("max") or 25),
+           "modo": body.get("modo") or "ambos", "status": "pendente", "criado": _li_now(), "leads": []}
+    with _LI_LOCK:
+        d["jobs"].append(job)
+        d["jobs"] = d["jobs"][-30:]
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "job": job["id"]}
+
+
+@app.post("/linkedin/job")
+def li_job_criar(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    tipo = body.get("tipo")
+    if tipo not in ("sync_respostas", "sync_aceites", "sync_posts", "status"):
+        raise HTTPException(status_code=400, detail="tipo inválido")
+    if not _li_conectado(u["id"]):
+        raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada — abra o navegador com a extensão pareada")
+    with _LI_LOCK:
+        j = next((x for x in d["jobs"] if x.get("tipo") == tipo and x.get("status") in ("pendente", "rodando")), None)
+        if not j:
+            j = {"id": _li_id(), "tipo": tipo, "status": "pendente", "criado": _li_now()}
+            d["jobs"].append(j)
+            d["jobs"] = d["jobs"][-30:]
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "job": j["id"]}
+
+
+@app.get("/linkedin/job/{jid}")
+def li_job_get(jid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    j = next((x for x in d["jobs"] if x["id"] == jid), None)
+    if not j:
+        raise HTTPException(status_code=404, detail="job não encontrado")
+    return {k: v for k, v in j.items()}
+
+
+@app.post("/linkedin/processar")
+def li_processar():
+    """'Processar agora': ignora o intervalo e o horário por 10 min (os limites diários continuam valendo)."""
+    u = _li_user()
+    d = _li_db(u["id"])
+    d["conta"]["forcar_ate"] = _li_now() + 600
+    d["conta"]["proxima_acao_em"] = 0
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "extensao": _li_conectado(u["id"])}
+
+
+@app.get("/linkedin/limites")
+def li_limites_get():
+    u = _li_user()
+    d = _li_db(u["id"])
+    uso = {k: _li_uso_hoje(d, k) for k in ("convites", "mensagens", "visitas", "curtidas", "extracao")}
+    uso["convites_semana"] = _li_uso_semana(d, "convites")
+    log = [dict(x, t=_li_iso(x.get("t"))) for x in d["log"][-80:]][::-1]
+    return {"limites": d["limites"], "uso": uso, "log": log, "na_janela": _li_na_janela(d)}
+
+
+@app.post("/linkedin/limites")
+def li_limites_set(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    lim = d["limites"]
+    teto = {"convites_dia": 100, "convites_semana": 200, "mensagens_dia": 150, "visitas_dia": 250, "curtidas_dia": 150,
+            "extracao_dia": 1000, "intervalo_min": 3600, "intervalo_max": 7200, "hora_inicio": 23, "hora_fim": 24}
+    with _LI_LOCK:
+        for k, mx in teto.items():
+            if k in body:
+                try:
+                    lim[k] = max(0, min(int(body[k]), mx))
+                except Exception:
+                    pass
+        if lim["intervalo_min"] < 20:
+            lim["intervalo_min"] = 20
+        if lim["intervalo_max"] < lim["intervalo_min"]:
+            lim["intervalo_max"] = lim["intervalo_min"]
+        if "dias" in body and isinstance(body["dias"], list):
+            lim["dias"] = sorted({int(x) for x in body["dias"] if str(x).isdigit() and 0 <= int(x) <= 6})
+        if "pausado" in body:
+            lim["pausado"] = bool(body["pausado"])
+        if "image_creator_url" in body and re.match(r"^https://", body.get("image_creator_url") or ""):
+            lim["image_creator_url"] = body["image_creator_url"][:400]
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "limites": lim}
+
+
+# --- CRM ---
+@app.get("/linkedin/crm")
+def li_crm_list():
+    u = _li_user()
+    d = _li_db(u["id"])
+    cts = sorted((_li_crm_pub(c) for c in d["crm"].values()), key=lambda c: -c["atualizado_ts"])
+    return {"contatos": cts, "etapas": _LI_ETAPAS,
+            "nao_lidos": sum(1 for c in cts if c["nao_lido"]),
+            "atrasadas": sum(1 for c in cts for t in c["tarefas"] if t.get("atrasada")),
+            "ganhos": sum(1 for c in cts if c["etapa"] == "Ganho")}
+
+
+@app.post("/linkedin/crm")
+def li_crm_criar(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    url = (body.get("url") or "").strip()
+    if not _li_slug(url) and not (body.get("nome") or "").strip():
+        raise HTTPException(status_code=400, detail="informe a URL do perfil ou o nome")
+    ct = _li_crm_upsert(d, url, (body.get("nome") or "").strip(), (body.get("cargo") or "").strip(),
+                        (body.get("empresa") or "").strip(), origem={"tipo": "Manual", "detalhe": "criado no CRM"}, nao_lido=False)
+    _li_save()
+    return {"ok": True, "contato": _li_crm_pub(ct)}
+
+
+@app.post("/linkedin/crm/{cid}")
+def li_crm_acao(cid: str, body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        ct = d["crm"].get(cid)
+        if not ct:
+            raise HTTPException(status_code=404, detail="contato não encontrado")
+        acao = body.get("acao")
+        if acao == "etapa" and body.get("etapa") in _LI_ETAPAS:
+            if ct.get("etapa") != body["etapa"]:
+                ct["notas"].append({"texto": f"etapa: {ct.get('etapa')} → {body['etapa']}", "por": _actor(), "em": _li_now(), "sistema": True})
+            ct["etapa"] = body["etapa"]
+        elif acao == "lido":
+            ct["nao_lido"] = False
+        elif acao == "tags":
+            ct["tags"] = [t.strip()[:30] for t in str(body.get("tags") or "").split(",") if t.strip()][:15]
+        elif acao == "tarefa":
+            txt = (body.get("texto") or "").strip()
+            if not txt:
+                raise HTTPException(status_code=400, detail="descreva a tarefa")
+            quando = None
+            if body.get("quando"):
+                try:
+                    import datetime as _dt
+                    quando = _dt.datetime.fromisoformat(body["quando"]).replace(tzinfo=_li_local().tzinfo).timestamp()
+                except Exception:
+                    quando = None
+            ct["tarefas"].append({"id": _li_id(), "texto": txt[:200], "quando": quando,
+                                  "prioridade": body.get("prioridade") if body.get("prioridade") in ("Baixa", "Normal", "Alta") else "Normal",
+                                  "feita": False})
+        elif acao == "tarefa_feita":
+            for t in ct["tarefas"]:
+                if t["id"] == body.get("id"):
+                    t["feita"] = not t.get("feita")
+        elif acao == "tarefa_excluir":
+            ct["tarefas"] = [t for t in ct["tarefas"] if t["id"] != body.get("id")]
+        elif acao == "nota":
+            txt = (body.get("texto") or "").strip()
+            if txt:
+                ct["notas"].append({"texto": txt[:2000], "por": _actor(), "em": _li_now()})
+        elif acao == "editar":
+            for k in ("nome", "cargo", "empresa"):
+                if k in body:
+                    ct[k] = (body.get(k) or "").strip()[:200]
+        elif acao == "mensagem":
+            txt = (body.get("texto") or "").strip()
+            if not txt or not ct.get("slug"):
+                raise HTTPException(status_code=400, detail="escreva a mensagem (o contato precisa ter URL do LinkedIn)")
+            d["avulsas"].append({"id": _li_id(), "tipo": "mensagem", "url": ct["url"], "nome": ct.get("nome"), "texto": txt[:3000],
+                                 "status": "pendente", "prox_em": _li_now(), "origem": "CRM", "contato_id": cid})
+            d["conta"]["forcar_ate"] = _li_now() + 300                  # mensagem do CRM sai já (limites valem)
+            d["conta"]["proxima_acao_em"] = 0
+        elif acao == "excluir":
+            d["crm"].pop(cid, None)
+            _li_save()
+            return {"ok": True}
+        else:
+            raise HTTPException(status_code=400, detail="ação inválida")
+        ct["atualizado"] = _li_now()
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "contato": _li_crm_pub(ct)}
+
+
+# --- Inbound: estratégia ---
+@app.get("/linkedin/estrategia")
+def li_estrategia_get():
+    u = _li_user()
+    d = _li_db(u["id"])
+    e = d["estrategia"]
+    return {"estrategia": e, "calibragem": _li_calibragem(e), "objetivos_opcoes": _LI_OBJ_NEG}
+
+
+@app.post("/linkedin/estrategia")
+def li_estrategia_set(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        e = d["estrategia"]
+        for k, v in (body or {}).items():
+            if k == "objetivos" and isinstance(v, list):
+                e[k] = [x for x in v if x in _LI_OBJ_NEG]
+            elif k == "extra_emojis":
+                e[k] = bool(v)
+            elif isinstance(v, str) and re.match(r"^[a-z_]{2,30}$", k):
+                e[k] = v[:6000]
+    _li_save()
+    return {"ok": True, "calibragem": _li_calibragem(d["estrategia"])}
+
+
+@app.get("/linkedin/estrategia/contexto")
+def li_estrategia_contexto():
+    u = _li_user()
+    d = _li_db(u["id"])
+    return {"contexto": _li_contexto(d["estrategia"]), "modelo": " → ".join(_li_modelos())}
+
+
+# --- Inbound: posts ---
+def _li_post_pub(p):
+    return {"id": p["id"], "texto": p.get("texto") or "", "status": p.get("status") or "rascunho",
+            "agendado_para": _li_iso(p.get("agendado_para")), "publicado_em": _li_iso(p.get("publicado_em")),
+            "publicado_ts": p.get("publicado_em") or 0, "criado": _li_iso(p.get("criado")),
+            "midias": [{"id": m["id"], "nome": m.get("nome"), "tipo": m.get("tipo")} for m in p.get("midias") or []],
+            "visibilidade": p.get("visibilidade") or "qualquer", "comentarios": p.get("comentarios") or "qualquer",
+            "metricas": p.get("metricas") or {}, "metricas_em": _li_iso(p.get("metricas_em")),
+            "li_url": p.get("li_url") or "", "erro": p.get("erro") or "", "origem": p.get("origem") or "cerne",
+            "imagem_prompt": p.get("imagem_prompt") or ""}
+
+
+@app.get("/linkedin/posts")
+def li_posts(periodo: str = "tudo", de: str = "", ate: str = ""):
+    u = _li_user()
+    d = _li_db(u["id"])
+    agora = _li_now()
+    ini, fim = 0, agora + 10 ** 9
+    if periodo in ("7", "14", "30"):
+        ini = agora - int(periodo) * 86400
+    elif periodo == "custom":
+        import datetime as _dt
+        try:
+            ini = _dt.datetime.fromisoformat(de).timestamp() if de else 0
+            fim = (_dt.datetime.fromisoformat(ate).timestamp() + 86400) if ate else fim
+        except Exception:
+            pass
+    pubs = [p for p in d["posts"] if p.get("status") == "publicado" and ini <= (p.get("publicado_em") or 0) <= fim]
+    tot = {"impressoes": 0, "reacoes": 0, "comentarios": 0, "compartilhamentos": 0}
+    for p in pubs:
+        for k in tot:
+            tot[k] += int((p.get("metricas") or {}).get(k) or 0)
+    tot["interacoes"] = tot["reacoes"] + tot["comentarios"] + tot["compartilhamentos"]
+    posts = sorted(d["posts"], key=lambda p: -(p.get("agendado_para") or p.get("publicado_em") or p.get("criado") or 0))
+    return {"posts": [_li_post_pub(p) for p in posts], "totais": tot, "n_periodo": len(pubs),
+            "sync_posts": _li_iso(d["sync"].get("posts")), "image_creator_url": d["limites"].get("image_creator_url")}
+
+
+@app.post("/linkedin/posts/gerar")
+def li_post_gerar(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    assunto = (body.get("assunto") or "").strip()
+    if not assunto:
+        raise HTTPException(status_code=400, detail="descreva o assunto do post")
+    tipo = _LI_TIPOS_POST.get(body.get("tipo") or "livre", "Post livre")
+    ctx = _li_contexto(d["estrategia"])
+    prompt = ("Você é ghostwriter de LinkedIn no Brasil. Escreva UM post em português do Brasil para o perfil descrito "
+              "no CONTEXTO, sobre o ASSUNTO. Formato: " + tipo + ". Regras: gancho forte na 1ª linha (até 12 palavras, "
+              "sem clichê); parágrafos curtos de 1-3 linhas com linha em branco entre eles; escaneável; conteúdo concreto "
+              "e útil para o público (ICP); ligue o tema ao negócio/carreira sem virar propaganda; termine com um CTA "
+              "natural (pergunta ou convite) alinhado ao objetivo; 900-1600 caracteres; texto puro (sem markdown, sem **); "
+              "no máximo 3 hashtags no final se fizer sentido. Não invente números, clientes ou resultados que não estão "
+              "no contexto.\n\nCONTEXTO:\n" + ctx + "\n\nASSUNTO: " + assunto +
+              ("\nORIENTAÇÕES ADICIONAIS: " + body["orientacoes"].strip() if (body.get("orientacoes") or "").strip() else "") +
+              "\n\nResponda SOMENTE com o texto do post.")
+    rasc = _li_limpa_post(_li_gerar_texto(prompt, 1600))
+    if len(rasc) < 80:
+        raise HTTPException(status_code=502, detail="o modelo não devolveu um post — tente de novo")
+    final = _li_limpa_post(_li_gerar_texto(_LI_VICIOS + rasc, 1600))   # 2ª passada: tira os vícios de IA
+    if len(final) < 0.5 * len(rasc):
+        final = rasc
+    post = {"id": _li_id(), "texto": final, "status": "rascunho", "criado": _li_now(), "midias": [],
+            "origem": "cerne", "assunto": assunto[:300], "tipo": body.get("tipo") or "livre"}
+    with _LI_LOCK:
+        d["posts"].append(post)
+    _li_save()
+    _event("linkedin · post gerado", assunto[:80], actor=_actor())
+    return {"ok": True, "post": _li_post_pub(post)}
+
+
+@app.post("/linkedin/posts")
+def li_post_salvar(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        pid = body.get("id")
+        post = next((p for p in d["posts"] if p["id"] == pid), None) if pid else None
+        if not post:
+            post = {"id": _li_id(), "status": "rascunho", "criado": _li_now(), "midias": [], "origem": "cerne"}
+            d["posts"].append(post)
+        if post.get("status") in ("publicado", "publicando"):
+            raise HTTPException(status_code=400, detail="post já publicado não pode ser editado aqui")
+        txt = (body.get("texto") or "").strip()
+        if len(txt) > 3000:
+            raise HTTPException(status_code=400, detail="o LinkedIn aceita até 3.000 caracteres")
+        post["texto"] = txt
+        post["visibilidade"] = body.get("visibilidade") if body.get("visibilidade") in ("qualquer", "conexoes") else "qualquer"
+        post["comentarios"] = body.get("comentarios") if body.get("comentarios") in ("qualquer", "conexoes", "ninguem") else "qualquer"
+        acao = body.get("acao") or "rascunho"
+        if acao == "agendar":
+            import datetime as _dt
+            try:
+                ts = _dt.datetime.fromisoformat(body.get("agendado_para") or "").replace(tzinfo=_li_local().tzinfo).timestamp()
+            except Exception:
+                raise HTTPException(status_code=400, detail="escolha data e hora para agendar")
+            if ts < _li_now() - 60:
+                raise HTTPException(status_code=400, detail="a data do agendamento já passou")
+            if not txt:
+                raise HTTPException(status_code=400, detail="o post está vazio")
+            post["agendado_para"] = ts
+            post["status"] = "agendado"
+        elif acao == "publicar":
+            if not txt:
+                raise HTTPException(status_code=400, detail="o post está vazio")
+            if not _li_conectado(u["id"]):
+                raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada — sem ela não dá para publicar")
+            post["status"] = "publicando"
+            d["jobs"].append({"id": _li_id(), "tipo": "publicar", "post_id": post["id"], "status": "pendente", "criado": _li_now()})
+        else:
+            post["status"] = "rascunho"
+            post["agendado_para"] = None
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "post": _li_post_pub(post)}
+
+
+@app.post("/linkedin/posts/{pid}/excluir")
+def li_post_excluir(pid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        d["posts"] = [p for p in d["posts"] if p["id"] != pid]
+    _li_save()
+    return {"ok": True}
+
+
+@app.post("/linkedin/posts/{pid}/imagem-prompt")
+def li_post_imagem_prompt(pid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    post = next((p for p in d["posts"] if p["id"] == pid), None)
+    if not post or not (post.get("texto") or "").strip():
+        raise HTTPException(status_code=400, detail="escreva ou gere o post primeiro")
+    e = d["estrategia"]
+    prompt = ("Crie um PROMPT para gerar UMA imagem que acompanhe o post de LinkedIn abaixo. A imagem deve ser profissional, "
+              "moderna e chamar atenção no feed (formato quadrado 1:1 ou 4:5), com uma metáfora visual clara do tema, "
+              "composição limpa, iluminação de qualidade e, se fizer sentido, um título curto em português (até 6 palavras) "
+              "escrito na imagem com tipografia legível. Evite clichês de banco de imagem, robôs genéricos e excesso de "
+              "elementos. " + (f"Identidade: {e.get('site') or ''} {e.get('tom_voz') or ''}. " if e.get("site") or e.get("tom_voz") else "") +
+              "Responda SOMENTE com o prompt, em português, em um parágrafo de 60-110 palavras.\n\nPOST:\n" + post["texto"][:2500])
+    pr = _li_gerar_texto(prompt, 500)
+    with _LI_LOCK:
+        post["imagem_prompt"] = pr[:1500]
+    _li_save()
+    return {"ok": True, "prompt": post["imagem_prompt"]}
+
+
+@app.post("/linkedin/posts/{pid}/imagem")
+def li_post_imagem(pid: str):
+    """Gera a imagem dentro do Cerne (chave OpenAI/Gemini configurada em Model Ops → LLMs pagas)."""
+    u = _li_user()
+    d = _li_db(u["id"])
+    post = next((p for p in d["posts"] if p["id"] == pid), None)
+    if not post:
+        raise HTTPException(status_code=404, detail="post não encontrado")
+    pr = post.get("imagem_prompt") or li_post_imagem_prompt(pid)["prompt"]
+    png, err = _marca_imagem_hibrida(pr, "1024x1024")
+    if not png:
+        raise HTTPException(status_code=424, detail=(err or "nenhuma chave de imagem configurada") +
+                            " — use 'Copiar prompt' e gere no ChatGPT, depois anexe a imagem em 'Mídia opcional'.")
+    m = _li_midia_salvar(u["id"], "imagem-ia.png", "image/png", png)
+    with _LI_LOCK:
+        post.setdefault("midias", []).insert(0, m)
+        post["midias"] = post["midias"][:20]
+    _li_save()
+    return {"ok": True, "midia": {"id": m["id"], "nome": m["nome"], "tipo": m["tipo"]}}
+
+
+def _li_midia_salvar(uid, nome, tipo, data):
+    pasta = os.path.join(_LI_MEDIA, uid)
+    os.makedirs(pasta, exist_ok=True)
+    mid = _li_id()
+    ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
+           "video/mp4": ".mp4", "application/pdf": ".pdf"}.get(tipo, "")
+    arq = mid + ext
+    with open(os.path.join(pasta, arq), "wb") as f:
+        f.write(data)
+    return {"id": mid, "nome": (nome or arq)[:120], "tipo": tipo, "arquivo": arq}
+
+
+@app.post("/linkedin/posts/{pid}/midia")
+async def li_post_midia(pid: str, file: UploadFile = File(...)):
+    u = _li_user()
+    d = _li_db(u["id"])
+    post = next((p for p in d["posts"] if p["id"] == pid), None)
+    if not post:
+        raise HTTPException(status_code=404, detail="salve o post antes de anexar mídia")
+    tipo = (file.content_type or "").lower()
+    if tipo not in ("image/png", "image/jpeg", "image/gif", "image/webp", "video/mp4", "application/pdf"):
+        raise HTTPException(status_code=400, detail="formato não suportado (imagem, MP4 ou PDF)")
+    data = await file.read()
+    if len(data) > 20 * 1048576:
+        raise HTTPException(status_code=400, detail="arquivo maior que 20 MB")
+    imgs = [m for m in post.get("midias") or [] if (m.get("tipo") or "").startswith("image/")]
+    if not tipo.startswith("image/") and post.get("midias"):
+        raise HTTPException(status_code=400, detail="vídeo/PDF vai sozinho no post (remova as outras mídias)")
+    if tipo.startswith("image/") and len(imgs) >= 20:
+        raise HTTPException(status_code=400, detail="até 20 imagens por post")
+    m = _li_midia_salvar(u["id"], file.filename, tipo, data)
+    with _LI_LOCK:
+        post.setdefault("midias", []).append(m)
+    _li_save()
+    return {"ok": True, "midia": {"id": m["id"], "nome": m["nome"], "tipo": m["tipo"]}}
+
+
+@app.post("/linkedin/posts/{pid}/midia/{mid}/remover")
+def li_post_midia_remover(pid: str, mid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        post = next((p for p in d["posts"] if p["id"] == pid), None)
+        if post:
+            post["midias"] = [m for m in post.get("midias") or [] if m["id"] != mid]
+    _li_save()
+    return {"ok": True}
+
+
+@app.get("/linkedin/midia/{mid}")
+def li_midia_get(mid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    for p in d["posts"]:
+        for m in p.get("midias") or []:
+            if m["id"] == mid:
+                path = os.path.join(_LI_MEDIA, u["id"], m["arquivo"])
+                if os.path.exists(path):
+                    return FileResponse(path, media_type=m.get("tipo") or "application/octet-stream")
+    raise HTTPException(status_code=404, detail="mídia não encontrada")
+
+
+# --- Inbound: automações ---
+@app.get("/linkedin/automacoes")
+def li_automacoes_get():
+    u = _li_user()
+    d = _li_db(u["id"])
+    posts = [{"url": p["li_url"], "texto": (p.get("texto") or "")[:80]} for p in d["posts"] if p.get("li_url")]
+    return {"automacoes": d["automacoes"], "posts": posts[:40], "ultima": _li_iso(d["sync"].get("automacoes"))}
+
+
+@app.post("/linkedin/automacoes")
+def li_automacoes_set(body: dict):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        if body.get("excluir"):
+            d["automacoes"] = [a for a in d["automacoes"] if a["id"] != body["excluir"]]
+        else:
+            novo = {"nome": (body.get("nome") or "Automação").strip()[:80], "ativo": bool(body.get("ativo", True)),
+                    "post_url": (body.get("post_url") or "").strip()[:400],
+                    "gatilho": "palavra" if body.get("gatilho") == "palavra" else "qualquer",
+                    "palavra": (body.get("palavra") or "").strip()[:60], "convite": bool(body.get("convite")),
+                    "nota": (body.get("nota") or "")[:300], "mensagem": bool(body.get("mensagem")),
+                    "texto": (body.get("texto") or "")[:3000]}
+            if novo["gatilho"] == "palavra" and not novo["palavra"]:    # valida ANTES de gravar
+                raise HTTPException(status_code=400, detail="informe a palavra-chave do comentário")
+            if novo["mensagem"] and not novo["texto"].strip():
+                raise HTTPException(status_code=400, detail="escreva a mensagem que será enviada")
+            aid = body.get("id") or _li_id()
+            a = next((x for x in d["automacoes"] if x["id"] == aid), None)
+            if not a:
+                a = {"id": aid, "disparos": 0, "criado": _li_now()}
+                d["automacoes"].append(a)
+            a.update(novo)
+    _li_save()
+    return {"ok": True, "automacoes": d["automacoes"]}
 
 
 # ---- Add-ins do OFFICE (Excel/Word/PowerPoint) — o painel Office.js faz long-poll e executa no app aberto ----
@@ -12452,6 +14042,171 @@ input:disabled{opacity:.4;cursor:not-allowed}
 .modal{position:fixed;inset:0;z-index:100;background:rgba(4,7,14,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center}
 .modalbox{background:var(--panel);border:1px solid var(--glassbrd);border-radius:16px;padding:20px;width:460px;max-width:92vw;box-shadow:var(--glasssh);animation:rise .25s ease both}
 .modalh{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.modalh b{font-size:15px;display:flex;align-items:center;gap:7px}
+/* ===== LinkedIn (Workspace → LinkedIn) ===== */
+.li-wrap{display:grid;grid-template-columns:230px minmax(0,1fr);gap:18px;align-items:start}
+@media(max-width:900px){.li-wrap{grid-template-columns:1fr}}
+.li-side{display:flex;flex-direction:column;gap:12px;position:sticky;top:0}
+.li-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px}
+.li-brand{display:flex;align-items:center;gap:10px;padding:4px 4px 12px;border-bottom:1px solid var(--line);margin-bottom:8px}
+.li-logo{width:34px;height:34px;border-radius:9px;background:#0a66c2;color:#fff;font-weight:800;font-family:Arial,sans-serif;font-size:17px;display:flex;align-items:center;justify-content:center;flex:none}
+.li-brand b{display:block;font-size:14px;color:var(--ink)}.li-brand span{font-size:11px;color:var(--dim)}
+.li-nav{display:flex;align-items:center;gap:9px;width:100%;background:transparent;border:0;border-radius:10px;padding:10px 11px;color:var(--ink2);font-size:13px;font-weight:600;cursor:pointer;text-align:left;font-family:var(--sans)}
+.li-nav:hover{background:var(--panel2)}.li-nav.on{background:linear-gradient(120deg,var(--iris),var(--violet));color:#fff}
+.li-nav svg{width:15px;height:15px;flex:none}.li-nav .li-beta{margin-left:auto;font-size:9px;font-family:var(--mono);background:rgba(176,108,255,.18);color:var(--violet);border-radius:999px;padding:2px 7px}
+.li-nav.on .li-beta{background:rgba(255,255,255,.22);color:#fff}
+.li-conn{margin-top:8px;border-radius:10px;padding:9px 11px;font-size:12px;border:1px solid}
+.li-conn b{display:flex;align-items:center;gap:6px;font-size:12px}.li-conn span{display:block;font-size:11px;margin-top:3px;opacity:.85}
+.li-conn.ok{background:rgba(53,230,160,.08);border-color:rgba(53,230,160,.35);color:var(--ok)}
+.li-conn.warn{background:rgba(255,184,77,.08);border-color:rgba(255,184,77,.35);color:var(--warn);cursor:pointer}
+.li-main{min-width:0;display:flex;flex-direction:column;gap:14px}
+.li-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.li-eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--cyan);font-weight:700;display:flex;align-items:center;gap:6px}
+.li-head h2{margin:6px 0 4px;font-size:21px;color:var(--ink)}.li-head p{margin:0;font-size:12.5px;color:var(--dim)}
+.li-acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.li-btn2{background:var(--panel2);border:1px solid var(--line2);color:var(--ink);border-radius:9px;padding:8px 13px;font-size:12.5px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:var(--sans)}
+.li-btn2:hover{border-color:var(--iris)}.li-btn2:disabled{opacity:.5;cursor:default}
+.li-btn2.sync{background:rgba(53,224,230,.08);border-color:rgba(53,224,230,.35);color:var(--cyan)}
+.li-btn2.ai{background:rgba(176,108,255,.10);border-color:rgba(176,108,255,.35);color:var(--violet)}
+.li-btn2.danger{color:var(--crit);border-color:rgba(255,93,115,.35)}
+.li-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.li-stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.li-stat .ic{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;font-size:14px}
+.li-stat b{display:block;font-size:24px;color:var(--ink);line-height:1.1}.li-stat span{font-size:11.5px;color:var(--dim)}
+.li-info{background:rgba(53,224,230,.06);border:1px solid rgba(53,224,230,.22);border-radius:10px;padding:9px 13px;font-size:12px;color:var(--ink2)}
+.li-seg{display:inline-flex;background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:3px;gap:3px}
+.li-seg button{background:transparent;border:0;border-radius:8px;padding:7px 13px;color:var(--dim);font-size:12.5px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:var(--sans)}
+.li-seg button.on{background:linear-gradient(120deg,var(--iris),var(--violet));color:#fff}
+.li-seg button.on2{background:var(--panel);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.li-seg .n{font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.16);border-radius:999px;padding:1px 7px}
+.li-box{background:var(--panel);border:1px solid var(--line);border-radius:14px}
+.li-bar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--line)}
+.li-search{display:flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--line2);border-radius:9px;padding:0 10px;min-width:220px}
+.li-search input{background:transparent;border:0;outline:none;color:var(--ink);padding:8px 0;font-size:12.5px;width:100%}
+.li-camp{display:grid;grid-template-columns:40px minmax(0,1fr) auto;gap:14px;align-items:center;padding:14px 16px;border-bottom:1px solid var(--line);cursor:pointer}
+.li-camp:last-child{border-bottom:0}.li-camp:hover{background:var(--panel2)}
+.li-camp .ci{width:36px;height:36px;border-radius:10px;background:rgba(108,140,255,.12);color:var(--iris);display:flex;align-items:center;justify-content:center}
+.li-camp h4{margin:0;font-size:14px;color:var(--ink);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.li-camp .meta{font-size:11.5px;color:var(--dim);margin:4px 0 7px;display:flex;gap:12px;flex-wrap:wrap}
+.li-prog{display:flex;align-items:center;gap:12px}.li-prog .tr{flex:1;max-width:330px;height:6px;border-radius:9px;background:var(--line);overflow:hidden}
+.li-prog .tr i{display:block;height:100%;background:linear-gradient(90deg,#0a66c2,var(--cyan));border-radius:9px}
+.li-prog small{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.li-pill{font-size:10.5px;font-weight:700;border-radius:999px;padding:2px 9px}
+.li-pill.ativa,.li-pill.publicado,.li-pill.ok{background:rgba(53,230,160,.14);color:var(--ok)}
+.li-pill.pausada,.li-pill.agendado,.li-pill.aguardando{background:rgba(255,184,77,.15);color:var(--warn)}
+.li-pill.rascunho,.li-pill.cinza{background:var(--panel2);color:var(--dim);border:1px solid var(--line2)}
+.li-pill.concluida,.li-pill.azul,.li-pill.publicando{background:rgba(108,140,255,.15);color:var(--iris)}
+.li-pill.erro{background:rgba(255,93,115,.14);color:var(--crit)}
+.li-icbtn{width:30px;height:30px;border-radius:999px;border:1px solid var(--line2);background:transparent;color:var(--dim);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:13px}
+.li-icbtn:hover{color:var(--ink);border-color:var(--iris)}.li-icbtn.pause{color:var(--warn);border-color:rgba(255,184,77,.5)}.li-icbtn.play{color:var(--ok);border-color:rgba(53,230,160,.5)}
+.li-menu{position:absolute;right:0;top:34px;z-index:20;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:5px;min-width:150px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.li-menu button{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--ink2);padding:8px 10px;border-radius:7px;cursor:pointer;font-size:12.5px}
+.li-menu button:hover{background:var(--panel2)}
+.li-fila{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.li-fila .fi{width:36px;height:36px;border-radius:10px;background:var(--panel2);display:flex;align-items:center;justify-content:center;color:var(--dim)}
+.li-fila .chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.li-chip{font-size:11px;border-radius:999px;padding:4px 10px;font-weight:600;background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
+.li-chip.am{color:var(--warn)}.li-chip.vd{color:var(--ok)}.li-chip.az{color:var(--cyan)}.li-chip.lr{color:#ff9a4d}
+.li-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.li-tbl th{text-align:left;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);padding:10px 12px;border-bottom:1px solid var(--line);font-weight:700}
+.li-tbl td{padding:10px 12px;border-bottom:1px solid var(--line);color:var(--ink2);vertical-align:top}
+.li-tbl tr:last-child td{border-bottom:0}.li-tbl a{color:var(--iris);text-decoration:none}
+.li-empty{padding:34px 20px;text-align:center;color:var(--dim);font-size:13px}
+.li-empty b{display:block;color:var(--ink);font-size:14px;margin-bottom:6px}
+/* wizard */
+.li-wiz{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.li-wtop{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
+.li-wtop h3{margin:0;font-size:16px;color:var(--ink);flex:1}
+.li-steps{display:flex;justify-content:center;gap:4px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.li-step{display:flex;align-items:center;gap:8px;padding:12px 22px;color:var(--dim);font-size:13px;font-weight:600;border-bottom:2px solid transparent;cursor:pointer}
+.li-step .n{width:22px;height:22px;border-radius:999px;background:var(--panel2);border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:11px;font-family:var(--mono)}
+.li-step.on{color:var(--iris);border-bottom-color:var(--iris)}.li-step.ok .n{background:var(--ok);border-color:var(--ok);color:#06231a}
+.li-wbody{padding:18px;background:var(--panel2)}
+.li-cad{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(260px,1fr);gap:16px;align-items:start}
+@media(max-width:1000px){.li-cad{grid-template-columns:1fr}}
+.li-pane{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+.li-pane h4{margin:0;font-size:15px;color:var(--ink)}.li-pane .sub{font-size:12px;color:var(--dim);margin:3px 0 0}
+.li-addrow{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0}
+.li-add{background:transparent;border:1px solid var(--line2);border-radius:9px;padding:6px 11px;font-size:12px;color:var(--ink2);cursor:pointer;font-family:var(--sans)}
+.li-add:hover{border-color:var(--iris);color:var(--ink)}
+.li-start{background:rgba(108,140,255,.08);border:1px solid rgba(108,140,255,.25);color:var(--iris);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:8px}
+.li-pstep{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:11px 12px;margin-bottom:8px;cursor:pointer}
+.li-pstep:hover{border-color:var(--line2)}.li-pstep.sel{border-color:var(--iris);box-shadow:0 0 0 3px rgba(108,140,255,.14)}
+.li-pstep .drag{color:var(--faint);cursor:grab;font-size:13px;letter-spacing:-2px}
+.li-pstep .pi{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:15px;flex:none}
+.li-pstep b{display:block;font-size:13px;color:var(--ink)}.li-pstep small{font-size:11.5px;color:var(--dim);display:block;max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li-pstep .x{margin-left:auto;opacity:.55}.li-pstep:hover .x{opacity:1}
+.pi-conexao{background:rgba(10,102,194,.15);color:#4ea1ff}.pi-mensagem{background:rgba(176,108,255,.15);color:var(--violet)}
+.pi-aguardar{background:rgba(255,184,77,.15);color:var(--warn)}.pi-visitar{background:rgba(53,230,160,.13);color:var(--ok)}.pi-curtir{background:rgba(255,93,115,.13);color:#ff7a90}
+.li-props-empty{text-align:center;padding:26px 10px;color:var(--dim);font-size:12.5px}.li-props-empty b{display:block;color:var(--ink);margin:8px 0 4px;font-size:14px}
+.li-vars{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.li-vars button{background:var(--panel2);border:1px solid var(--line2);border-radius:6px;font-family:var(--mono);font-size:10.5px;color:var(--cyan);padding:3px 7px;cursor:pointer}
+.li-lbl{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin:12px 0 6px}
+.li-g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:860px){.li-g2{grid-template-columns:1fr}}
+.li-drop{border:1.5px dashed var(--line2);border-radius:12px;padding:26px;text-align:center;color:var(--dim);font-size:12.5px;cursor:pointer}
+.li-drop:hover{border-color:var(--iris)}
+.li-imp{background:rgba(53,224,230,.05);border:1px solid rgba(53,224,230,.22);border-radius:14px;padding:16px;margin-top:14px}
+.li-improw{display:grid;grid-template-columns:180px minmax(0,1fr) 120px;gap:10px;margin-top:12px}@media(max-width:760px){.li-improw{grid-template-columns:1fr}}
+.li-leadl{max-height:320px;overflow:auto}
+.li-lrow{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px}
+.li-av{width:34px;height:34px;border-radius:999px;background:rgba(108,140,255,.16);color:var(--iris);display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700;flex:none}
+/* CRM */
+.li-kanban{display:flex;gap:12px;overflow-x:auto;padding:14px;align-items:flex-start}
+.li-col{flex:0 0 232px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px;min-height:120px}
+.li-col.over{border-color:var(--iris);background:rgba(108,140,255,.06)}
+.li-colh{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--ink);margin:2px 2px 10px}
+.li-colh .dt{width:8px;height:8px;border-radius:9px}.li-colh small{margin-left:auto;font-size:10.5px;color:var(--faint);font-weight:500}
+.li-kc{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:10px;margin-bottom:9px;cursor:pointer}
+.li-kc:hover{border-color:var(--line2)}.li-kc .top{display:flex;gap:9px;align-items:flex-start}
+.li-kc b{font-size:12.5px;color:var(--ink);display:flex;align-items:center;gap:6px}.li-kc .em{font-size:11px;color:var(--dim)}
+.li-kc .or{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint);margin:8px 0 7px}
+.li-kc select{width:100%;background:var(--panel2);border:1px solid var(--line2);color:var(--ink2);border-radius:7px;padding:5px 7px;font-size:11.5px}
+.li-unr{width:7px;height:7px;border-radius:9px;background:var(--cyan);display:inline-block}
+.li-drawer-bg{position:fixed;inset:0;background:rgba(4,7,14,.45);z-index:90}
+.li-drawer{position:fixed;top:0;right:0;bottom:0;width:440px;max-width:96vw;background:var(--panel);border-left:1px solid var(--line2);z-index:91;overflow:auto;padding:18px 20px 40px;box-shadow:-20px 0 50px rgba(0,0,0,.35);animation:rise .2s ease both}
+.li-dsec{margin-top:18px}.li-dsec h5{margin:0 0 8px;font-size:12.5px;color:var(--ink);display:flex;align-items:center;gap:7px}
+.li-orig{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-bottom:7px;font-size:12px}.li-orig b{display:block;color:var(--ink);font-size:12.5px}.li-orig span{color:var(--dim);font-size:11px}
+.li-msgs{max-height:240px;overflow:auto;display:flex;flex-direction:column;gap:6px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px}
+.li-msg{max-width:85%;border-radius:10px;padding:7px 10px;font-size:12px;white-space:pre-wrap}.li-msg.c{background:var(--panel);border:1px solid var(--line);align-self:flex-start}.li-msg.e{background:rgba(108,140,255,.16);align-self:flex-end}
+.li-msg small{display:block;font-size:9.5px;color:var(--faint);margin-top:3px}
+.li-task{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.li-inbox{display:flex;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);cursor:pointer}.li-inbox:hover{background:var(--panel2)}
+.li-inbox .tx{flex:1;min-width:0}.li-inbox .tx div{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Inbound */
+.li-calib{min-width:190px}.li-calib .t{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);margin-bottom:5px}.li-calib .t b{color:var(--ok)}
+.li-calib .tr{height:7px;border-radius:9px;background:var(--line);overflow:hidden}.li-calib .tr i{display:block;height:100%;background:var(--ok);border-radius:9px}
+.li-radio{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}@media(max-width:760px){.li-radio{grid-template-columns:1fr}}
+.li-ropt{border:1px solid var(--line2);border-radius:12px;padding:12px 14px;cursor:pointer;display:flex;gap:10px}
+.li-ropt.on{border-color:var(--cyan);background:rgba(53,224,230,.06)}.li-ropt b{font-size:13.5px;color:var(--ink)}.li-ropt div span{display:block;font-size:11.5px;color:var(--dim);margin-top:3px}
+.li-objs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}@media(max-width:860px){.li-objs{grid-template-columns:1fr 1fr}}
+.li-obj{display:flex;align-items:center;gap:9px;border:1px solid var(--line2);border-radius:10px;padding:11px 12px;font-size:12.5px;color:var(--ink2);cursor:pointer}
+.li-obj.on{border-color:var(--cyan);background:rgba(53,224,230,.07);color:var(--ink)}
+.li-post{padding:14px 16px;border-bottom:1px solid var(--line);cursor:pointer;position:relative}.li-post:hover{background:var(--panel2)}
+.li-post .tx{font-size:13px;color:var(--ink2);white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;margin:8px 0}
+.li-post .mt{display:flex;gap:14px;font-size:11.5px;color:var(--dim);align-items:center}
+.li-cal{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;padding:14px}
+.li-cal .h{font-size:10.5px;color:var(--faint);text-align:center;font-weight:700}
+.li-cal .d{min-height:84px;border:1px solid var(--line);border-radius:9px;padding:5px;font-size:11px;color:var(--dim)}
+.li-cal .d.out{opacity:.35}.li-cal .d.hj{border-color:var(--iris)}
+.li-cal .ev{display:block;margin-top:4px;border-radius:6px;padding:3px 5px;font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.li-modal{width:980px!important;max-width:96vw!important;max-height:92vh;overflow:auto}
+.li-ed{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}@media(max-width:900px){.li-ed{grid-template-columns:1fr}}
+.li-prev{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:14px}
+.li-prevcard{background:#fff;color:#1d2226;border-radius:10px;padding:14px;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif;font-size:13.5px;line-height:1.45}
+.li-prevcard .who{display:flex;gap:9px;align-items:center;margin-bottom:10px}.li-prevcard .who .a{width:40px;height:40px;border-radius:999px;background:#0a66c2;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700}
+.li-prevcard .who b{display:block;font-size:13.5px}.li-prevcard .who span{font-size:11.5px;color:#666}
+.li-prevcard .tx{white-space:pre-wrap;word-wrap:break-word}.li-prevcard img{width:100%;border-radius:6px;margin-top:10px;display:block}
+.li-imgbox{border:1px dashed var(--line2);border-radius:12px;padding:12px 14px;margin-top:12px;font-size:12px;color:var(--dim)}
+.li-imgbox ol{margin:6px 0 10px 18px;padding:0}.li-imgbox b{color:var(--ink)}
+.li-thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.li-thumbs div{position:relative}.li-thumbs img{width:76px;height:76px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
+.li-thumbs button{position:absolute;top:-6px;right:-6px;width:20px;height:20px;border-radius:999px;border:0;background:var(--crit);color:#fff;cursor:pointer;font-size:11px}
+.li-auto{display:flex;gap:14px;align-items:flex-start;padding:14px 16px;border-bottom:1px solid var(--line)}
+.li-sw{position:relative;width:38px;height:21px;border-radius:999px;background:var(--line2);cursor:pointer;flex:none;border:0}
+.li-sw::after{content:"";position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:999px;background:#fff;transition:left .15s}
+.li-sw.on{background:var(--ok)}.li-sw.on::after{left:20px}
+.li-lim{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.li-limc{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
+.li-limc label{font-size:12px;font-weight:600;color:var(--ink2)}.li-limc input{margin-top:7px}
+.li-limc .use{font-size:11px;color:var(--dim);margin-top:7px}.li-limc .tr{height:5px;border-radius:9px;background:var(--line);overflow:hidden;margin-top:5px}.li-limc .tr i{display:block;height:100%;background:var(--cyan)}
+.li-days{display:flex;gap:6px;flex-wrap:wrap}.li-days button{border:1px solid var(--line2);background:transparent;color:var(--dim);border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer}.li-days button.on{background:rgba(108,140,255,.16);border-color:var(--iris);color:var(--ink)}
 .modrow{display:flex;align-items:center;gap:8px;padding:6px 7px;font-size:13px;cursor:pointer;border-radius:7px}.modrow:hover{background:rgba(108,140,255,.08)}.modalbox svg{width:15px;height:15px}
 .taskcard{display:flex;align-items:center;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;cursor:pointer;background:var(--panel2)}.taskcard:hover{border-color:var(--iris)}.taskcard.on{border-color:var(--iris);box-shadow:inset 2px 0 0 var(--iris)}
 .taskcard .tkico{color:var(--cyan);display:inline-flex}.taskcard .tkname{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.taskcard .tkmeta{font-family:var(--mono);font-size:10px;color:var(--dim)}
@@ -13883,8 +15638,339 @@ async function pagaDel(al){if(!confirm('Remover a configuração desta LLM paga?
 let WS={colecoes:['cerne_docs'],task:'',sid:null,skills:[],model:'local',hib:false,routing:false,anexos:[],tasks:[],active:null,loaded:false,orquestrar:false};
 let WSK_ALL=[];
 let CORE={ok:true,svc:{}};
+/* ===================== LinkedIn (Workspace → LinkedIn) ===================== */
+const LI={sec:'outbound',inb:'posts',outTab:'campanhas',outArq:false,outQ:'',metCamp:'',leadsQ:'',leadsSt:'',camp:null,wiz:null,
+ crmTab:'pipeline',crmQ:'',crmEtapa:'',crmOrig:'',crm:null,drawer:null,est:null,estTab:'principal',per:'tudo',perDe:'',perAte:'',
+ pView:'lista',pQ:'',pF:'',calM:null,st:null,menu:null};
+const LI_IC={send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>',
+ inbox:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></svg>',
+ users:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>',
+ shield:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>',
+ spark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></svg>',
+ doc:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h6"/></svg>',
+ bot:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 14h.01M16 14h.01"/></svg>',
+ sync:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16M3 12a9 9 0 0 1 15.5-6.2L21 8M21 3v5h-5M3 21v-5h5"/></svg>',
+ link:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>',
+ ext:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/></svg>',
+ clock:'<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>'};
+const LI_PI={conexao:'👤',mensagem:'💬',aguardar:'⏱',visitar:'👁',curtir:'👍'};
+const LI_PSUB={conexao:'Envie um convite com ou sem nota personalizada',mensagem:'Envie uma mensagem personalizada ao lead',visitar:'Aqueça o contato visitando o perfil',curtir:'Interaja com uma publicação recente',aguardar:''};
+const LI_PNOME={conexao:'Pedido de conexão',mensagem:'Enviar mensagem',aguardar:'Aguardar',visitar:'Visitar perfil',curtir:'Curtir publicação'};
+const LI_ETC={'Novo':'#35e0e6','Em contato':'#38d6d6','Qualificado':'#b06cff','Desqualificado':'#ff5d73','Reunião':'#ffb84d','Proposta':'#6c8cff','Ganho':'#35e6a0','Perdido':'#7d8ca8'};
+const LI_LST={pendente:['Pendente','cinza'],na_fila:['Na fila','cinza'],em_andamento:['Em andamento','azul'],aguardando_aceite:['Aguardando aceite','aguardando'],concluido:['Cadência concluída','ok'],respondeu:['Respondeu','ok'],ignorado:['Ignorado','cinza'],erro:['Erro','erro'],nao_aceitou:['Não aceitou','cinza']};
+async function liP(u,b){const r=await P(u,b||{});let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.detail||j.error||('erro '+r.status));return j;}
+const liSleep=ms=>new Promise(r=>setTimeout(r,ms));
+function liD(iso){if(!iso)return '—';const [d]=iso.split('T');const p=d.split('-');return p[2]+'/'+p[1]+'/'+p[0];}
+function liDH(iso){if(!iso)return '—';const [d,t]=iso.split('T');const p=d.split('-');return p[2]+'/'+p[1]+'/'+p[0]+', '+(t||'').slice(0,5);}
+function liAgo(iso){if(!iso)return '';const t=new Date(iso).getTime();const s=(Date.now()-t)/1000;if(s<60)return 'agora';if(s<3600)return 'há '+Math.round(s/60)+' min';if(s<86400)return 'há '+Math.round(s/3600)+' h';return liD(iso);}
+function liIni(n){const p=(n||'?').trim().split(/\s+/);return ((p[0]||'')[0]||'?').toUpperCase()+((p.length>1?p[p.length-1][0]:'')||'').toUpperCase();}
+function liMount(h){const m=document.getElementById('limount');if(m)m.innerHTML=h;}
+async function liRefresh(){liMount(await liPage());}
+async function liGo(sec,sub){LI.sec=sec;if(sub)LI.inb=sub;LI.wiz=null;LI.camp=null;LI.menu=null;liMount('<div class="li-wrap">'+liSide()+'<div class="li-main"><div class="li-box" style="padding:20px">'+skelPage()+'</div></div></div>');await liRefresh();}
+V.linkedin=async()=>liPage();
+async function liJob(id,onTick){for(let i=0;i<220;i++){await liSleep(3000);const j=await J('/linkedin/job/'+id);if(onTick)onTick(j);if(j.status==='ok'||j.status==='erro')return j;}return {status:'erro',erro:'tempo esgotado esperando a extensão'};}
+
+function liSide(){const st=LI.st||{},c=st.conta||{};const nv=(s,ic,l,extra)=>`<button class="li-nav${LI.sec===s?' on':''}" onclick="liGo('${s}')">${ic}<span>${l}</span>${extra||''}</button>`;
+ const ok=st.extensao&&c.logado!==false&&c.nome;
+ const conn=ok?`<div class="li-conn ok"><b>✓ LinkedIn conectado</b><span>${esc(c.nome)}</span></div>`:(st.extensao?`<div class="li-conn warn" onclick="liReconectar()"><b>! Verifique a conta</b><span>${c.logado===false?'Entre no LinkedIn no seu navegador':'Extensão conectada — clique para verificar o LinkedIn'}</span></div>`:`<div class="li-conn warn" onclick="liReconectar()"><b>! LinkedIn desconectado</b><span>Conecte a extensão do Cerne no seu navegador</span></div>`);
+ let h=`<aside class="li-side"><div class="li-card"><div class="li-brand"><div class="li-logo">in</div><div><b>LinkedIn</b><span>Prospecção e conteúdo</span></div></div>${nv('outbound',LI_IC.send,'Outbound')}${nv('inbound',LI_IC.inbox,'Inbound')}${nv('crm',LI_IC.users,'CRM','<span class="li-beta">BETA</span>')}${nv('limites',LI_IC.shield,'Segurança e limites')}${conn}</div>`;
+ if(LI.sec==='inbound'){const sb=(s,ic,l)=>`<button class="li-nav${LI.inb===s?' on':''}" onclick="liGo('inbound','${s}')">${ic}<span>${l}</span></button>`;h+=`<div class="li-card">${sb('estrategia',LI_IC.spark,'Estratégia')}${sb('posts',LI_IC.doc,'Posts')}${sb('automacoes',LI_IC.bot,'Automações')}</div>`;}
+ return h+'</aside>';}
+
+async function liPage(){try{LI.st=await J('/linkedin/estado'+(LI.metCamp?('?campanha='+encodeURIComponent(LI.metCamp)):''));}catch(e){LI.st={};}
+ let body='';try{
+  if(LI.wiz)body=liWizHtml();
+  else if(LI.sec==='outbound')body=LI.camp?await liCampDet():await liOutbound();
+  else if(LI.sec==='crm')body=await liCrm();
+  else if(LI.sec==='limites')body=await liLimites();
+  else if(LI.inb==='estrategia')body=await liEstrategia();
+  else if(LI.inb==='automacoes')body=await liAutomacoes();
+  else body=await liPosts();
+ }catch(e){body='<div class="li-box li-empty"><b>Não foi possível carregar</b>'+esc(''+e.message)+'</div>';}
+ return `<div class="li-wrap">${liSide()}<div class="li-main">${body}</div></div>`;}
+
+function liHead(eb,ic,t,sub,acts){return `<div class="li-head"><div><div class="li-eyebrow"><span style="width:13px;height:13px;display:inline-flex">${ic}</span>${eb}</div><h2>${t}</h2><p>${sub}</p></div><div class="li-acts">${acts||''}</div></div>`;}
+function liStat(ic,bg,col,v,l){return `<div class="li-stat"><div class="ic" style="background:${bg};color:${col}">${ic}</div><b>${v}</b><span>${l}</span></div>`;}
+
+/* ---------- Outbound ---------- */
+async function liOutbound(){const st=LI.st,m=st.metricas||{},f=st.fila||{};const camps=st.campanhas||[];
+ const opts='<option value="">Todas as campanhas</option>'+camps.map(c=>`<option value="${c.id}"${LI.metCamp===c.id?' selected':''}>${esc(c.nome)}</option>`).join('');
+ let h=liHead('LINKEDIN OUTBOUND',LI_IC.send,'Campanhas de prospecção','Crie cadências personalizadas de conexão, relacionamento e mensagens.',
+  `<button class="li-btn2 sync" onclick="liSyncJob('sync_aceites',this)">${LI_IC.sync} Sincronizar Aceites</button><button class="li-btn2" onclick="liReconectar()">${LI_IC.link} Reconectar LinkedIn</button><button class="btn" onclick="liNovaCamp()">＋ Nova campanha</button>`);
+ h+=`<div style="display:flex;align-items:center;gap:10px"><span class="faint" style="font-size:12.5px">Métricas de</span><select class="field" style="max-width:420px;margin:0" onchange="LI.metCamp=this.value;liRefresh()">${opts}</select></div>`;
+ h+=`<div class="li-stats">${liStat('➤','rgba(53,224,230,.12)','var(--cyan)',m.convites||0,'Convites enviados')}${liStat('👥','rgba(53,230,160,.12)','var(--ok)',m.aceitos||0,'Aceitos')}${liStat('▥','rgba(176,108,255,.13)','var(--violet)',(m.taxa_aceite||0)+'%','Taxa de aceite')}${liStat('💬','rgba(255,184,77,.13)','var(--warn)',m.respostas||0,'Respostas')}${liStat('▤','rgba(255,93,115,.12)','#ff7a90',(m.taxa_resposta||0)+'%','Taxa de resposta')}</div>`;
+ h+=`<div class="li-info">↻ Aceites e respostas são sincronizados automaticamente (respostas a cada 1h, aceites a cada 4h, no horário de funcionamento). A confirmação de novos aceites pode levar até 8 horas para aparecer nas métricas.</div>`;
+ const ativas=camps.filter(c=>!c.arquivada),arq=camps.filter(c=>c.arquivada);
+ h+=`<div><div class="li-seg"><button class="${LI.outTab==='campanhas'?'on':''}" onclick="LI.outTab='campanhas';liRefresh()">${'<span style="width:14px;height:14px;display:inline-flex">'+LI_IC.send+'</span>'} Campanhas <span class="n">${camps.length}</span></button><button class="${LI.outTab==='leads'?'on':''}" onclick="LI.outTab='leads';liRefresh()"><span style="width:14px;height:14px;display:inline-flex">${LI_IC.users}</span> Leads <span class="n">${st.n_leads||0}</span></button></div></div>`;
+ if(LI.outTab==='leads')h+=await liLeadsTbl('');
+ else{const lst=(LI.outArq?arq:ativas).filter(c=>!LI.outQ||c.nome.toLowerCase().includes(LI.outQ.toLowerCase()));
+  h+=`<div class="li-box"><div class="li-bar"><div class="li-seg"><button class="${!LI.outArq?'on2':''}" onclick="LI.outArq=false;liRefresh()">Ativas</button><button class="${LI.outArq?'on2':''}" onclick="LI.outArq=true;liRefresh()">Arquivadas</button></div><div class="li-search">${ico('search')}<input placeholder="Pesquisar campanhas..." value="${esc(LI.outQ)}" oninput="LI.outQ=this.value;clearTimeout(window._liqt);window._liqt=setTimeout(liRefresh,350)"></div></div>`;
+  h+=lst.length?lst.map(liCampRow).join(''):`<div class="li-empty"><b>${LI.outArq?'Nenhuma campanha arquivada':'Nenhuma campanha ainda'}</b>${LI.outArq?'':'Crie a primeira: monte a cadência, cole uma busca do LinkedIn ou o link de um post do seu concorrente e lance.'}${LI.outArq?'':'<div style="margin-top:12px"><button class="btn" onclick="liNovaCamp()">＋ Nova campanha</button></div>'}</div>`;
+  h+='</div>';}
+ h+=`<div class="li-fila"><div class="fi">${LI_IC.clock}</div><div><b style="font-size:14px;color:var(--ink)">Fila de campanhas</b><div class="faint" style="font-size:11.5px">Ações planejadas pelas campanhas ativas${f.executando?(' · <span style="color:var(--cyan)">agora: '+esc(f.executando)+'</span>'):''}</div><div style="font-size:11.5px;color:var(--iris);margin-top:2px">${st.pausado?'Automações pausadas (Segurança e limites)':(!st.extensao?'Aguardando a extensão do navegador':(f.proxima?('Próxima ação: '+liDH(f.proxima)):'Nada agendado'))}${(!st.na_janela&&!st.pausado&&f.agendadas)?' · fora do horário de funcionamento':''}</div></div>
+  <div class="chips"><span class="li-chip">${f.agendadas||0} agendadas</span><span class="li-chip am">${f.em_andamento||0} em andamento</span><span class="li-chip vd">${f.concluidas||0} concluídas</span><span class="li-chip az">${f.ignoradas||0} ignorada(s)</span><span class="li-chip lr">${f.tentativas||0} nova(s) tentativa(s)</span><button class="li-btn2" onclick="liProcessar(this)">Processar agora</button></div></div>`;
+ return h;}
+function liCampRow(c){const pill={ativa:'Ativa',pausada:'Pausada',rascunho:'Rascunho',concluida:'Concluída'}[c.status]||c.status;
+ const tg=c.status==='ativa'?`<button class="li-icbtn pause" title="Pausar" onclick="event.stopPropagation();liCampAcao('${c.id}','pausar')">❚❚</button>`:(c.status==='concluida'?'':`<button class="li-icbtn play" title="${c.status==='rascunho'?'Lançar':'Retomar'}" onclick="event.stopPropagation();liCampAcao('${c.id}','${c.status==='rascunho'?'lancar':'retomar'}')">▶</button>`);
+ const menu=LI.menu===c.id?`<div class="li-menu" onclick="event.stopPropagation()"><button onclick="liCampAcao('${c.id}','duplicar')">Duplicar</button><button onclick="liRenomear('${c.id}')">Renomear</button><button onclick="liCampAcao('${c.id}','${c.arquivada?'desarquivar':'arquivar'}')">${c.arquivada?'Desarquivar':'Arquivar'}</button><button style="color:var(--crit)" onclick="liExcluirCamp('${c.id}')">Excluir</button></div>`:'';
+ return `<div class="li-camp" onclick="liAbrirCamp('${c.id}')"><div class="ci"><span style="width:17px;height:17px;display:inline-flex">${LI_IC.send}</span></div><div style="min-width:0"><h4>${esc(c.nome)} <span class="li-pill ${c.status}">${pill}</span></h4><div class="meta"><span>${c.n_leads} leads</span><span>${c.n_passos} ações</span><span>Atualizada em ${liD(c.atualizado)}</span></div><div class="li-prog"><div class="tr"><i style="width:${c.progresso}%"></i></div><small>${c.progresso}%</small></div><div class="faint" style="font-size:10.5px;margin-top:4px">${c.acoes_feitas} de ${c.acoes_total} ações processadas</div></div>
+ <div style="display:flex;gap:8px;align-items:center;position:relative">${tg}<button class="li-icbtn" title="Mais" onclick="event.stopPropagation();LI.menu=LI.menu==='${c.id}'?null:'${c.id}';liRefresh()">⋯</button><span class="faint">›</span>${menu}</div></div>`;}
+async function liCampAcao(id,acao,extra){try{await liP('/linkedin/campanhas/'+id,Object.assign({acao},extra||{}));LI.menu=null;toast({pausar:'Campanha pausada',lancar:'Campanha lançada',retomar:'Campanha retomada',duplicar:'Campanha duplicada (rascunho)',arquivar:'Campanha arquivada',desarquivar:'Campanha restaurada'}[acao]||'Feito','ok');liRefresh();}catch(e){toast(e.message,'error');}}
+function liRenomear(id){const c=(LI.st.campanhas||[]).find(x=>x.id===id);const n=prompt('Novo nome da campanha:',c?c.nome:'');if(n)liCampAcao(id,'renomear',{nome:n});}
+function liExcluirCamp(id){if(confirm('Excluir a campanha e todos os leads dela? Isso não pode ser desfeito.'))liCampAcao(id,'excluir');}
+function liAbrirCamp(id){LI.camp=id;LI.menu=null;liRefresh();}
+async function liProcessar(b){b.disabled=true;try{const r=await liP('/linkedin/processar');toast(r.extensao?'Processando a fila agora (os limites diários continuam valendo)':'Fila liberada — mas a extensão do navegador não está conectada','ok');}catch(e){toast(e.message,'error');}setTimeout(liRefresh,2500);}
+async function liSyncJob(tipo,b){if(b)b.disabled=true;const nomes={sync_aceites:'aceites',sync_respostas:'respostas',sync_posts:'posts',status:'conta'};const t=toast('Sincronizando '+nomes[tipo]+' pelo seu navegador…','load');
+ try{const r=await liP('/linkedin/job',{tipo});const j=await liJob(r.job);toastKill(t);if(j.status==='ok')toast('Sincronização concluída','ok');else toast('Falhou: '+(j.erro||'erro'),'error');}catch(e){toastKill(t);toast(e.message,'error');if(/extensão/.test(e.message))liReconectar();}
+ if(b)b.disabled=false;liRefresh();}
+async function liReconectar(){const st=LI.st||await J('/linkedin/estado');
+ if(st.extensao){liSyncJob('status');return;}
+ let tok='';try{const r=await liP('/ext/pair');tok=r.token||'';}catch(e){}
+ const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:560px"><div class="modalh"><b><span class="li-logo" style="width:24px;height:24px;font-size:12px;border-radius:6px">in</span> Conectar o LinkedIn</b><button class="cvbtn" onclick="closeModal()">✕</button></div>
+ <div style="font-size:13px;color:var(--ink2);line-height:1.6">O Cerne opera o LinkedIn <b>no seu navegador</b>, na sessão que você já tem logada — sem pedir sua senha. Para isso usa a extensão do Cerne (versão 1.2.0 ou mais nova):
+ <ol style="margin:10px 0 0 18px;padding:0"><li>Baixe a extensão em <a href="/baixar#extensao" target="_blank" style="color:var(--iris)">Baixar Extensão</a> e carregue em <span class="mono">chrome://extensions</span> (modo do desenvolvedor → "Carregar sem compactação"). Se já tem uma versão antiga, recarregue.</li>
+ <li>Abra o ícone da extensão e cole este código de pareamento:<div style="display:flex;gap:8px;margin:7px 0"><input class="field mono" readonly value="${esc(tok)}" style="margin:0;font-size:11.5px"><button class="li-btn2" onclick="navigator.clipboard.writeText('${esc(tok)}');toast('Código copiado','ok')">Copiar</button></div></li>
+ <li>Entre no LinkedIn nesse mesmo navegador.</li><li>Volte aqui e clique em <b>Verificar</b>. O Cerne usa uma <b>aba fixada</b> em segundo plano para agir — pode deixá-la aberta.</li></ol></div>
+ <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Fechar</button><button class="btn" onclick="closeModal();LI.st=null;J('/linkedin/estado').then(s=>{LI.st=s;if(s.extensao)liSyncJob('status');else toast('A extensão ainda não conectou — confira o código e se o navegador está aberto','error');})">Verificar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
+
+async function liLeadsTbl(campId){const q='/linkedin/leads?limite=400'+(campId?'&campanha='+campId:'')+(LI.leadsQ?'&q='+encodeURIComponent(LI.leadsQ):'')+(LI.leadsSt?'&status='+LI.leadsSt:'');const d=await J(q);const ls=d.leads||[];
+ const sts='<option value="">Todos os status</option>'+Object.entries(LI_LST).map(([k,v])=>`<option value="${k}"${LI.leadsSt===k?' selected':''}>${v[0]}</option>`).join('');
+ const rows=ls.map(l=>{const s=LI_LST[l.status]||[l.status,'cinza'];return `<tr><td><div style="display:flex;gap:9px;align-items:center"><div class="li-av">${esc(liIni(l.nome))}</div><div><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.nome)}</a><div class="faint" style="font-size:11px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(l.cargo||'')}</div></div></div></td>${campId?'':`<td>${esc(l.campanha)}</td>`}<td><span class="li-pill ${s[1]}">${s[0]}</span>${l.convidado?' <span class="faint" title="convite enviado">➤</span>':''}${l.conectado?' <span title="conectado" style="color:var(--ok)">✓</span>':''}${l.respondeu?' <span title="respondeu">💬</span>':''}</td><td class="faint" style="font-size:11.5px">${esc(l.erro||l.ultimo||'')}${l.prox_em&&!['concluido','respondeu','ignorado','erro','nao_aceitou'].includes(l.status)?'<div>próx.: '+liDH(l.prox_em)+'</div>':''}</td><td style="text-align:right;white-space:nowrap"><button class="li-icbtn" title="Adicionar ao CRM" onclick="liLeadAcao('${l.id}','crm')">＋</button> <button class="li-icbtn" title="Pular este lead" onclick="liLeadAcao('${l.id}','pular')">⏭</button> <button class="li-icbtn" title="Remover" onclick="liLeadAcao('${l.id}','remover')">✕</button></td></tr>`;}).join('');
+ return `<div class="li-box"><div class="li-bar"><b style="font-size:13.5px;color:var(--ink)">Leads <span class="faint" style="font-weight:500">(${ls.length}${d.total>ls.length&&!campId?' de '+d.total:''})</span></b><div style="display:flex;gap:8px;flex-wrap:wrap"><select class="field" style="margin:0;width:auto" onchange="LI.leadsSt=this.value;liRefresh()">${sts}</select><div class="li-search">${ico('search')}<input placeholder="Buscar nome, empresa, cargo..." value="${esc(LI.leadsQ)}" oninput="LI.leadsQ=this.value;clearTimeout(window._liqt);window._liqt=setTimeout(liRefresh,400)"></div></div></div>
+ ${ls.length?`<div style="overflow:auto"><table class="li-tbl"><thead><tr><th>Lead</th>${campId?'':'<th>Campanha</th>'}<th>Status</th><th>Última atividade</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="li-empty"><b>Nenhum lead</b>Os leads entram pelas campanhas (URLs, CSV, busca do LinkedIn ou post).</div>'}</div>`;}
+async function liLeadAcao(id,acao){if(acao==='remover'&&!confirm('Remover este lead da campanha?'))return;try{await liP('/linkedin/leads/'+id,{acao});toast({crm:'Adicionado ao CRM',pular:'Lead ignorado',remover:'Lead removido'}[acao],'ok');liRefresh();}catch(e){toast(e.message,'error');}}
+
+async function liCampDet(){const d=await J('/linkedin/campanhas/'+LI.camp);if(!d.campanha){LI.camp=null;return liOutbound();}const c=d.campanha,m=d.metricas||{};
+ const acts=(c.status==='ativa'?`<button class="li-btn2" onclick="liCampAcao('${c.id}','pausar')">❚❚ Pausar</button>`:c.status!=='concluida'?`<button class="btn" onclick="liCampAcao('${c.id}','${c.status==='rascunho'?'lancar':'retomar'}')">▶ ${c.status==='rascunho'?'Lançar':'Retomar'}</button>`:'')+`<button class="li-btn2" onclick="liEditarPassos('${c.id}')">Editar cadência</button><button class="li-btn2" onclick="liAddLeads('${c.id}')">＋ Adicionar leads</button>`;
+ let h=`<div><button class="li-btn2" onclick="LI.camp=null;liRefresh()">‹ Campanhas</button></div>`+liHead('CAMPANHA',LI_IC.send,esc(c.nome)+` <span class="li-pill ${c.status}" style="font-size:11px;vertical-align:middle">${{ativa:'Ativa',pausada:'Pausada',rascunho:'Rascunho',concluida:'Concluída'}[c.status]}</span>`,`${c.n_leads} leads · ${c.acoes_feitas} de ${c.acoes_total} ações processadas (${c.progresso}%) · criada em ${liD(c.criado)}`,acts);
+ h+=`<div class="li-stats">${liStat('➤','rgba(53,224,230,.12)','var(--cyan)',m.convites||0,'Convites enviados')}${liStat('👥','rgba(53,230,160,.12)','var(--ok)',m.aceitos||0,'Aceitos')}${liStat('▥','rgba(176,108,255,.13)','var(--violet)',(m.taxa_aceite||0)+'%','Taxa de aceite')}${liStat('💬','rgba(255,184,77,.13)','var(--warn)',m.respostas||0,'Respostas')}${liStat('▤','rgba(255,93,115,.12)','#ff7a90',(m.taxa_resposta||0)+'%','Taxa de resposta')}</div>`;
+ h+=`<div class="li-pane"><h4>Cadência</h4><p class="sub">A automação executa esta sequência para cada lead${c.config.parar_ao_responder?' · para quando o lead responde':''}.</p><div style="margin-top:12px"><div class="li-start">Início da sequência</div>${c.passos.map(p=>liPassoHtml(p,false)).join('')}</div></div>`;
+ h+=await liLeadsTbl(c.id);return h;}
+
+/* ---------- Wizard: nova campanha ---------- */
+const LI_PRESETS={
+ simples:[{tipo:'conexao',cfg:{nota:''}},{tipo:'aguardar',cfg:{dias:1}},{tipo:'mensagem',cfg:{texto:'Oi {{primeiro_nome}}, obrigado por aceitar a conexão! Vi que você atua como {{cargo}} e achei que valia a gente trocar uma ideia. Como está sendo por aí?'}},{tipo:'aguardar',cfg:{dias:1}},{tipo:'mensagem',cfg:{texto:'{{primeiro_nome}}, só complementando: ajudamos empresas como a {{empresa}} a resolver isso com menos esforço. Faz sentido uma conversa rápida de 15 min esta semana?'}},{tipo:'aguardar',cfg:{dias:1}},{tipo:'mensagem',cfg:{texto:'Última mensagem por aqui, {{primeiro_nome}} — se não for o momento, sem problema. Fico à disposição!'}}],
+ relacionamento:[{tipo:'visitar',cfg:{}},{tipo:'conexao',cfg:{nota:''}},{tipo:'aguardar',cfg:{dias:1}},{tipo:'curtir',cfg:{}},{tipo:'mensagem',cfg:{texto:'Oi {{primeiro_nome}}, obrigado por aceitar! Curti acompanhar seus posts por aqui. Como está o dia a dia como {{cargo}}?'}},{tipo:'aguardar',cfg:{dias:2}},{tipo:'mensagem',cfg:{texto:'{{primeiro_nome}}, pensei em você porque temos ajudado times parecidos com o da {{empresa}}. Topa uma conversa rápida para eu entender seu cenário?'}}]};
+function liNovoPasso(p){return {id:Math.random().toString(36).slice(2,10),tipo:p.tipo,cfg:JSON.parse(JSON.stringify(p.cfg||{}))};}
+function liNovaCamp(){LI.wiz={modo:'nova',step:1,passos:LI_PRESETS.simples.map(liNovoPasso),sel:null,leads:[],nome:'',cfg:{parar_ao_responder:true,pular_existentes:true,notas:''},imp:{fonte:'busca',url:'',max:25,modo:'ambos'},urls:'',job:null,preset:'simples'};liRefresh();}
+async function liEditarPassos(id){const d=await J('/linkedin/campanhas/'+id);LI.wiz={modo:'passos',campId:id,step:1,passos:(d.campanha.passos||[]).map(p=>({id:p.id,tipo:p.tipo,cfg:p.cfg||{}})),sel:null,leads:[],nome:d.campanha.nome,cfg:{},imp:{fonte:'busca',url:'',max:25,modo:'ambos'},urls:''};liRefresh();}
+function liAddLeads(id){const c=(LI.st.campanhas||[]).find(x=>x.id===id)||{};LI.wiz={modo:'leads',campId:id,step:2,passos:[],sel:null,leads:[],nome:c.nome||'',cfg:{},imp:{fonte:'busca',url:'',max:25,modo:'ambos'},urls:''};liRefresh();}
+function liWizRender(){const m=document.querySelector('#limount .li-main');if(m)m.innerHTML=liWizHtml();else liRefresh();}
+function liPassoSub(p){if(p.tipo==='aguardar')return (p.cfg.dias||1)+' dia(s)';if(p.tipo==='mensagem')return p.cfg.texto?esc(p.cfg.texto):'<span style="color:var(--warn)">escreva a mensagem →</span>';if(p.tipo==='conexao')return p.cfg.nota?('Com nota: '+esc(p.cfg.nota)):LI_PSUB.conexao;return LI_PSUB[p.tipo];}
+function liPassoHtml(p,edit,i){return `<div class="li-pstep${edit&&LI.wiz.sel===p.id?' sel':''}" ${edit?`draggable="true" ondragstart="liDragS(event,${i})" ondragover="event.preventDefault()" ondrop="liDrop(event,${i})" onclick="LI.wiz.sel='${p.id}';liWizRender()"`:''}>${edit?'<span class="drag">⋮⋮</span>':''}<div class="pi pi-${p.tipo}">${LI_PI[p.tipo]}</div><div style="min-width:0"><b>${LI_PNOME[p.tipo]}</b><small>${liPassoSub(p)}</small></div>${edit?`<button class="li-icbtn x" title="Remover passo" onclick="event.stopPropagation();liRmPasso('${p.id}')">✕</button>`:''}</div>`;}
+function liDragS(e,i){e.dataTransfer.setData('text/plain',String(i));}
+function liDrop(e,i){e.preventDefault();const f=+e.dataTransfer.getData('text/plain');const a=LI.wiz.passos;if(isNaN(f)||f===i)return;const [x]=a.splice(f,1);a.splice(i,0,x);liWizRender();}
+function liRmPasso(id){LI.wiz.passos=LI.wiz.passos.filter(p=>p.id!==id);if(LI.wiz.sel===id)LI.wiz.sel=null;liWizRender();}
+function liAddPasso(t){const p=liNovoPasso({tipo:t,cfg:t==='aguardar'?{dias:1}:t==='mensagem'?{texto:''}:t==='conexao'?{nota:''}:{}});LI.wiz.passos.push(p);LI.wiz.sel=p.id;liWizRender();}
+function liPreset(k){if(LI.wiz.passos.length&&!confirm('Trocar a cadência atual pelo modelo "'+(k==='simples'?'Modelo simples':'Relacionamento')+'"?'))return;LI.wiz.preset=k;LI.wiz.passos=LI_PRESETS[k].map(liNovoPasso);LI.wiz.sel=null;liWizRender();}
+function liVarIns(id,v){const el=document.getElementById(id);if(!el)return;const s=el.selectionStart||el.value.length;el.value=el.value.slice(0,s)+'{{'+v+'}}'+el.value.slice(el.selectionEnd||s);el.dispatchEvent(new Event('input'));el.focus();}
+function liProps(){const w=LI.wiz;const p=w.passos.find(x=>x.id===w.sel);if(!p)return `<div class="li-props-empty"><div style="font-size:22px">✧</div><b>Selecione um passo</b>Clique em uma ação para editar suas propriedades.</div>`;
+ const vars=id=>`<div class="li-vars">${['primeiro_nome','nome','empresa','cargo'].map(v=>`<button onclick="liVarIns('${id}','${v}')">{{${v}}}</button>`).join('')}</div>`;
+ const up=`(function(el){const p=LI.wiz.passos.find(x=>x.id==='${p.id}');p.cfg[el.dataset.k]=el.type==='number'?parseFloat(el.value||'1'):el.value;const s=document.getElementById('lipst-${p.id}');if(s)s.innerHTML=liPassoSub(p);const c=document.getElementById('licnt');if(c)c.textContent=el.value.length;})(this)`;
+ let h=`<div style="display:flex;gap:10px;align-items:center;margin-bottom:6px"><div class="pi pi-${p.tipo}" style="width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center">${LI_PI[p.tipo]}</div><b style="font-size:14px;color:var(--ink)">${LI_PNOME[p.tipo]}</b></div>`;
+ if(p.tipo==='conexao')h+=`<label class="li-lbl">Nota do convite (opcional)</label><textarea class="field" id="linota" data-k="nota" rows="5" maxlength="300" placeholder="Ex.: Oi {{primeiro_nome}}, vi seu trabalho na {{empresa}} e gostaria de me conectar." oninput="${up}">${esc(p.cfg.nota||'')}</textarea><div class="faint" style="font-size:11px;margin-top:4px"><span id="licnt">${(p.cfg.nota||'').length}</span>/300 · contas gratuitas têm poucas notas por mês — sem nota o aceite costuma ser parecido.</div>${vars('linota')}`;
+ else if(p.tipo==='mensagem')h+=`<label class="li-lbl">Mensagem</label><textarea class="field" id="limsg" data-k="texto" rows="8" placeholder="Oi {{primeiro_nome}}, ..." oninput="${up}">${esc(p.cfg.texto||'')}</textarea><div class="faint" style="font-size:11px;margin-top:4px"><span id="licnt">${(p.cfg.texto||'').length}</span> caracteres · só é enviada depois que o convite é aceito.</div>${vars('limsg')}`;
+ else if(p.tipo==='aguardar')h+=`<label class="li-lbl">Aguardar quantos dias?</label><input class="field" type="number" min="0.5" max="30" step="0.5" data-k="dias" value="${p.cfg.dias||1}" oninput="${up}"><div class="faint" style="font-size:11px;margin-top:6px">O próximo passo só acontece depois desse intervalo (e dentro do horário de funcionamento).</div>`;
+ else h+=`<div class="faint" style="font-size:12.5px;line-height:1.6;margin-top:8px">${p.tipo==='visitar'?'O Cerne abre o perfil do lead e rola a página por alguns segundos — a pessoa recebe a notificação de visita, o que aquece o contato antes do convite.':'O Cerne abre a atividade recente do lead e curte a publicação mais recente dele.'}</div>`;
+ return h;}
+function liWizHtml(){const w=LI.wiz;const tt={nova:'Nova campanha',passos:'Editar cadência · '+esc(w.nome),leads:'Adicionar leads · '+esc(w.nome)}[w.modo];
+ const steps=w.modo==='nova'?[[1,'Cadência'],[2,'Lista de leads'],[3,'Configurações'],[4,'Lançar']]:w.modo==='passos'?[[1,'Cadência']]:[[2,'Lista de leads']];
+ const okStep=s=>s===1?w.passos.some(p=>p.tipo!=='aguardar')&&w.passos.every(p=>p.tipo!=='mensagem'||(p.cfg.texto||'').trim()):s===2?w.leads.length>0:true;
+ const last=steps[steps.length-1][0];const canNext=okStep(w.step);
+ const nextLbl=w.step===last?(w.modo==='nova'?'':'Salvar'):'Próximo →';
+ let h=`<div class="li-wiz"><div class="li-wtop"><button class="li-icbtn" title="Fechar" onclick="if(confirm('Sair sem salvar?')){LI.wiz=null;liRefresh();}">✕</button><h3>${tt}</h3>${w.step!==steps[0][0]?`<button class="li-btn2" onclick="LI.wiz.step--;liWizRender()">← Voltar</button>`:''}${nextLbl?`<button class="btn" ${canNext?'':'disabled style="opacity:.5;cursor:default"'} onclick="liWizNext()">${nextLbl}</button>`:''}</div>
+ <div class="li-steps">${steps.map(([n,l])=>`<div class="li-step${w.step===n?' on':''}${w.step>n&&okStep(n)?' ok':''}" onclick="${w.modo==='nova'&&(n<w.step||[1,2,3].slice(0,n-1).every(okStep))?`LI.wiz.step=${n};liWizRender()`:''}"><span class="n">${w.step>n&&okStep(n)?'✓':n}</span>${l}</div>`).join('')}</div><div class="li-wbody">`;
+ if(w.step===1){h+=`<div class="li-cad"><div class="li-pane"><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap"><div><h4>Cadência</h4><p class="sub">Monte a sequência de relacionamento com o lead.</p></div><div class="li-seg"><button class="${w.preset==='simples'?'on2':''}" onclick="liPreset('simples')">Modelo simples</button><button class="${w.preset==='relacionamento'?'on2':''}" onclick="liPreset('relacionamento')">✧ Relacionamento</button></div></div>
+  <div class="li-addrow">${['conexao','mensagem','aguardar','visitar','curtir'].map(t=>`<button class="li-add" onclick="liAddPasso('${t}')">＋ ${LI_PNOME[t]}</button>`).join('')}</div><div class="li-start">Início da sequência</div>
+  ${w.passos.map((p,i)=>liPassoHtml(p,true,i).replace('<small>','<small id="lipst-'+p.id+'">')).join('')||'<div class="li-empty">Adicione passos com os botões acima.</div>'}</div><div class="li-pane" style="position:sticky;top:0">${liProps()}</div></div>`;}
+ else if(w.step===2){const imp=w.imp;const ph={busca:'Cole a URL completa da busca de pessoas',sales:'Cole a URL da busca do Sales Navigator',post:'https://www.linkedin.com/posts/...'}[imp.fonte];
+  h+=`<div class="li-g2"><div class="li-pane"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px">${LI_IC.link}</div><div><h4 style="font-size:14px">URLs do LinkedIn</h4><p class="sub">Uma URL de perfil por linha</p></div></div><textarea class="field" id="liurls" rows="6" style="margin-top:12px" placeholder="https://www.linkedin.com/in/perfil-1&#10;https://www.linkedin.com/in/perfil-2" oninput="LI.wiz.urls=this.value">${esc(w.urls||'')}</textarea><button class="btn" style="width:100%;margin-top:10px" onclick="liAddUrls()">＋ Adicionar perfis</button></div>
+  <div class="li-pane"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px;color:var(--ok);background:rgba(53,230,160,.12)">▦</div><div><h4 style="font-size:14px">Importar CSV</h4><p class="sub">Nome, empresa, cargo e URL do LinkedIn</p></div></div><label class="li-drop" style="display:block;margin-top:12px"><input type="file" accept=".csv,text/csv" style="display:none" onchange="liCsv(this)"><div style="font-size:20px">🗎</div><b style="color:var(--ink)">Selecione um arquivo CSV</b><div style="font-size:11px;margin-top:4px">Inclua a coluna linkedin_url, linkedin ou url</div></label></div></div>
+  <div class="li-imp"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px;background:#0a66c2;color:#fff">in</div><div><h4 style="font-size:14px;margin:0;color:var(--ink)">Importar pelo LinkedIn</h4><p class="sub" style="font-size:12px;color:var(--dim);margin:2px 0 0">Busca clássica, Sales Navigator ou pessoas que interagiram com uma publicação.</p></div></div>
+  <div class="li-improw"><select class="field" style="margin:0" onchange="LI.wiz.imp.fonte=this.value;liWizRender()"><option value="busca"${imp.fonte==='busca'?' selected':''}>LinkedIn Search</option><option value="sales"${imp.fonte==='sales'?' selected':''}>Sales Navigator</option><option value="post"${imp.fonte==='post'?' selected':''}>URL de publicação</option></select><input class="field" style="margin:0" placeholder="${ph}" value="${esc(imp.url)}" oninput="LI.wiz.imp.url=this.value"><select class="field" style="margin:0" onchange="LI.wiz.imp.max=+this.value">${[25,50,100,250,500].map(n=>`<option value="${n}"${imp.max===n?' selected':''}>${n} leads</option>`).join('')}</select></div>
+  ${imp.fonte==='post'?`<div class="faint" style="font-size:11.5px;margin-top:10px;line-height:1.55">Use o link da <b>publicação original</b>, não de um compartilhamento (repost) dela — compartilhamentos têm comentários e reações próprios, separados do post original, e não podem ser importados. Pra pegar o link certo: abra a publicação no LinkedIn, clique nos três pontinhos (•••) no canto do post e escolha <b>"Copiar link para a publicação"</b>.</div><div class="li-seg" style="margin-top:10px">${[['comentarios','Comentários'],['reacoes','Reações'],['ambos','Ambos']].map(([k,l])=>`<button class="${imp.modo===k?'on':''}" onclick="LI.wiz.imp.modo='${k}';liWizRender()">${l}</button>`).join('')}</div>`:''}
+  ${imp.fonte==='sales'?'<div class="faint" style="font-size:11.5px;margin-top:10px">A extração do Sales Navigator ainda é limitada — se falhar, faça a mesma busca no LinkedIn Search.</div>':''}
+  <div style="display:flex;align-items:center;gap:12px;margin-top:12px"><button class="btn" id="liimpbtn" onclick="liImportar()" ${w.job?'disabled style="opacity:.6"':''}>${w.job?'Importando…':'⌕ Buscar e importar leads'}</button><span class="faint" id="liimpmsg" style="font-size:12px">${w.job?'A extensão está percorrendo o LinkedIn numa aba fixada (pode levar alguns minutos)…':''}</span></div></div>
+  <div class="li-pane" style="margin-top:14px;padding:0"><div class="li-bar"><b style="color:var(--ink)">Leads adicionados</b><div style="display:flex;gap:8px;align-items:center"><span class="li-pill azul">${w.leads.length} lead(s)</span>${w.leads.length?'<button class="li-btn2" onclick="if(confirm(\'Remover todos os leads da lista?\')){LI.wiz.leads=[];liWizRender();}">Limpar</button>':''}</div></div>
+  <div class="li-leadl">${w.leads.length?w.leads.map((l,i)=>`<div class="li-lrow"><div class="li-av">${esc(liIni(l.nome||l.url.split('/in/')[1]))}</div><div style="flex:1;min-width:0"><b style="color:var(--ink)">${esc(l.nome||l.url.split('/in/')[1].replace('/',''))}</b><div class="faint" style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(l.cargo||l.url)}</div></div><button class="li-icbtn" onclick="LI.wiz.leads.splice(${i},1);liWizRender()">✕</button></div>`).join(''):'<div class="li-empty" style="padding:26px">Nenhum lead adicionado.</div>'}</div></div>`;}
+ else if(w.step===3){const lim=(LI.lim||{}).limites||{};
+  h+=`<div class="li-pane" style="max-width:760px"><h4>Configurações</h4><p class="sub">Como esta campanha se comporta.</p><label class="li-lbl">Nome da campanha</label><input class="field" value="${esc(w.nome)}" placeholder="Ex.: Diretores de TI — SP" oninput="LI.wiz.nome=this.value">
+  <label class="li-obj${w.cfg.parar_ao_responder?' on':''}" style="margin-top:14px"><input type="checkbox" ${w.cfg.parar_ao_responder?'checked':''} onchange="LI.wiz.cfg.parar_ao_responder=this.checked;liWizRender()"> Parar a cadência quando o lead responder (ele vai para o CRM)</label>
+  <label class="li-obj${w.cfg.pular_existentes?' on':''}" style="margin-top:8px"><input type="checkbox" ${w.cfg.pular_existentes?'checked':''} onchange="LI.wiz.cfg.pular_existentes=this.checked;liWizRender()"> Pular leads que já estão em outras campanhas</label>
+  <label class="li-lbl">Anotações internas (opcional)</label><textarea class="field" rows="3" oninput="LI.wiz.cfg.notas=this.value">${esc(w.cfg.notas||'')}</textarea>
+  <div class="li-info" style="margin-top:14px">🛡 Ritmo da conta (vale para todas as campanhas): até <b>${lim.convites_dia||25} convites/dia</b> e <b>${lim.mensagens_dia||40} mensagens/dia</b>, das ${lim.hora_inicio??8}h às ${lim.hora_fim??19}h, com ${lim.intervalo_min||60}–${lim.intervalo_max||180}s entre ações. Ajuste em <a href="javascript:void(0)" onclick="LI.wiz=null;liGo('limites')" style="color:var(--iris)">Segurança e limites</a>.</div></div>`;}
+ else if(w.step===4){const lim=(LI.lim||{}).limites||{};const conv=w.passos.some(p=>p.tipo==='conexao');const dias=Math.ceil(w.leads.length/Math.max(1,conv?(lim.convites_dia||25):(lim.mensagens_dia||40)));
+  h+=`<div class="li-pane" style="max-width:760px"><h4>Lançar</h4><p class="sub">Revise e lance — a fila começa no próximo horário de funcionamento.</p>
+  <div class="kv" style="margin-top:14px"><span class="k">Nome</span><span class="v">${esc(w.nome||'(sem nome)')}</span></div><div class="kv"><span class="k">Leads</span><span class="v">${w.leads.length}</span></div><div class="kv"><span class="k">Cadência</span><span class="v">${w.passos.map(p=>LI_PNOME[p.tipo]+(p.tipo==='aguardar'?' '+(p.cfg.dias||1)+'d':'')).join(' → ')}</span></div><div class="kv"><span class="k">Ritmo estimado</span><span class="v">~${dias} dia(s) útil(eis) para o 1º passo de todos os leads</span></div>
+  ${(LI.st&&LI.st.extensao)?'':'<div class="li-info" style="margin-top:12px;border-color:rgba(255,184,77,.4);background:rgba(255,184,77,.07)">⚠ A extensão do navegador não está conectada agora. A campanha fica na fila e começa quando ela conectar. <a href="javascript:void(0)" onclick="liReconectar()" style="color:var(--iris)">Como conectar</a></div>'}
+  <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="li-btn2" onclick="liSalvarCamp(false,this)">Salvar como rascunho</button><button class="btn" onclick="liSalvarCamp(true,this)">🚀 Lançar campanha</button></div></div>`;}
+ return h+'</div></div>';}
+async function liWizNext(){const w=LI.wiz;
+ if(w.modo==='passos'){try{await liP('/linkedin/campanhas/'+w.campId,{acao:'editar_passos',passos:w.passos});toast('Cadência atualizada','ok');LI.camp=w.campId;LI.wiz=null;liRefresh();}catch(e){toast(e.message,'error');}return;}
+ if(w.modo==='leads'){try{await liP('/linkedin/campanhas/'+w.campId,{acao:'adicionar_leads',leads:w.leads});toast(w.leads.length+' lead(s) adicionados','ok');LI.camp=w.campId;LI.wiz=null;liRefresh();}catch(e){toast(e.message,'error');}return;}
+ if(w.step===2&&!LI.lim){try{LI.lim=await J('/linkedin/limites');}catch(e){}}
+ w.step++;liWizRender();}
+async function liSalvarCamp(lancar,b){const w=LI.wiz;b.disabled=true;try{const r=await liP('/linkedin/campanhas',{nome:w.nome,passos:w.passos,leads:w.leads,config:w.cfg,lancar});toast(lancar?'Campanha lançada 🚀':'Rascunho salvo','ok');if(r.pulados)toast(r.pulados+' lead(s) pulados (já estavam em outras campanhas)','info');LI.wiz=null;LI.camp=null;liRefresh();}catch(e){toast(e.message,'error');b.disabled=false;}}
+function liLeadAdd(arr){const w=LI.wiz;const have=new Set(w.leads.map(l=>l.url));let n=0;for(const p of arr){let u=(p.url||'').trim();const m=u.match(/linkedin\.com\/(?:in|pub)\/([^/?#\s]+)/i);if(!m)continue;u='https://www.linkedin.com/in/'+decodeURIComponent(m[1]).toLowerCase()+'/';if(have.has(u))continue;have.add(u);w.leads.push({url:u,nome:p.nome||'',cargo:p.cargo||'',empresa:p.empresa||''});n++;}return n;}
+function liAddUrls(){const t=(document.getElementById('liurls')||{}).value||'';const n=liLeadAdd(t.split(/[\s,;]+/).map(u=>({url:u})));LI.wiz.urls='';toast(n?n+' perfil(is) adicionado(s)':'Nenhuma URL de perfil válida (formato linkedin.com/in/...)',n?'ok':'error');liWizRender();}
+function liCsvParse(txt){const delim=(txt.split('\n')[0].match(/;/g)||[]).length>(txt.split('\n')[0].match(/,/g)||[]).length?';':',';const rows=[];let row=[],cur='',q=false;for(let i=0;i<txt.length;i++){const ch=txt[i];if(q){if(ch==='"'){if(txt[i+1]==='"'){cur+='"';i++;}else q=false;}else cur+=ch;}else if(ch==='"')q=true;else if(ch===delim){row.push(cur);cur='';}else if(ch==='\n'||ch==='\r'){if(ch==='\r'&&txt[i+1]==='\n')i++;row.push(cur);rows.push(row);row=[];cur='';}else cur+=ch;}if(cur||row.length){row.push(cur);rows.push(row);}return rows.filter(r=>r.some(c=>c.trim()));}
+function liCsv(inp){const f=inp.files[0];if(!f)return;const rd=new FileReader();rd.onload=()=>{const rows=liCsvParse(String(rd.result||''));if(!rows.length){toast('CSV vazio','error');return;}const hd=rows[0].map(h=>h.trim().toLowerCase());const col=(...ks)=>hd.findIndex(h=>ks.some(k=>h===k||h.includes(k)));
+ const iu=col('linkedin_url','linkedin','url','perfil','profile'),inm=col('nome','name'),ifn=col('first name','primeiro'),iln=col('last name','sobrenome'),ie=col('empresa','company','organiza'),ic=col('cargo','title','headline','posição','position');
+ if(iu<0){toast('Não achei a coluna da URL do LinkedIn (linkedin_url, linkedin ou url)','error');return;}
+ const arr=rows.slice(1).map(r=>({url:r[iu]||'',nome:(inm>=0?r[inm]:((ifn>=0?r[ifn]:'')+' '+(iln>=0?r[iln]:''))).trim(),empresa:ie>=0?r[ie]:'',cargo:ic>=0?r[ic]:''}));const n=liLeadAdd(arr);toast(n+' lead(s) importado(s) do CSV','ok');liWizRender();};rd.readAsText(f,'utf-8');}
+async function liImportar(){const w=LI.wiz,imp=w.imp;if(!imp.url.trim()){toast('Cole a URL do LinkedIn','error');return;}
+ try{const r=await liP('/linkedin/importar',{url:imp.url.trim(),fonte:imp.fonte,max:imp.max,modo:imp.modo});w.job=r.job;liWizRender();
+  const j=await liJob(r.job,jj=>{const m=document.getElementById('liimpmsg');if(m&&jj.status==='rodando')m.textContent='Extraindo leads… a extensão está percorrendo as páginas do LinkedIn.';});
+  w.job=null;if(j.status==='ok'){const n=liLeadAdd(j.leads||[]);toast(n+' lead(s) importado(s)'+(j.aviso?' · '+j.aviso:''),n?'ok':'info');}else toast('Importação falhou: '+(j.erro||'erro'),'error');}
+ catch(e){w.job=null;toast(e.message,'error');if(/extensão/.test(e.message))liReconectar();}
+ if(LI.wiz)liWizRender();}
+
+/* ---------- CRM ---------- */
+async function liCrm(){const d=await J('/linkedin/crm');LI.crm=d;const cts=d.contatos||[];
+ const origs=[...new Set(cts.map(c=>c.origem).filter(Boolean))];
+ const fil=cts.filter(c=>(!LI.crmQ||(c.nome+' '+c.empresa+' '+c.cargo+' '+c.tags.join(' ')).toLowerCase().includes(LI.crmQ.toLowerCase()))&&(!LI.crmEtapa||c.etapa===LI.crmEtapa)&&(!LI.crmOrig||c.origem===LI.crmOrig));
+ let h=liHead('LINKEDIN CRM',LI_IC.users,'Relacionamentos e oportunidades','Centralize respostas de campanhas e comentários de posts com automação ativa.',`<button class="li-btn2" onclick="liNovoContato()">＋ Contato</button><button class="li-btn2 sync" onclick="liSyncJob('sync_respostas',this)">${LI_IC.sync} Atualizar CRM</button>`);
+ const nl=fil.filter(c=>c.nao_lido).length,at=fil.reduce((s,c)=>s+c.tarefas.filter(t=>t.atrasada).length,0),gn=fil.filter(c=>c.etapa==='Ganho').length;
+ h+=`<div class="li-stats" style="grid-template-columns:repeat(3,1fr)">${liStat('🔔','rgba(53,224,230,.12)','var(--cyan)',nl,'Não lidos nesta visão')}${liStat('📅','rgba(255,184,77,.13)','var(--warn)',at,'Tarefas atrasadas nesta visão')}${liStat('✓','rgba(53,230,160,.12)','var(--ok)',gn,'Ganhos nesta visão')}</div>`;
+ h+=`<div class="li-box"><div class="li-bar"><div class="li-seg">${[['inbox','Caixa de entrada'],['pipeline','Pipeline'],['contatos','Contatos']].map(([k,l])=>`<button class="${LI.crmTab===k?'on2':''}" onclick="LI.crmTab='${k}';liRefresh()">${l}</button>`).join('')}</div><div style="display:flex;gap:8px;flex-wrap:wrap"><div class="li-search">${ico('search')}<input placeholder="Buscar nome, empresa ou tag" value="${esc(LI.crmQ)}" oninput="LI.crmQ=this.value;clearTimeout(window._liqt);window._liqt=setTimeout(liRefresh,350)"></div><select class="field" style="margin:0;width:auto" onchange="LI.crmEtapa=this.value;liRefresh()"><option value="">Todas as etapas</option>${d.etapas.map(e=>`<option${LI.crmEtapa===e?' selected':''}>${e}</option>`).join('')}</select><select class="field" style="margin:0;width:auto" onchange="LI.crmOrig=this.value;liRefresh()"><option value="">Todas as origens</option>${origs.map(o=>`<option${LI.crmOrig===o?' selected':''}>${esc(o)}</option>`).join('')}</select></div></div>`;
+ if(!cts.length)h+=`<div class="li-empty"><b>O CRM está vazio</b>Quem responder suas campanhas de Outbound ou comentar seus posts (com uma automação ativa) cai aqui direto no pipeline.</div>`;
+ else if(LI.crmTab==='pipeline'){h+=`<div class="li-kanban">${d.etapas.filter(e=>!LI.crmEtapa||e===LI.crmEtapa).map(e=>{const cs=fil.filter(c=>c.etapa===e);return `<div class="li-col" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="this.classList.remove('over');liCrmDrop(event,'${e}')"><div class="li-colh"><span class="dt" style="background:${LI_ETC[e]}"></span>${e}<small>${cs.length} exibidos</small></div>${cs.slice(0,80).map(liKCard).join('')}</div>`;}).join('')}</div>`;}
+ else if(LI.crmTab==='inbox'){const ls=[...fil].sort((a,b)=>(b.nao_lido-a.nao_lido)||(b.atualizado_ts-a.atualizado_ts));h+=ls.map(c=>`<div class="li-inbox" onclick="liDrawer('${c.id}')"><div class="li-av">${esc(liIni(c.nome))}</div><div class="tx"><b style="font-size:13px;color:var(--ink);${c.nao_lido?'':'font-weight:500'}">${esc(c.nome)} ${c.nao_lido?'<span class="li-unr"></span>':''}</b><div>${esc(c.ultima||c.origem_detalhe||'')}</div></div><div style="text-align:right;font-size:11px;color:var(--faint)">${liAgo(c.atualizado)}<div><span class="li-pill cinza">${esc(c.etapa)}</span></div></div></div>`).join('')||'<div class="li-empty">Nada nesta visão.</div>';}
+ else{h+=`<div style="overflow:auto"><table class="li-tbl"><thead><tr><th>Contato</th><th>Empresa</th><th>Etapa</th><th>Origem</th><th>Tags</th><th>Atualizado</th></tr></thead><tbody>${fil.map(c=>`<tr style="cursor:pointer" onclick="liDrawer('${c.id}')"><td><b style="color:var(--ink)">${esc(c.nome)}</b><div class="faint" style="font-size:11px">${esc(c.cargo)}</div></td><td>${esc(c.empresa||'—')}</td><td><span class="dt" style="display:inline-block;width:7px;height:7px;border-radius:9px;background:${LI_ETC[c.etapa]};margin-right:6px"></span>${esc(c.etapa)}</td><td>${esc(c.origem)}</td><td>${c.tags.map(t=>'<span class="li-chip">'+esc(t)+'</span>').join(' ')}</td><td class="faint">${liAgo(c.atualizado)}</td></tr>`).join('')}</tbody></table></div>`;}
+ h+='</div>';if(LI.drawer)setTimeout(()=>liDrawer(LI.drawer,true),0);return h;}
+function liKCard(c){return `<div class="li-kc" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','${c.id}')" onclick="liDrawer('${c.id}')"><div class="top"><div class="li-av" style="width:30px;height:30px;font-size:10.5px">${esc(liIni(c.nome))}</div><div style="min-width:0;flex:1"><b>${esc(c.nome)} ${c.nao_lido?'<span class="li-unr"></span>':''}</b><div class="em">${esc(c.empresa||'Sem empresa')}</div></div></div><div class="or"><span>${esc(c.origem||'—')}</span><span>${liAgo(c.atualizado)}</span></div><select onclick="event.stopPropagation()" onchange="liCrmAcao('${c.id}',{acao:'etapa',etapa:this.value},true)">${(LI.crm.etapas||[]).map(e=>`<option${c.etapa===e?' selected':''}>${e}</option>`).join('')}</select></div>`;}
+async function liCrmDrop(e,etapa){const id=e.dataTransfer.getData('text/plain');if(id)liCrmAcao(id,{acao:'etapa',etapa},true);}
+async function liCrmAcao(id,b,recarrega){try{const r=await liP('/linkedin/crm/'+id,b);if(recarrega){liRefresh();}return r;}catch(e){toast(e.message,'error');}}
+function liNovoContato(){const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox"><div class="modalh"><b>Novo contato</b><button class="cvbtn" onclick="closeModal()">✕</button></div><label class="li-lbl">URL do perfil no LinkedIn</label><input class="field" id="lncu" placeholder="https://www.linkedin.com/in/..."><label class="li-lbl">Nome</label><input class="field" id="lncn"><div class="li-g2"><div><label class="li-lbl">Cargo</label><input class="field" id="lncc"></div><div><label class="li-lbl">Empresa</label><input class="field" id="lnce"></div></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" onclick="liP('/linkedin/crm',{url:lncu.value,nome:lncn.value,cargo:lncc.value,empresa:lnce.value}).then(()=>{closeModal();toast('Contato criado','ok');liRefresh();}).catch(e=>toast(e.message,'error'))">Criar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
+async function liDrawer(id,soAbrir){LI.drawer=id;let c=(LI.crm&&LI.crm.contatos||[]).find(x=>x.id===id);if(!c)return;
+ if(c.nao_lido&&!soAbrir){const r=await liCrmAcao(id,{acao:'lido'});if(r&&r.contato){c=r.contato;const i=LI.crm.contatos.findIndex(x=>x.id===id);LI.crm.contatos[i]=c;}}
+ document.querySelectorAll('.li-drawer,.li-drawer-bg').forEach(x=>x.remove());
+ const et=(LI.crm.etapas||[]).map(e=>`<option${c.etapa===e?' selected':''}>${e}</option>`).join('');
+ const h=`<div class="li-drawer-bg" onclick="liDrawerFechar()"></div><div class="li-drawer"><div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:15px;color:var(--ink)">Detalhes do contato</b><button class="cvbtn" onclick="liDrawerFechar()">✕</button></div>
+ <div style="display:flex;gap:12px;align-items:center;margin-top:16px"><div class="li-av" style="width:44px;height:44px;font-size:14px">${esc(liIni(c.nome))}</div><div><b style="font-size:16px;color:var(--ink)">${esc(c.nome)}</b><div class="faint" style="font-size:12px">${esc(c.cargo||'Cargo não informado')}${c.empresa?' · '+esc(c.empresa):''}</div></div></div>
+ <div style="display:flex;gap:8px;margin-top:12px"><select class="field" style="margin:0;max-width:170px" onchange="liCrmAcao('${c.id}',{acao:'etapa',etapa:this.value}).then(r=>{if(r)toast('Etapa: '+this.value,'ok');liDrawerAtualiza(r)})">${et}</select>${c.url?`<a class="li-btn2 sync" href="${esc(c.url)}" target="_blank" rel="noopener">${LI_IC.ext} Abrir LinkedIn</a>`:''}</div>
+ <div class="li-dsec"><h5>≡ Origens</h5>${c.origens.map(o=>`<div class="li-orig"><b>${esc(o.tipo)}</b><span>${esc(o.detalhe||'')} · ${liDH(o.em)}</span></div>`).join('')||'<div class="faint" style="font-size:12px">—</div>'}</div>
+ <div class="li-dsec"><h5>💬 Conversa</h5><div class="li-msgs" id="limsgs">${c.mensagens.map(m=>`<div class="li-msg ${m.de==='eu'?'e':'c'}">${esc(m.texto)}<small>${liDH(m.em)}</small></div>`).join('')||'<div class="faint" style="font-size:12px">Sem mensagens registradas.</div>'}</div>${c.url?`<textarea class="field" id="lidmsg" rows="3" style="margin-top:8px" placeholder="Responder pelo LinkedIn…"></textarea><div style="display:flex;justify-content:flex-end;margin-top:6px"><button class="btn" onclick="liCrmMsg('${c.id}')">Enviar pelo LinkedIn</button></div>`:''}</div>
+ <div class="li-dsec"><h5>🏷 Tags</h5><div style="display:flex;gap:8px"><input class="field" id="lidtags" style="margin:0" placeholder="Ex.: quente, decisor" value="${esc(c.tags.join(', '))}"><button class="btn" onclick="liCrmAcao('${c.id}',{acao:'tags',tags:lidtags.value}).then(r=>{if(r){toast('Tags salvas','ok');liDrawerAtualiza(r)}})">Salvar</button></div><div class="faint" style="font-size:11px;margin-top:4px">Separe as tags por vírgulas.</div></div>
+ <div class="li-dsec"><h5>📅 Tarefas</h5><div style="display:grid;grid-template-columns:1fr 150px 92px 36px;gap:6px"><input class="field" id="lidtt" style="margin:0" placeholder="Nova tarefa..."><input class="field" id="lidtq" type="datetime-local" style="margin:0;font-size:11.5px"><select class="field" id="lidtp" style="margin:0"><option>Normal</option><option>Alta</option><option>Baixa</option></select><button class="btn" style="padding:0" onclick="liCrmAcao('${c.id}',{acao:'tarefa',texto:lidtt.value,quando:lidtq.value,prioridade:lidtp.value}).then(r=>{if(r)liDrawerAtualiza(r)})">＋</button></div>
+ ${c.tarefas.map(t=>`<div class="li-task"><input type="checkbox" ${t.feita?'checked':''} onchange="liCrmAcao('${c.id}',{acao:'tarefa_feita',id:'${t.id}'}).then(r=>{if(r)liDrawerAtualiza(r)})"><span style="flex:1;${t.feita?'text-decoration:line-through;opacity:.6':''}">${esc(t.texto)}</span>${t.quando_iso?`<span class="li-pill ${t.atrasada?'erro':'cinza'}">${liDH(t.quando_iso)}</span>`:''}<span class="li-pill ${t.prioridade==='Alta'?'erro':'cinza'}">${t.prioridade}</span><button class="li-icbtn" style="width:24px;height:24px" onclick="liCrmAcao('${c.id}',{acao:'tarefa_excluir',id:'${t.id}'}).then(r=>{if(r)liDrawerAtualiza(r)})">✕</button></div>`).join('')}</div>
+ <div class="li-dsec"><h5>🗎 Adicionar nota</h5><textarea class="field" id="lidnota" rows="3" placeholder="Registre contexto para o próximo contato..."></textarea><div style="display:flex;justify-content:flex-end;margin-top:6px"><button class="li-btn2" onclick="liCrmAcao('${c.id}',{acao:'nota',texto:lidnota.value}).then(r=>{if(r){toast('Nota salva','ok');liDrawerAtualiza(r)}})">Salvar nota</button></div>
+ ${[...c.notas].reverse().map(n=>`<div class="li-orig" style="${n.sistema?'opacity:.7':''}"><span>${liDH(n.em)} · ${esc(n.por||'')}</span><div style="color:var(--ink2);margin-top:3px;white-space:pre-wrap">${esc(n.texto)}</div></div>`).join('')}</div>
+ <div class="li-dsec" style="text-align:right"><button class="li-btn2 danger" onclick="if(confirm('Excluir este contato do CRM?'))liCrmAcao('${c.id}',{acao:'excluir'}).then(()=>{liDrawerFechar();})">Excluir contato</button></div></div>`;
+ document.body.insertAdjacentHTML('beforeend',h);const ms=document.getElementById('limsgs');if(ms)ms.scrollTop=ms.scrollHeight;}
+function liDrawerAtualiza(r){if(!r||!r.contato)return;const i=LI.crm.contatos.findIndex(x=>x.id===r.contato.id);if(i>=0)LI.crm.contatos[i]=r.contato;liDrawer(r.contato.id,true);}
+function liDrawerFechar(){LI.drawer=null;document.querySelectorAll('.li-drawer,.li-drawer-bg').forEach(x=>x.remove());if(LI.sec==='crm')liRefresh();}
+async function liCrmMsg(id){const t=(document.getElementById('lidmsg')||{}).value||'';if(!t.trim())return;const r=await liCrmAcao(id,{acao:'mensagem',texto:t});if(r){toast('Mensagem na fila — sai pelo seu navegador em instantes','ok');document.getElementById('lidmsg').value='';}}
+
+/* ---------- Inbound: Estratégia ---------- */
+const LI_EST_TABS={negocio:[['principal','Meu negócio'],['ref','Posts de referência'],['icp','Sobre seu ICP'],['extra','Informações adicionais']],carreira:[['principal','Minha carreira'],['ref','Posts de referência'],['icp','Sobre seu público'],['extra','Informações adicionais']]};
+async function liEstrategia(){const d=await J('/linkedin/estrategia');LI.est=d.estrategia||{};LI.estObjs=d.objetivos_opcoes||[];LI.estCal=d.calibragem||0;return liEstHtml();}
+function liEstHtml(){const e=LI.est,obj=e.objetivo||'negocio';const tabs=LI_EST_TABS[obj];
+ const F=(k,l,req,ph,rows)=>`<div><label class="li-lbl">${l}${req?' <span style="color:var(--crit)">*</span>':''}</label>${rows?`<textarea class="field" rows="${rows}" placeholder="${ph||''}" oninput="LI.est['${k}']=this.value">${esc(e[k]||'')}</textarea>`:`<input class="field" placeholder="${ph||''}" value="${esc(e[k]||'')}" oninput="LI.est['${k}']=this.value">`}</div>`;
+ let h=`<div class="li-head"><div><div class="li-eyebrow">LINKEDIN INBOUND</div><h2>Estratégia de conteúdo</h2><p>Construa a base usada na criação dos seus conteúdos.</p></div><div class="li-acts"><div class="li-calib"><div class="t">Calibragem IA <b id="licalib">${LI.estCal}%</b></div><div class="tr"><i style="width:${LI.estCal}%"></i></div></div><button class="li-btn2" onclick="liInspecionar()">👁 Inspecionar Contexto IA</button><button class="btn" onclick="liEstSalvar(this)">💾 Salvar</button></div></div>`;
+ h+=`<div class="li-pane"><b style="color:var(--ink);font-size:13.5px">Qual é o seu objetivo no LinkedIn?</b><div class="faint" style="font-size:11.5px;margin-top:3px">Isso ajusta os campos desta página e as mensagens geradas pela IA para o seu objetivo. Nada do que você já preencheu é apagado ao trocar.</div><div class="li-radio">${[['negocio','Meu negócio','Tenho uma empresa/produto/serviço e quero gerar leads e vendas pelo LinkedIn.'],['carreira','Minha carreira','Sou profissional CLT e quero construir autoridade, posicionamento e expandir minha rede.']].map(([k,t,s])=>`<label class="li-ropt${obj===k?' on':''}"><input type="radio" name="liobj" ${obj===k?'checked':''} onchange="LI.est.objetivo='${k}';LI.estTab='principal';liEstRender()"><div><b>${t}</b><span>${s}</span></div></label>`).join('')}</div></div>`;
+ h+=`<div class="li-seg" style="align-self:flex-start">${tabs.map(([k,l])=>`<button class="${LI.estTab===k?'on':''}" onclick="LI.estTab='${k}';liEstRender()">${l}</button>`).join('')}</div><div class="li-pane">`;
+ if(LI.estTab==='principal'){
+  if(obj==='negocio')h+=`<h4 style="font-size:17px">Visão geral</h4><p class="sub">Conte sobre sua empresa e o valor entregue.</p><div class="li-g2">${F('linkedin_url','LinkedIn URL',0,'https://www.linkedin.com/in/...')}${F('site','Site da empresa',1,'https://...')}</div>`;
+  else h+=`<h4 style="font-size:17px">Visão geral</h4><p class="sub">Conte sobre você, sua trajetória e onde quer chegar.</p><div class="li-g2">${F('linkedin_url','LinkedIn URL',0,'https://www.linkedin.com/in/...')}${F('cargo_atual','Cargo atual',1,'Ex.: Gerente de Projetos')}</div>`;
+  h+=`<label class="li-lbl">Objetivos</label><div class="li-objs">${LI.estObjs.map(o=>{const on=(e.objetivos||[]).includes(o);return `<label class="li-obj${on?' on':''}"><input type="checkbox" ${on?'checked':''} onchange="liEstObj('${o}',this.checked)"> ${o}</label>`;}).join('')}</div>`;
+  if(obj==='negocio')h+=F('descricao','Descrição do negócio',1,'O que sua empresa faz, para quem e como.',5)+F('proposta_valor','Proposta de valor',1,'Por que te escolher? Qual transformação você entrega?',5)+`<div class="li-g2">${F('produtos','Produtos e serviços',0,'',4)}${F('diferenciais','Diferenciais',0,'',4)}</div>`+F('tom_voz','Tom de voz',0,'Ex.: direto, próximo, técnico sem jargão, com bom humor');
+  else h+=F('area','Área de atuação',0,'Ex.: Engenharia de dados no varejo')+F('trajetoria','Trajetória',1,'Resumo da sua carreira, empresas e projetos marcantes.',5)+F('conquistas','Conquistas e resultados',0,'Números, prêmios, projetos que você liderou...',4)+F('objetivo_carreira','Onde quer chegar',0,'Ex.: ser referência em IA aplicada a logística',3)+F('tom_voz','Tom de voz',0,'Ex.: inspirador, didático, pé no chão');}
+ else if(LI.estTab==='ref')h+=`<h4 style="font-size:17px">Posts de referência</h4><p class="sub">Cole seus melhores posts (ou de criadores que você admira). A IA imita o estilo — ritmo, tamanho, ganchos — não o conteúdo. Separe os posts com uma linha contendo ---</p>`+F('posts_ref','Posts',0,'Post 1...\n---\nPost 2...',14);
+ else if(LI.estTab==='icp')h+=`<h4 style="font-size:17px">${obj==='negocio'?'Sobre seu ICP':'Sobre seu público'}</h4><p class="sub">Para quem você escreve. Quanto mais específico, melhores os posts.</p><div class="li-g2">${F('icp_cargos','Cargos',0,'Ex.: CEO, Diretor de Operações')}${F('icp_setores','Setores',0,'Ex.: indústria, logística')}</div>`+F('icp_porte','Porte / contexto',0,'Ex.: PMEs de 20 a 200 funcionários')+`<div class="li-g2">${F('icp_dores','Dores',0,'O que tira o sono dessas pessoas?',4)}${F('icp_desejos','Desejos',0,'O que elas querem conquistar?',4)}</div>`+F('icp_objecoes','Objeções',0,'Por que elas hesitam em comprar/contratar?',3);
+ else h+=`<h4 style="font-size:17px">Informações adicionais</h4><p class="sub">Ajustes finos para a IA.</p>`+F('extra_cta','CTA padrão',0,'Ex.: me chama no direct / comente "quero"')+`<div class="li-g2">${F('extra_evitar','Evite',0,'Palavras, temas ou promessas a evitar')}${F('extra_hashtags','Hashtags',0,'Ex.: #automacao #ia')}</div>`+F('extra_info','Outras informações',0,'Cases, histórias, números reais que a IA pode usar.',5)+`<label class="li-obj${e.extra_emojis!==false?' on':''}" style="margin-top:12px"><input type="checkbox" ${e.extra_emojis!==false?'checked':''} onchange="LI.est.extra_emojis=this.checked;liEstRender()"> Pode usar emojis com moderação</label>`;
+ return h+'</div>';}
+function liEstRender(){const m=document.querySelector('#limount .li-main');if(m)m.innerHTML=liEstHtml();}
+function liEstObj(o,on){const a=LI.est.objetivos=LI.est.objetivos||[];if(on&&!a.includes(o))a.push(o);if(!on)LI.est.objetivos=a.filter(x=>x!==o);liEstRender();}
+async function liEstSalvar(b){b.disabled=true;try{const r=await liP('/linkedin/estrategia',LI.est);LI.estCal=r.calibragem;toast('Estratégia salva · calibragem '+r.calibragem+'%','ok');liEstRender();}catch(e){toast(e.message,'error');}b.disabled=false;}
+async function liInspecionar(){try{await liP('/linkedin/estrategia',LI.est);}catch(e){}const d=await J('/linkedin/estrategia/contexto');const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:720px"><div class="modalh"><b>👁 Contexto que a IA recebe</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-bottom:8px">Este é o texto que acompanha cada pedido de post (modelo: <span class="mono">${esc(d.modelo||'')}</span>).</div><pre class="mono" style="white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:11.5px;max-height:60vh;overflow:auto;color:var(--ink2)">${esc(d.contexto||'')}</pre></div></div>`;document.body.appendChild(w.firstChild);}
+
+/* ---------- Inbound: Posts ---------- */
+async function liPosts(){const q='/linkedin/posts?periodo='+(LI.per==='custom'?'custom&de='+LI.perDe+'&ate='+LI.perAte:LI.per);const d=await J(q);LI.posts=d;const t=d.totais||{};const st=LI.st||{};
+ let h=liHead('LINKEDIN INBOUND','','Posts','Crie, sincronize, agende e acompanhe seus conteúdos.',`${st.extensao?`<span class="li-btn2" style="cursor:default;color:var(--ok);border-color:rgba(53,230,160,.35);background:rgba(53,230,160,.06)">● Sincronização Automática Ativa (Proteção 1h)</span>`:''}<button class="li-btn2" title="Sincronizar posts e métricas agora" onclick="liSyncJob('sync_posts',this)">${LI_IC.sync}</button><button class="li-btn2 ai" onclick="liGerarModal()">✧ Gerar com IA</button><button class="btn" onclick="liNovoPost()">＋ Novo post</button>`);
+ h+=`<div class="li-box" style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;flex-wrap:wrap;gap:10px"><div><b style="color:var(--ink);font-size:13.5px">Período</b><div class="faint" style="font-size:11.5px">${{7:'Últimos 7 dias',14:'Últimos 14 dias',tudo:'Todo o período',custom:'Personalizado'}[LI.per]} · ${d.n_periodo||0} post(s)</div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${LI.per==='custom'?`<input type="date" class="field" style="margin:0;width:auto" value="${LI.perDe}" onchange="LI.perDe=this.value;liRefresh()"><input type="date" class="field" style="margin:0;width:auto" value="${LI.perAte}" onchange="LI.perAte=this.value;liRefresh()">`:''}<div class="li-seg">${[['7','7 dias'],['14','14 dias'],['tudo','Tudo'],['custom','Personalizar']].map(([k,l])=>`<button class="${LI.per===k?'on2':''}" onclick="LI.per='${k}';liRefresh()">${l}</button>`).join('')}</div></div></div>`;
+ h+=`<div class="li-stats">${liStat('👁','rgba(176,108,255,.13)','var(--violet)',(t.impressoes||0).toLocaleString('pt-BR'),'Impressões')}${liStat('〰','rgba(53,224,230,.12)','var(--cyan)',(t.interacoes||0).toLocaleString('pt-BR'),'Interações')}${liStat('👍','rgba(53,230,160,.12)','var(--ok)',(t.reacoes||0).toLocaleString('pt-BR'),'Reações')}${liStat('💬','rgba(255,184,77,.13)','var(--warn)',(t.comentarios||0).toLocaleString('pt-BR'),'Comentários')}</div>`;
+ const F={'':'Todos',rascunho:'Rascunhos',agendado:'Agendados',publicado:'Publicados',erro:'Com erro'};
+ const ps=(d.posts||[]).filter(p=>(!LI.pF||p.status===LI.pF||(LI.pF==='agendado'&&p.status==='publicando'))&&(!LI.pQ||p.texto.toLowerCase().includes(LI.pQ.toLowerCase())));
+ h+=`<div class="li-box"><div class="li-bar"><div class="li-seg"><button class="${LI.pView==='lista'?'on2':''}" onclick="LI.pView='lista';liRefresh()">Lista</button><button class="${LI.pView==='cal'?'on2':''}" onclick="LI.pView='cal';liRefresh()">Calendário</button></div><div style="display:flex;gap:8px;flex-wrap:wrap"><div class="li-search">${ico('search')}<input placeholder="Buscar posts..." value="${esc(LI.pQ)}" oninput="LI.pQ=this.value;clearTimeout(window._liqt);window._liqt=setTimeout(liRefresh,350)"></div><select class="field" style="margin:0;width:auto" onchange="LI.pF=this.value;liRefresh()">${Object.entries(F).map(([k,l])=>`<option value="${k}"${LI.pF===k?' selected':''}>${l}</option>`).join('')}</select></div></div>`;
+ if(LI.pView==='cal')h+=liCal(ps);
+ else h+=ps.length?ps.map(liPostRow).join(''):`<div class="li-empty"><b>Nenhum post ${LI.pF?'nesse filtro':'ainda'}</b>Preencha a <a href="javascript:void(0)" onclick="liGo('inbound','estrategia')" style="color:var(--iris)">Estratégia</a> e clique em <b>Gerar com IA</b> — ou sincronize para trazer seus posts já publicados.</div>`;
+ return h+'</div>';}
+function liPostRow(p){const lb={rascunho:['Rascunho','rascunho'],agendado:['Agendado','agendado'],publicando:['Publicando…','publicando'],publicado:['Publicado','publicado'],erro:['Erro','erro']}[p.status]||[p.status,'cinza'];const dt=p.status==='publicado'?p.publicado_em:p.status==='agendado'?p.agendado_para:p.criado;const m=p.metricas||{};
+ const atrasado=p.status==='agendado'&&p.agendado_para&&new Date(p.agendado_para).getTime()<Date.now()-120000;
+ return `<div class="li-post" onclick="liAbrirPost('${p.id}')"><div style="display:flex;gap:10px;align-items:center"><span class="li-pill ${lb[1]}">${lb[0]}</span><span class="faint" style="font-size:11.5px">${liDH(dt)}</span>${atrasado?'<span class="li-pill aguardando">aguardando o navegador</span>':''}${p.midias.length?`<span class="faint" style="font-size:11px">🖼 ${p.midias.length}</span>`:''}${p.li_url?`<a href="${esc(p.li_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="margin-left:auto;color:var(--dim)" title="Abrir no LinkedIn">${LI_IC.ext}</a>`:''}</div><div class="tx">${esc(p.texto||'(vazio)')}</div>${p.erro?`<div style="font-size:11.5px;color:var(--crit);margin-bottom:6px">${esc(p.erro)}</div>`:''}${p.status==='publicado'?`<div class="mt"><span>👁 ${(m.impressoes||0).toLocaleString('pt-BR')}</span><span>👍 ${m.reacoes||0}</span><span>💬 ${m.comentarios||0}</span><span style="margin-left:auto;font-size:10.5px;color:var(--faint)">${p.metricas_em?'Métricas atualizadas em '+liDH(p.metricas_em):'Métricas na próxima sincronização'}</span></div>`:''}</div>`;}
+function liCal(ps){const b=LI.calM?new Date(LI.calM):new Date();b.setDate(1);const y=b.getFullYear(),mo=b.getMonth();const ini=new Date(y,mo,1-((new Date(y,mo,1).getDay()+6)%7));const nomes=['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+ const ev={};ps.forEach(p=>{const dt=p.status==='publicado'?p.publicado_em:p.agendado_para;if(!dt)return;const k=dt.slice(0,10);(ev[k]=ev[k]||[]).push(p);});
+ const hoje=new Date().toISOString().slice(0,10);let h=`<div style="display:flex;align-items:center;gap:10px;padding:12px 16px 0"><button class="li-icbtn" onclick="LI.calM=new Date(${y},${mo-1},1).toISOString();liRefresh()">‹</button><b style="color:var(--ink);min-width:120px;text-align:center">${nomes[mo]} ${y}</b><button class="li-icbtn" onclick="LI.calM=new Date(${y},${mo+1},1).toISOString();liRefresh()">›</button><span class="faint" style="font-size:11.5px">Rascunhos não aparecem no calendário.</span></div><div class="li-cal">${['seg','ter','qua','qui','sex','sáb','dom'].map(x=>`<div class="h">${x}</div>`).join('')}`;
+ for(let i=0;i<42;i++){const d=new Date(ini);d.setDate(ini.getDate()+i);const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  h+=`<div class="d${d.getMonth()!==mo?' out':''}${k===hoje?' hj':''}">${d.getDate()}${(ev[k]||[]).map(p=>`<span class="ev li-pill ${p.status}" onclick="liAbrirPost('${p.id}')" title="${esc(p.texto.slice(0,120))}">${(p.status==='publicado'?p.publicado_em:p.agendado_para||'').slice(11,16)} ${esc(p.texto.slice(0,30))}</span>`).join('')}</div>`;}
+ return h+'</div>';}
+function liGerarModal(){const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:520px"><div class="modalh"><b>Gerar post com IA</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-top:-6px">O resultado será aberto como rascunho para sua revisão.</div>
+ <label class="li-lbl">Tipo</label><select class="field" id="ligt"><option value="livre">Post livre</option><option value="storytelling">Storytelling</option><option value="lista">Lista de dicas</option><option value="opiniao">Opinião / contraponto</option><option value="case">Case de sucesso</option><option value="bastidores">Bastidores</option><option value="tutorial">Passo a passo</option><option value="pergunta">Pergunta para engajar</option></select>
+ <label class="li-lbl">Assunto</label><textarea class="field" id="liga" rows="4" placeholder="Descreva o tema e o ponto principal..." oninput="document.getElementById('ligbtn').disabled=!this.value.trim()"></textarea>
+ <label class="li-lbl">Orientações adicionais</label><textarea class="field" id="ligo" rows="3"></textarea>
+ ${(LI.estCal||0)<40?'<div class="li-info" style="margin-top:10px">Dica: preencha a <b>Estratégia</b> — a IA usa esse contexto para escrever sobre o seu negócio/carreira.</div>':''}
+ <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" id="ligbtn" disabled onclick="liGerar(this)">✧ Gerar post</button></div></div></div>`;document.body.appendChild(w.firstChild);setTimeout(()=>{const a=document.getElementById('liga');if(a)a.focus();},50);}
+async function liGerar(b){b.disabled=true;b.textContent='Gerando… (escreve e depois tira os vícios de IA)';try{const r=await liP('/linkedin/posts/gerar',{tipo:ligt.value,assunto:liga.value,orientacoes:ligo.value});closeModal();toast('Post gerado — revise antes de publicar','ok');await liRefresh();liEditor(r.post);}catch(e){toast(e.message,'error');b.disabled=false;b.textContent='✧ Gerar post';}}
+async function liNovoPost(){try{const r=await liP('/linkedin/posts',{texto:''});liEditor(r.post);}catch(e){toast(e.message,'error');}}
+function liAbrirPost(id){const p=((LI.posts||{}).posts||[]).find(x=>x.id===id);if(p)liEditor(p);}
+function liEditor(p){LI.ed=JSON.parse(JSON.stringify(p));closeModal();const ro=['publicado','publicando'].includes(p.status);const icu=(LI.posts||{}).image_creator_url||'https://chatgpt.com/';
+ const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox li-modal"><div class="modalh"><div><b>Editor de post</b><div class="faint" style="font-size:11.5px;margin-top:3px">O LinkedIn publica texto puro. A prévia abaixo mostra o texto e a mídia que serão enviados.</div></div><button class="cvbtn" onclick="closeModal();liRefresh()">✕</button></div>
+ <div class="li-ed"><div><div style="display:flex;justify-content:space-between"><label class="li-lbl" style="margin-top:0">Conteúdo</label><span class="faint mono" style="font-size:11px" id="liedcnt">${p.texto.length}/3000</span></div><textarea class="field" id="liedtx" rows="14" maxlength="3000" ${ro?'readonly':''} oninput="LI.ed.texto=this.value;liEdPrev()">${esc(p.texto)}</textarea>
+ <label class="li-lbl">Mídia opcional</label>${ro?'':`<input type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,application/pdf" class="field" style="padding:7px" onchange="liEdUpload(this)"><div class="faint" style="font-size:11px;margin-top:4px">Até 20 imagens ou um único vídeo/PDF; 20 MB por arquivo. A publicação automática envia a 1ª imagem (vídeo/PDF: publique manualmente).</div>`}<div class="li-thumbs" id="liedthumbs"></div>
+ ${ro?'':`<div class="li-imgbox"><b>Gerar imagem com IA</b><ol><li>Clique em <b>Gerar prompt</b> (montado com base no post).</li><li>Clique em <b>Gerar no Cerne</b> (usa a chave de imagem configurada) — ou <b>Copiar prompt</b> e abra o criador de imagem.</li><li>No criador externo: cole (Ctrl+V), gere, baixe e anexe acima em "Mídia opcional".</li></ol>
+ <textarea class="field" id="liedip" rows="3" placeholder="O prompt da imagem aparece aqui" style="font-size:11.5px">${esc(p.imagem_prompt||'')}</textarea><div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:8px"><button class="li-btn2" onclick="liEdPrompt(this)">✧ Gerar prompt</button><button class="li-btn2" onclick="const v=liedip.value;if(!v){toast('Gere o prompt primeiro','error');return;}navigator.clipboard.writeText(v);toast('Prompt copiado','ok')">⧉ Copiar prompt</button><button class="li-btn2 ai" onclick="liEdImg(this)">🖼 Gerar no Cerne</button><a class="li-btn2" href="${esc(icu)}" target="_blank" rel="noopener">Abrir criador de imagem ${LI_IC.ext}</a></div></div>`}
+ <div class="li-g2"><div><label class="li-lbl">Visibilidade</label><select class="field" id="liedvis" ${ro?'disabled':''}><option value="qualquer"${p.visibilidade==='qualquer'?' selected':''}>Qualquer pessoa</option><option value="conexoes"${p.visibilidade==='conexoes'?' selected':''}>Somente conexões</option></select></div><div><label class="li-lbl">Comentários</label><select class="field" id="liedcom" ${ro?'disabled':''}><option value="qualquer">Qualquer pessoa</option><option value="conexoes"${p.comentarios==='conexoes'?' selected':''}>Somente conexões</option><option value="ninguem"${p.comentarios==='ninguem'?' selected':''}>Ninguém</option></select></div></div>
+ ${ro?(p.li_url?`<div style="margin-top:14px"><a class="li-btn2 sync" href="${esc(p.li_url)}" target="_blank" rel="noopener">Ver no LinkedIn ${LI_IC.ext}</a></div>`:''):`<label class="li-lbl">Agendar para</label><input type="datetime-local" class="field" id="liedag" value="${(p.agendado_para||'').slice(0,16)}">
+ <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;justify-content:flex-end"><button class="li-btn2 danger" style="margin-right:auto" onclick="if(confirm('Excluir este post?'))liP('/linkedin/posts/${p.id}/excluir').then(()=>{closeModal();liRefresh();})">Excluir</button><button class="li-btn2" onclick="liEdSalvar('rascunho',this)">Salvar rascunho</button><button class="li-btn2" onclick="liEdSalvar('agendar',this)">📅 Agendar</button><button class="btn" onclick="liEdSalvar('publicar',this)">Publicar agora</button></div>`}
+ ${p.status==='agendado'?`<div class="li-info" style="margin-top:10px">Agendado para ${liDH(p.agendado_para)} — publica pelo seu navegador (ele precisa estar aberto com a extensão). Salvar como rascunho cancela o agendamento.</div>`:''}</div>
+ <div class="li-prev"><div class="faint mono" style="font-size:10.5px;letter-spacing:.12em;margin-bottom:10px">PRÉVIA DA PUBLICAÇÃO</div><div class="li-prevcard" id="liedprev"></div></div></div></div></div>`;document.body.appendChild(w.firstChild);liEdPrev();}
+function liEdPrev(){const p=LI.ed,el=document.getElementById('liedprev');if(!el)return;const c=(LI.st&&LI.st.conta)||{};const nm=c.nome||(ME&&ME.nome)||'Você';
+ const imgs=(p.midias||[]).filter(m=>(m.tipo||'').startsWith('image/'));const outros=(p.midias||[]).filter(m=>!(m.tipo||'').startsWith('image/'));
+ el.innerHTML=`<div class="who"><div class="a">${esc(liIni(nm))}</div><div><b>${esc(nm)}</b><span>agora · 🌐</span></div></div><div class="tx">${esc(p.texto||'Seu texto aparece aqui…')}</div>${imgs.slice(0,1).map(m=>`<img src="/linkedin/midia/${m.id}" alt="">`).join('')}${imgs.length>1?`<div style="font-size:11.5px;color:#666;margin-top:6px">+${imgs.length-1} imagem(ns)</div>`:''}${outros.map(m=>`<div style="margin-top:10px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:12px">📎 ${esc(m.nome)}</div>`).join('')}`;
+ const cnt=document.getElementById('liedcnt');if(cnt)cnt.textContent=(p.texto||'').length+'/3000';
+ const th=document.getElementById('liedthumbs');if(th)th.innerHTML=(p.midias||[]).map(m=>`<div>${(m.tipo||'').startsWith('image/')?`<img src="/linkedin/midia/${m.id}">`:`<div style="width:76px;height:76px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:10px;padding:4px;text-align:center">${esc(m.nome)}</div>`}${['publicado','publicando'].includes(p.status)?'':`<button onclick="liEdRmMidia('${m.id}')">✕</button>`}</div>`).join('');}
+async function liEdPersist(){const p=LI.ed;const r=await liP('/linkedin/posts',{id:p.id,texto:(document.getElementById('liedtx')||{}).value||p.texto,visibilidade:(document.getElementById('liedvis')||{}).value,comentarios:(document.getElementById('liedcom')||{}).value,acao:'rascunho'});return r.post;}
+async function liEdUpload(inp){const fs=[...inp.files];for(const f of fs){const fd=new FormData();fd.append('file',f);const r=await fetch('/linkedin/posts/'+LI.ed.id+'/midia',{method:'POST',body:fd});const j=await r.json().catch(()=>({}));if(!r.ok){toast(j.detail||'falha no upload','error');continue;}LI.ed.midias.push(j.midia);}inp.value='';liEdPrev();}
+async function liEdRmMidia(mid){await liP('/linkedin/posts/'+LI.ed.id+'/midia/'+mid+'/remover');LI.ed.midias=LI.ed.midias.filter(m=>m.id!==mid);liEdPrev();}
+async function liEdPrompt(b){b.disabled=true;const o=b.textContent;b.textContent='gerando…';try{await liEdPersist();const r=await liP('/linkedin/posts/'+LI.ed.id+'/imagem-prompt');document.getElementById('liedip').value=r.prompt;LI.ed.imagem_prompt=r.prompt;}catch(e){toast(e.message,'error');}b.disabled=false;b.textContent=o;}
+async function liEdImg(b){b.disabled=true;const o=b.textContent;b.textContent='gerando imagem… (~30s)';try{await liEdPersist();if(!document.getElementById('liedip').value){const r=await liP('/linkedin/posts/'+LI.ed.id+'/imagem-prompt');document.getElementById('liedip').value=r.prompt;}const r=await liP('/linkedin/posts/'+LI.ed.id+'/imagem');LI.ed.midias.unshift(r.midia);liEdPrev();toast('Imagem gerada e anexada','ok');}catch(e){toast(e.message,'error');}b.disabled=false;b.textContent=o;}
+async function liEdSalvar(acao,b){const p=LI.ed;const body={id:p.id,texto:document.getElementById('liedtx').value,visibilidade:document.getElementById('liedvis').value,comentarios:document.getElementById('liedcom').value,acao,agendado_para:(document.getElementById('liedag')||{}).value||''};
+ if(acao==='publicar'&&!confirm('Publicar agora no seu LinkedIn?'))return;b.disabled=true;
+ try{const r=await liP('/linkedin/posts',body);closeModal();toast({rascunho:'Rascunho salvo',agendar:'Post agendado para '+liDH(r.post.agendado_para),publicar:'Publicando pelo seu navegador…'}[acao],'ok');await liRefresh();
+  if(acao==='publicar'){for(let i=0;i<60;i++){await liSleep(4000);const d=await J('/linkedin/posts');const x=(d.posts||[]).find(y=>y.id===p.id);if(x&&x.status!=='publicando'){toast(x.status==='publicado'?'Post publicado no LinkedIn ✓':'Falhou: '+(x.erro||''),x.status==='publicado'?'ok':'error');if(LI.sec==='inbound')liRefresh();break;}}}}
+ catch(e){toast(e.message,'error');b.disabled=false;}}
+
+/* ---------- Inbound: Automações ---------- */
+async function liAutomacoes(){const d=await J('/linkedin/automacoes');LI.auto=d;const as=d.automacoes||[];
+ let h=liHead('LINKEDIN INBOUND','','Automações','Transforme comentários dos seus posts em conversas: o Cerne lê os comentários dos posts recentes (até 14 dias) a cada 2h e age por você, dentro dos limites.',`<button class="btn" onclick="liAutoModal()">＋ Nova automação</button>`);
+ h+=`<div class="li-box">${as.length?as.map(a=>`<div class="li-auto"><button class="li-sw${a.ativo?' on':''}" title="${a.ativo?'Desativar':'Ativar'}" onclick="liAutoSalvar(Object.assign({},LI.auto.automacoes.find(x=>x.id==='${a.id}'),{ativo:${!a.ativo}}))"></button><div style="flex:1;min-width:0"><b style="color:var(--ink);font-size:13.5px">${esc(a.nome)}</b><div class="faint" style="font-size:12px;margin-top:3px">Quando alguém comentar ${a.gatilho==='palavra'?'<b>"'+esc(a.palavra)+'"</b>':'qualquer coisa'} em ${a.post_url?'um post específico':'qualquer post recente'} → adiciona ao CRM${a.convite?' · envia convite':''}${a.mensagem?' · envia mensagem':''}</div><div class="faint" style="font-size:11px;margin-top:3px">${a.disparos||0} disparo(s)</div></div><button class="li-btn2" onclick="liAutoModal('${a.id}')">Editar</button><button class="li-icbtn" onclick="if(confirm('Excluir automação?'))liAutoSalvar({excluir:'${a.id}'})">✕</button></div>`).join(''):`<div class="li-empty"><b>Nenhuma automação</b>Exemplo: "quem comentar <i>QUERO</i> no meu post recebe o material por mensagem e entra no CRM".</div>`}</div>`;
+ if(d.ultima)h+=`<div class="faint" style="font-size:11.5px">Última verificação: ${liDH(d.ultima)}</div>`;return h;}
+function liAutoModal(id){const a=id?(LI.auto.automacoes||[]).find(x=>x.id===id):{nome:'',ativo:true,gatilho:'qualquer',palavra:'',post_url:'',convite:true,nota:'',mensagem:false,texto:''};const posts=LI.auto.posts||[];
+ const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:600px"><div class="modalh"><b>${id?'Editar':'Nova'} automação</b><button class="cvbtn" onclick="closeModal()">✕</button></div>
+ <label class="li-lbl">Nome</label><input class="field" id="laN" value="${esc(a.nome)}" placeholder="Ex.: Material grátis — comentou QUERO">
+ <label class="li-lbl">Em qual post?</label><select class="field" id="laP"><option value="">Qualquer post recente (até 14 dias)</option>${posts.map(p=>`<option value="${esc(p.url)}"${a.post_url===p.url?' selected':''}>${esc(p.texto)}</option>`).join('')}</select>${posts.length?'':'<div class="faint" style="font-size:11px;margin-top:4px">Sincronize seus posts em Posts para escolher um específico.</div>'}
+ <label class="li-lbl">Quando alguém comentar</label><div style="display:flex;gap:8px"><select class="field" id="laG" style="margin:0;max-width:220px" onchange="laW.style.display=this.value==='palavra'?'':'none'"><option value="qualquer">qualquer comentário</option><option value="palavra"${a.gatilho==='palavra'?' selected':''}>que contenha a palavra</option></select><input class="field" id="laW" style="margin:0;${a.gatilho==='palavra'?'':'display:none'}" value="${esc(a.palavra)}" placeholder="Ex.: QUERO"></div>
+ <label class="li-lbl">Então</label><label class="li-obj on" style="opacity:.8"><input type="checkbox" checked disabled> Adicionar ao CRM (origem "Comentário automatizado")</label>
+ <label class="li-obj${a.convite?' on':''}" style="margin-top:8px"><input type="checkbox" id="laC" ${a.convite?'checked':''}> Enviar pedido de conexão</label><textarea class="field" id="laCN" rows="2" maxlength="300" placeholder="Nota do convite (opcional) — use {{primeiro_nome}}" style="margin-top:6px">${esc(a.nota)}</textarea>
+ <label class="li-obj${a.mensagem?' on':''}" style="margin-top:8px"><input type="checkbox" id="laM" ${a.mensagem?'checked':''}> Enviar mensagem (só chega a quem já é conexão)</label><textarea class="field" id="laMT" rows="4" placeholder="Oi {{primeiro_nome}}, vi seu comentário! Aqui está o material: ..." style="margin-top:6px">${esc(a.texto)}</textarea>
+ <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" onclick="liAutoSalvar({id:${id?`'${id}'`:'null'},nome:laN.value,ativo:${a.ativo!==false},post_url:laP.value,gatilho:laG.value,palavra:laW.value,convite:laC.checked,nota:laCN.value,mensagem:laM.checked,texto:laMT.value},true)">Salvar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
+async function liAutoSalvar(b,fecha){try{await liP('/linkedin/automacoes',b);if(fecha)closeModal();toast('Automação salva','ok');liRefresh();}catch(e){toast(e.message,'error');}}
+
+/* ---------- Segurança e limites ---------- */
+async function liLimites(){const d=await J('/linkedin/limites');LI.lim=d;const l=d.limites,u=d.uso;
+ const card=(k,lb,uk,dica)=>`<div class="li-limc"><label>${lb}</label><input class="field" type="number" min="0" data-lk="${k}" value="${l[k]}"><div class="use">Hoje: ${u[uk]||0} de ${l[k]}${dica?' · '+dica:''}</div><div class="tr"><i style="width:${Math.min(100,Math.round(100*(u[uk]||0)/Math.max(1,l[k])))}%"></i></div></div>`;
+ let h=liHead('LINKEDIN',LI_IC.shield,'Segurança e limites','O Cerne age como uma pessoa: ritmo diário controlado, horário comercial e pausas aleatórias entre as ações — para proteger sua conta.',`<button class="btn" onclick="liLimSalvar(this)">💾 Salvar</button>`);
+ h+=`<div class="li-pane" style="display:flex;gap:14px;align-items:center"><button class="li-sw${l.pausado?' on':''}" style="${l.pausado?'background:var(--warn)':''}" onclick="liP('/linkedin/limites',{pausado:${!l.pausado}}).then(()=>{toast('${l.pausado?'Automações retomadas':'Todas as automações pausadas'}','ok');liRefresh();})"></button><div><b style="color:var(--ink)">Pausar todas as automações</b><div class="faint" style="font-size:12px">Campanhas, mensagens, sincronizações e automações de comentários param até você reativar. ${l.pausado?'<b style="color:var(--warn)">PAUSADO</b>':''}</div></div></div>`;
+ h+=`<div class="li-pane"><h4>Limites diários</h4><p class="sub">Recomendação: contas novas ou pouco ativas começam com 10–15 convites/dia e sobem aos poucos. O LinkedIn limita cerca de 100–200 convites por semana.</p><div class="li-lim" style="margin-top:14px">${card('convites_dia','Convites por dia','convites')}<div class="li-limc"><label>Convites por semana</label><input class="field" type="number" min="0" data-lk="convites_semana" value="${l.convites_semana}"><div class="use">Últimos 7 dias: ${u.convites_semana||0} de ${l.convites_semana}</div><div class="tr"><i style="width:${Math.min(100,Math.round(100*(u.convites_semana||0)/Math.max(1,l.convites_semana)))}%"></i></div></div>${card('mensagens_dia','Mensagens por dia','mensagens')}${card('visitas_dia','Visitas a perfis por dia','visitas')}${card('curtidas_dia','Curtidas por dia','curtidas')}${card('extracao_dia','Leads extraídos por dia','extracao','buscas e posts')}</div></div>`;
+ h+=`<div class="li-g2"><div class="li-pane"><h4>Horário de funcionamento</h4><p class="sub">Fora dele só rodam importações e publicações que você pedir. Horário de Brasília.</p><div style="display:flex;gap:10px;align-items:center;margin-top:12px"><input class="field" type="number" min="0" max="23" data-lk="hora_inicio" value="${l.hora_inicio}" style="margin:0;width:90px"><span class="faint">h até</span><input class="field" type="number" min="1" max="24" data-lk="hora_fim" value="${l.hora_fim}" style="margin:0;width:90px"><span class="faint">h</span></div><label class="li-lbl">Dias</label><div class="li-days">${['seg','ter','qua','qui','sex','sáb','dom'].map((n,i)=>`<button class="${(l.dias||[]).includes(i)?'on':''}" onclick="this.classList.toggle('on')" data-dia="${i}">${n}</button>`).join('')}</div>${d.na_janela?'<div class="faint" style="font-size:11.5px;margin-top:10px;color:var(--ok)">● Dentro do horário agora</div>':'<div class="faint" style="font-size:11.5px;margin-top:10px">○ Fora do horário agora</div>'}</div>
+ <div class="li-pane"><h4>Intervalo entre ações</h4><p class="sub">Pausa aleatória entre uma ação e outra (segundos).</p><div style="display:flex;gap:10px;align-items:center;margin-top:12px"><input class="field" type="number" min="20" data-lk="intervalo_min" value="${l.intervalo_min}" style="margin:0;width:100px"><span class="faint">a</span><input class="field" type="number" min="20" data-lk="intervalo_max" value="${l.intervalo_max}" style="margin:0;width:100px"><span class="faint">segundos</span></div><label class="li-lbl">Criador de imagem (link do botão no editor de post)</label><input class="field" data-lk="image_creator_url" value="${esc(l.image_creator_url||'')}" placeholder="https://chatgpt.com/g/..."></div></div>`;
+ h+=`<div class="li-box"><div class="li-bar"><b style="color:var(--ink)">Atividade recente</b><span class="faint" style="font-size:11.5px">últimas 80 ações e sincronizações</span></div>${(d.log||[]).length?`<div style="max-height:360px;overflow:auto"><table class="li-tbl"><tbody>${d.log.map(x=>`<tr><td class="faint mono" style="white-space:nowrap;font-size:11px">${liDH(x.t)}</td><td><span class="li-pill ${x.ok?'ok':'erro'}">${esc(LI_PNOME[x.tipo]||x.tipo)}</span></td><td>${esc(x.detalhe)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="li-empty">Nada ainda.</div>'}</div>`;
+ return h;}
+async function liLimSalvar(b){const body={};document.querySelectorAll('#limount [data-lk]').forEach(el=>{body[el.dataset.lk]=el.type==='number'?parseInt(el.value||'0',10):el.value;});body.dias=[...document.querySelectorAll('#limount .li-days button.on')].map(x=>+x.dataset.dia);b.disabled=true;try{await liP('/linkedin/limites',body);toast('Limites salvos','ok');liRefresh();}catch(e){toast(e.message,'error');b.disabled=false;}}
+
 let WSUB='chat';
-function wSubBar(){const t=(id,ic,l)=>'<button class="agtab'+(WSUB===id?' on':'')+'" onclick="wSub(\''+id+'\')">'+ico(ic)+' <span>'+l+'</span></button>';return '<div class="agtabs wsubbar">'+t('chat','chat','Chat')+t('studio','megaphone','Studio de Marca')+t('agentes','bot','Agentes')+t('simulador','graph','Simulador')+t('design','site','Design')+'</div>';}
+function wSubBar(){const t=(id,ic,l)=>'<button class="agtab'+(WSUB===id?' on':'')+'" onclick="wSub(\''+id+'\')">'+ico(ic)+' <span>'+l+'</span></button>';return '<div class="agtabs wsubbar">'+t('chat','chat','Chat')+t('studio','megaphone','Studio de Marca')+t('agentes','bot','Agentes')+t('simulador','graph','Simulador')+t('design','site','Design')+t('linkedin','link','LinkedIn')+'</div>';}
 function wSub(s){WSUB=s;renderWork();}
 /* ---- Toast (feedback padrão do app) ---- */
 function toast(msg,type){let r=document.getElementById('toasts');if(!r){r=document.createElement('div');r.id='toasts';r.className='toasts';document.body.appendChild(r);}const sym=type==='ok'?'✓':type==='error'?'!':type==='load'?'·':'›';const el=document.createElement('div');el.className='toast t-'+(type||'info');el.innerHTML='<span class="ti">'+sym+'</span><span>'+esc(''+msg)+'</span>';r.appendChild(el);requestAnimationFrame(function(){el.classList.add('in');});const dur=type==='load'?0:(type==='error'?5200:3000);if(dur)setTimeout(function(){toastKill(el);},dur);return el;}
@@ -13916,6 +16002,7 @@ async function renderWork(){
  if(WSUB==='studio'){let _h;try{_h=await V.marca();}catch(e){_h='<div class="panel">erro ao abrir o Studio: '+esc(''+e)+'</div>';}document.getElementById("stage").innerHTML='<div class="wsplit">'+_sb+'<div class="wsbody" style="overflow:auto"><div id="mkmount" style="padding:22px 26px 60px">'+_h+'</div></div></div>';return;}
  if(WSUB==='agentes'){let _h;try{_h=await V.agentes();}catch(e){_h='<div class="panel">erro ao abrir os Agentes: '+esc(''+e)+'</div>';}document.getElementById("stage").innerHTML='<div class="wsplit">'+_sb+'<div class="wsbody" style="overflow:auto"><div id="dview" style="padding:22px 26px 60px">'+_h+'</div></div></div>';return;}
  if(WSUB==='simulador'){let _h;try{_h=await V.simulador();}catch(e){_h='<div class="panel">erro ao abrir o Simulador: '+esc(''+e)+'</div>';}document.getElementById("stage").innerHTML='<div class="wsplit">'+_sb+'<div class="wsbody" style="overflow:auto"><div id="simmount" style="padding:22px 26px 60px">'+_h+'</div></div></div>';return;}
+ if(WSUB==='linkedin'){let _h;try{_h=await V.linkedin();}catch(e){_h='<div class="panel">erro ao abrir o LinkedIn: '+esc(''+e)+'</div>';}document.getElementById("stage").innerHTML='<div class="wsplit">'+_sb+'<div class="wsbody" style="overflow:auto"><div id="limount" style="padding:22px 26px 60px">'+_h+'</div></div></div>';return;}
  if(WSUB==='design'){let _h;try{_h=await V.design();}catch(e){_h='<div class="panel">erro ao abrir o Design: '+esc(''+e)+'</div>';}document.getElementById("stage").innerHTML='<div class="wsplit">'+_sb+'<div class="wsbody" style="overflow:auto"><div id="dsgmount" style="padding:22px 26px 60px">'+_h+'</div></div></div>';if(DSG.detail)dsgPreview();return;}
  if(!WS.tasks.length){
    if(WS._hadSaved){_stageWork(`<div class="work rise"><aside class="wsL"><div class="wsLhead"><span class="lstitle" style="margin:0">TAREFAS</span><button class="collapsebtn" onclick="lCol()" title="Recolher">«</button></div><button class="btn" style="width:100%;margin:2px 0 12px" onclick="novaTarefa()">${ico('spark')} Nova tarefa</button><div class="faint" style="font-size:11.5px;line-height:1.5;border-top:1px solid var(--line);padding-top:12px">Nenhuma tarefa aberta. Crie uma nova para começar a conversar com o copiloto.</div></aside><section class="wsC" style="display:flex;align-items:center;justify-content:center;text-align:center"><div style="max-width:44ch"><div style="font-size:34px;margin-bottom:10px;opacity:.5">${ico('spark')}</div><div style="font-size:15px;font-weight:700;margin-bottom:6px">Nenhuma tarefa aberta</div><div class="muted" style="font-size:12.5px;margin-bottom:18px">Você removeu todas as tarefas. Crie uma nova tarefa (com uma coleção do acervo ou em chat livre) para começar.</div><button class="btn" onclick="novaTarefa()">${ico('spark')} Nova tarefa</button></div></section></div>`);return;}
@@ -14214,6 +16301,7 @@ function route(){let h=(location.hash||"#work").slice(1);
  if(isDesk()){if(h==="marca")WSUB="studio";if(h==="agentes")WSUB="agentes";if((h||"work")!=="work"){location.hash="work";return;}renderTabs("work");updateTop();renderWork();return;}
  if(h==="agentes"){WSUB="agentes";location.hash="work";return;}
  if(h==="marca"){WSUB="studio";location.hash="work";return;}
+ if(h==="linkedin"){WSUB="linkedin";location.hash="work";return;}
  let mode=modeOf(h);if(!allowed(mode)){const fb=ROLES[role][0];location.hash=(fb==="work"?"work":fb==="deck"?"overview":"ops");return;}renderTabs(mode);updateTop();if(mode==="work")renderWork();else if(mode==="ops")renderOps();else renderDeck(V[h]?h:"overview");}
 window.addEventListener("hashchange",route);
 function tick(){const e=document.getElementById("clk");if(e)e.textContent=new Date().toTimeString().slice(0,8);}setInterval(tick,1000);tick();
