@@ -77,8 +77,10 @@ async function liExecutar(cmd) {
     if (acao === "li_extrair_post") return await liExtrairPost(cmd.url, cmd.modo || "ambos", cmd.max || 100);
     if (acao === "li_conexoes") return await liConexoes(cmd.max || 80);
     if (acao === "li_conversas") return await liConversas(cmd.max || 40);
-    if (acao === "li_meus_posts") return await liMeusPosts(cmd.max || 30);
-    if (acao === "li_publicar") return await liPublicar(cmd.texto || "", cmd.midia || null);
+    if (acao === "li_meus_posts") return await liMeusPosts(cmd.max || 30, cmd.pagina || null);
+    if (acao === "li_publicar") return await liPublicar(cmd.texto || "", cmd.midia || null, cmd.pagina || null);
+    if (acao === "li_pagina_info") return await liPaginaInfo(cmd.url);
+    if (acao === "li_seguidores") return await liSeguidores(cmd.pagina, cmd.max || 100);
     return { erro: "ação do LinkedIn desconhecida: " + acao };
   } catch (e) {
     return { erro: String(e && e.message || e).slice(0, 200) };
@@ -248,8 +250,41 @@ async function liConversas(max) {
   return { ok: true, conversas: (r.conversas || []).slice(0, max) };
 }
 
-async function liMeusPosts(max) {
-  const tabId = await liGo("https://www.linkedin.com/in/me/recent-activity/shares/", 3500);
+// ---- página da empresa (você é admin) ----
+const liPagUrl = (pg, resto) => "https://www.linkedin.com/company/" + encodeURIComponent(String(pg.id || pg.slug)) + "/" + (resto || "");
+
+async function liPaginaInfo(url) {
+  const m = String(url || "").match(/linkedin\.com\/company\/([^/?#]+)/i);
+  if (!m) return { erro: "link de página inválido" };
+  const tabId = await liGo("https://www.linkedin.com/company/" + m[1] + "/admin/dashboard/", 4000);
+  const lg = await liChecaLogin(tabId); if (lg) return lg;
+  const r = await liEsperar(tabId, "pagina", {}, "pronto", 15000);
+  return { ok: true, admin: !!r.admin, nome: r.nome || "", numid: r.numid || "", seguidores: r.seguidores || 0 };
+}
+
+async function liSeguidores(pg, max) {
+  if (!pg) return { erro: "página não informada" };
+  const tabId = await liGo(liPagUrl(pg, "admin/analytics/followers/"), 4000);
+  const lg = await liChecaLogin(tabId); if (lg) return lg;
+  const info = await liEsperar(tabId, "pagina", {}, "pronto", 15000);
+  if (!info.admin) return { erro: "sem acesso de admin a essa página" };
+  const a = await liEsperar(tabId, "abrir_seguidores", {}, "clicou", 12000);
+  if (!a.clicou) return { erro: "não achei a lista de seguidores no painel da página (Analytics → Seguidores)" };
+  await liEsperar(tabId, "reacoes", {}, "aberto", 10000);
+  const mapa = new Map(); let semNovos = 0;
+  for (let i = 0; i < 120 && mapa.size < max && semNovos < 5; i++) {
+    const r = await liDom(tabId, "reacoes", { rolar: true });
+    let novos = 0;
+    for (const p of r.pessoas || []) if (!mapa.has(p.url)) { mapa.set(p.url, p); novos++; }
+    semNovos = novos ? 0 : semNovos + 1;
+    await liSleep(liRnd(900, 1700));
+  }
+  await liDom(tabId, "fechar_dialogo");
+  return { ok: true, pessoas: [...mapa.values()].slice(0, max) };
+}
+
+async function liMeusPosts(max, pagina) {
+  const tabId = await liGo(pagina ? liPagUrl(pagina, "posts/?feedView=all") : "https://www.linkedin.com/in/me/recent-activity/shares/", 3500);
   const lg = await liChecaLogin(tabId); if (lg) return lg;
   await liEsperar(tabId, "meus_posts", {}, "pronto", 15000);
   for (let i = 0; i < 4; i++) { await liDom(tabId, "rolar", { px: 1600 }); await liSleep(1300); }
@@ -257,13 +292,29 @@ async function liMeusPosts(max) {
   return { ok: true, posts: (r.posts || []).slice(0, max) };
 }
 
-async function liPublicar(texto, midia) {
-  const tabId = await liGo(LI_HOME, 3000);
-  const lg = await liChecaLogin(tabId); if (lg) return lg;
-  const a = await liEsperar(tabId, "share_abrir", {}, "clicou", 12000);
-  if (!a.clicou) return { erro: "não achei o botão 'Começar publicação'" };
-  const ed = await liEsperar(tabId, "share_editor", {}, "pronto", 10000);
-  if (!ed.pronto) return { erro: "o editor de publicação não abriu" };
+async function liPublicar(texto, midia, pagina) {
+  let tabId;
+  if (pagina) {
+    // painel de admin da página: o editor aberto ali publica COMO A EMPRESA
+    tabId = await liGo(liPagUrl(pagina, "admin/page-posts/published/?share=true"), 4000);
+    const lg = await liChecaLogin(tabId); if (lg) return lg;
+    let ed = await liEsperar(tabId, "share_editor", {}, "pronto", 8000);
+    if (!ed.pronto) {
+      const b = await liEsperar(tabId, "abrir_post_pagina", {}, "clicou", 10000);
+      if (b.menu) { await liSleep(900); await liDom(tabId, "abrir_post_pagina", { menu: true }); }
+      ed = await liEsperar(tabId, "share_editor", {}, "pronto", 10000);
+    }
+    if (!ed.pronto) return { erro: "o editor de publicação da página não abriu (você é admin dela?)" };
+    const au = await liDom(tabId, "share_autor", { nome: pagina.nome || "" });
+    if (!au.ok) { await liDom(tabId, "fechar_dialogo"); return { erro: "o editor não abriu como a página \"" + (pagina.nome || "") + "\" — nada foi publicado" }; }
+  } else {
+    tabId = await liGo(LI_HOME, 3000);
+    const lg = await liChecaLogin(tabId); if (lg) return lg;
+    const a = await liEsperar(tabId, "share_abrir", {}, "clicou", 12000);
+    if (!a.clicou) return { erro: "não achei o botão 'Começar publicação'" };
+    const ed = await liEsperar(tabId, "share_editor", {}, "pronto", 10000);
+    if (!ed.pronto) return { erro: "o editor de publicação não abriu" };
+  }
   await liDom(tabId, "share_digitar", { texto });
   await liSleep(1200);
   if (midia && midia.b64) {
@@ -458,7 +509,11 @@ function _liDom(op, a) {
       for (const ln of d.querySelectorAll("a[href*='/in/']")) {
         const url = limpaUrl(ln.href); if (!url || vistos.has(url)) continue; vistos.add(url);
         const ls = (ln.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean).filter((s) => !/^(•|·)?\s*\d(º|st|nd|rd)/.test(s) && !/^Ver perfil|^View /i.test(s));
-        pessoas.push({ url, nome: (ls[0] || "").slice(0, 120), cargo: (ls[1] || "").slice(0, 200) });
+        const box = ln.closest("li, [class*='artdeco-list__item'], [class*='entity']") || ln;
+        const nomeEl = T(box.querySelector("[class*='name'] span[aria-hidden=true], [class*='__name'], [class*='title'] span[aria-hidden=true], span[aria-hidden=true]"));
+        const cargoEl = T(box.querySelector("[class*='headline'], [class*='subtitle'], [class*='caption'], [class*='occupation']"));
+        const nome = (nomeEl || ls[0] || "").replace(/\s*(•|·)\s*\d(º|st|nd|rd|th)?.*$/, "").trim();
+        pessoas.push({ url, nome: nome.slice(0, 120), cargo: (cargoEl || ls[1] || "").slice(0, 200) });
       }
       if (a.rolar) {
         const sc = [...d.querySelectorAll("*")].find((x) => x.scrollHeight > x.clientHeight + 30 && /(auto|scroll)/.test(getComputedStyle(x).overflowY));
@@ -544,6 +599,39 @@ function _liDom(op, a) {
       const d = dialogo(); if (!d) return { clicou: false };
       const b = d.querySelector("button.share-actions__primary-action:not([disabled])") || botoes(d).find((x) => /^(publicar|post)$/i.test(T(x)) && !x.disabled);
       if (b) { b.click(); return { clicou: true }; }
+      return { clicou: false };
+    }
+    if (op === "pagina") {
+      if (logadoFora()) return { pronto: true, admin: false, erro: "nao_logado" };
+      const main = document.querySelector("main");
+      if (!main || document.readyState !== "complete") return {};
+      const admin = /\/admin\//.test(location.pathname) && !/\/unavailable|\/login/.test(location.pathname);
+      const h = document.querySelector("main h1, .org-organizational-page-admin-navigation__title, [class*='org-top-card'] h1");
+      let nome = T(h) || (document.title || "").split("|")[0].replace(/^\(\d+\)\s*/, "").replace(/: (Admin|Painel|Dashboard).*$/i, "").trim();
+      const numid = (location.pathname.match(/\/company\/(\d+)\//) || [])[1] || "";
+      const seg = num((T(main).match(/([\d.,]+\s*(mil|k)?)\s*(seguidores|followers)/i) || [])[1]);
+      return { pronto: !!(nome || admin), admin, nome: nome.slice(0, 120), numid, seguidores: seg };
+    }
+    if (op === "abrir_post_pagina") {
+      if (a.menu) {
+        const it = [...document.querySelectorAll("[role=menu] *, .artdeco-dropdown__content *")].filter(vis).find((x) => /^(começar uma publicação|começar publicação|start a post|publicação|post)$/i.test(T(x)));
+        if (it) { (it.closest("[role=menuitem], button, a, [role=button]") || it).click(); return { clicou: true }; }
+        return { clicou: false };
+      }
+      const b = botoes(document.querySelector("main") || document).find((x) => /^(começar uma publicação|começar publicação|start a post|criar publicação|create a post)$/i.test(rotulo(x)) || /^(começar uma publicação|start a post)$/i.test(T(x)));
+      if (b) { b.click(); return { clicou: true }; }
+      const c = botoes(document.querySelector("main") || document).find((x) => /^(criar|create|\+ criar|\+ create)$/i.test(T(x)) || /^(criar|create)$/i.test(rotulo(x)));
+      if (c) { c.click(); return { clicou: true, menu: true }; }
+      return { clicou: false };
+    }
+    if (op === "share_autor") {
+      const d = dialogo(); if (!d) return { ok: false };
+      const alvo = String(a.nome || "").toLowerCase().slice(0, 18).trim();
+      return { ok: !!alvo && T(d).toLowerCase().includes(alvo) };
+    }
+    if (op === "abrir_seguidores") {
+      const b = botoes(document.querySelector("main") || document).find((x) => /(mostrar|ver|exibir) (todos os |todas as )?seguidores|show (all )?followers|todos os seguidores|all followers|ver seguidores/i.test(rotulo(x)) || /(mostrar|ver) (todos os )?seguidores|show (all )?followers/i.test(T(x)));
+      if (b) { b.scrollIntoView({ block: "center" }); b.click(); return { clicou: true }; }
       return { clicou: false };
     }
     if (op === "share_fechado") {

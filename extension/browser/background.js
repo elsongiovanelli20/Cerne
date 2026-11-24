@@ -217,7 +217,7 @@ async function pollLoop() {
       try {
         const r = await fetch(cfg.base + "/ext/poll", {
           method: "POST", headers: { "Content-Type": "application/json", "X-Ext-Token": cfg.token },
-          body: JSON.stringify({ v: "1.2.1" })
+          body: JSON.stringify({ v: "1.3.0" })
         });
         if (r.status === 401) { await chrome.storage.local.set({ token: "" }); break; }
         if (r.ok) { const j = await r.json(); cmd = j && j.comando ? j.comando : null; }

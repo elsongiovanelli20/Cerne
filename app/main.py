@@ -6636,9 +6636,9 @@ def _li_db(uid):
         lim = d.setdefault("limites", {})
         for k, v in _LI_LIMITES_PADRAO.items():
             lim.setdefault(k, v)
-        for k in ("campanhas", "posts", "automacoes", "avulsas", "jobs", "log"):
+        for k in ("campanhas", "posts", "automacoes", "avulsas", "jobs", "log", "paginas"):
             d.setdefault(k, [])
-        for k in ("leads", "crm", "uso", "sync", "estrategia", "vistos"):
+        for k in ("leads", "crm", "uso", "sync", "estrategia", "vistos", "estrategias_pag"):
             d.setdefault(k, {})
         return d
 
@@ -7082,9 +7082,36 @@ def _li_sync_aceites(uid, d):
     return {"ok": True, "novos": n}
 
 
-def _li_sync_posts(uid, d):
-    r = _li_exec(uid, {"acao": "li_meus_posts", "max": 30}, timeout=150)
-    d["sync"]["posts"] = _li_now()
+def _li_pagina(d, pid):
+    return next((p for p in d.get("paginas") or [] if p.get("id") == pid), None)
+
+
+def _li_conta(d, conta):
+    """'perfil' ou o id de uma página da empresa cadastrada (qualquer outra coisa cai no perfil)."""
+    return conta if conta and conta != "perfil" and _li_pagina(d, conta) else "perfil"
+
+
+def _li_pag_cmd(d, conta):
+    pg = _li_pagina(d, conta) if conta != "perfil" else None
+    return {"id": pg.get("numid") or pg["id"], "slug": pg["id"], "nome": pg.get("nome") or ""} if pg else None
+
+
+def _li_estrategia_de(d, conta):
+    if conta and conta != "perfil":
+        e = d["estrategias_pag"].setdefault(conta, {})
+        e["objetivo"] = "pagina"
+        e["nome_pagina"] = (_li_pagina(d, conta) or {}).get("nome") or conta
+        return e
+    return d["estrategia"]
+
+
+def _li_sync_posts(uid, d, conta="perfil"):
+    conta = _li_conta(d, conta)
+    cmd = {"acao": "li_meus_posts", "max": 30}
+    if conta != "perfil":
+        cmd["pagina"] = _li_pag_cmd(d, conta)
+    r = _li_exec(uid, cmd, timeout=150)
+    d["sync"]["posts" if conta == "perfil" else "posts:" + conta] = _li_now()
     if r.get("erro"):
         _li_log(d, "sync", "posts: " + str(r["erro"]), ok=False)
         return r
@@ -7097,17 +7124,19 @@ def _li_sync_posts(uid, d):
             if not post:                                        # liga ao post publicado pelo Cerne pelo início do texto
                 ini = (p.get("texto") or "")[:60].strip()
                 post = next((x for x in d["posts"] if not x.get("urn") and x.get("status") == "publicado"
+                             and (x.get("autor") or "perfil") == conta
                              and ini and (x.get("texto") or "").strip().startswith(ini[:40])), None)
             if not post:
                 post = {"id": _li_id(), "texto": p.get("texto") or "", "status": "publicado", "origem": "sincronizado",
-                        "criado": _li_now(), "publicado_em": p.get("publicado_em") or _li_now(), "midias": []}
+                        "criado": _li_now(), "publicado_em": p.get("publicado_em") or _li_now(), "midias": [], "autor": conta}
                 d["posts"].append(post)
             post["urn"] = urn
             post["li_url"] = p.get("url") or post.get("li_url")
             post["metricas"] = {"impressoes": int(p.get("impressoes") or 0), "reacoes": int(p.get("reacoes") or 0),
                                 "comentarios": int(p.get("comentarios") or 0), "compartilhamentos": int(p.get("compartilhamentos") or 0)}
             post["metricas_em"] = _li_now()
-    _li_log(d, "sync", f"posts sincronizados · {len(r.get('posts') or [])}")
+    _rot = "perfil" if conta == "perfil" else "página " + ((_li_pagina(d, conta) or {}).get("nome") or conta)
+    _li_log(d, "sync", f"posts sincronizados ({_rot}) · {len(r.get('posts') or [])}")
     return {"ok": True}
 
 
@@ -7116,10 +7145,11 @@ def _li_rodar_automacoes(uid, d):
     d["sync"]["automacoes"] = _li_now()
     if not regras:
         return
-    recentes = [p for p in d["posts"] if p.get("status") == "publicado" and p.get("li_url")
-                and _li_now() - (p.get("publicado_em") or 0) < 14 * 86400][:6]
+    recentes = sorted([p for p in d["posts"] if p.get("status") == "publicado" and p.get("li_url")
+                       and _li_now() - (p.get("publicado_em") or 0) < 14 * 86400], key=lambda p: -(p.get("publicado_em") or 0))[:8]
     for p in recentes:
-        alvo = [a for a in regras if not a.get("post_url") or _li_slug_post(a["post_url"]) == _li_slug_post(p["li_url"])]
+        alvo = [a for a in regras if (not a.get("post_url") or _li_slug_post(a["post_url"]) == _li_slug_post(p["li_url"]))
+                and (not a.get("conta") or a["conta"] == (p.get("autor") or "perfil"))]
         if not alvo:
             continue
         r = _li_exec(uid, {"acao": "li_extrair_post", "url": p["li_url"], "modo": "comentarios", "max": 100}, timeout=180)
@@ -7177,10 +7207,12 @@ def _li_publicar(uid, d, post):
                 with open(p, "rb") as f:
                     midia = {"nome": m.get("nome") or m["arquivo"], "tipo": m["tipo"], "b64": _b64.b64encode(f.read()).decode()}
                 break
-    _LI_RUNNING[uid] = "Publicando post"
+    conta = _li_conta(d, post.get("autor") or "perfil")
+    _LI_RUNNING[uid] = "Publicando post" + ("" if conta == "perfil" else " como " + ((_li_pagina(d, conta) or {}).get("nome") or "página"))
     try:
         r = _li_exec(uid, {"acao": "li_publicar", "texto": post.get("texto") or "", "midia": midia,
-                           "visibilidade": post.get("visibilidade") or "qualquer"}, timeout=180)
+                           "visibilidade": post.get("visibilidade") or "qualquer",
+                           "pagina": _li_pag_cmd(d, conta) if conta != "perfil" else None}, timeout=200)
     finally:
         _LI_RUNNING.pop(uid, None)
     with _LI_LOCK:
@@ -7205,7 +7237,8 @@ def _li_job_run(uid, d, job):
     job["inicio"] = _li_now()
     _LI_RUNNING[uid] = {"importar": "Importando leads", "sync_respostas": "Sincronizando respostas",
                         "sync_aceites": "Sincronizando aceites", "sync_posts": "Sincronizando posts",
-                        "status": "Verificando conta", "publicar": "Publicando post"}.get(tipo, tipo)
+                        "status": "Verificando conta", "publicar": "Publicando post",
+                        "pagina_info": "Verificando a página da empresa"}.get(tipo, tipo)
     try:
         if tipo == "importar":
             mx = max(1, min(int(job.get("max") or 25), 500))
@@ -7216,6 +7249,9 @@ def _li_job_run(uid, d, job):
                 mx = min(mx, resto)
                 if job.get("fonte") == "post":
                     r = _li_exec(uid, {"acao": "li_extrair_post", "url": job["url"], "modo": job.get("modo") or "ambos", "max": mx}, timeout=420)
+                elif job.get("fonte") == "seguidores":
+                    pc = _li_pag_cmd(d, _li_conta(d, job.get("pagina")))
+                    r = _li_exec(uid, {"acao": "li_seguidores", "pagina": pc, "max": mx}, timeout=540) if pc else {"erro": "página não encontrada"}
                 else:
                     r = _li_exec(uid, {"acao": "li_extrair_busca", "url": job["url"], "max": mx}, timeout=540)
             if not r.get("erro"):
@@ -7235,7 +7271,23 @@ def _li_job_run(uid, d, job):
         elif tipo == "sync_aceites":
             r = _li_sync_aceites(uid, d)
         elif tipo == "sync_posts":
-            r = _li_sync_posts(uid, d)
+            r = _li_sync_posts(uid, d, job.get("conta") or "perfil")
+        elif tipo == "pagina_info":
+            r = _li_exec(uid, {"acao": "li_pagina_info", "url": job["url"]}, timeout=90)
+            if not r.get("erro"):
+                if not r.get("admin"):
+                    r = {"erro": "você não é administrador dessa página (ou o LinkedIn não abriu o painel de admin)"}
+                else:
+                    slug = job["slug"]
+                    with _LI_LOCK:
+                        pg = _li_pagina(d, slug)
+                        if not pg:
+                            pg = {"id": slug, "criado": _li_now()}
+                            d["paginas"].append(pg)
+                        pg.update({"nome": (r.get("nome") or slug)[:120], "numid": str(r.get("numid") or pg.get("numid") or ""),
+                                   "url": f"https://www.linkedin.com/company/{slug}/", "seguidores": int(r.get("seguidores") or 0),
+                                   "admin": True, "verificada": _li_now()})
+                    job["pagina"] = slug
         elif tipo == "status":
             r = _li_exec(uid, {"acao": "li_status"}, timeout=60)
             if not r.get("erro"):
@@ -7288,9 +7340,14 @@ def _li_tick_user(uid, d):
     if tem_conv and agora - (s.get("aceites") or 0) > 4 * 3600:
         _li_sync_aceites(uid, d)
         return
-    if any(p.get("status") == "publicado" for p in d["posts"]) and agora - (s.get("posts") or 0) > 6 * 3600:
+    if any(p.get("status") == "publicado" and (p.get("autor") or "perfil") == "perfil" for p in d["posts"]) \
+            and agora - (s.get("posts") or 0) > 6 * 3600:
         _li_sync_posts(uid, d)
         return
+    for pg in d.get("paginas") or []:                          # páginas da empresa: posts + métricas a cada 6h
+        if agora - (s.get("posts:" + pg["id"]) or 0) > 6 * 3600:
+            _li_sync_posts(uid, d, pg["id"])
+            return
     if any(a.get("ativo") for a in d["automacoes"]) and agora - (s.get("automacoes") or 0) > 2 * 3600:
         _li_rodar_automacoes(uid, d)
         return
@@ -7357,7 +7414,9 @@ _LI_OBJ_NEG = ["Aumentar seguidores", "Criar networking", "Recrutar talentos", "
 
 def _li_calibragem(e):
     obj = e.get("objetivo") or "negocio"
-    if obj == "carreira":
+    if obj == "pagina":
+        campos = ["site", "descricao", "proposta_valor", "produtos", "diferenciais", "tom_voz"]
+    elif obj == "carreira":
         campos = ["linkedin_url", "cargo_atual", "area", "trajetoria", "conquistas", "objetivo_carreira", "tom_voz"]
     else:
         campos = ["linkedin_url", "site", "descricao", "proposta_valor", "produtos", "diferenciais", "tom_voz"]
@@ -7376,7 +7435,12 @@ def _li_contexto(e):
             if e.get(k):
                 L.append(f"{rot}: {e[k]}")
     else:
-        L.append("OBJETIVO NO LINKEDIN: negócio — gerar leads e vendas.")
+        if obj == "pagina":
+            L.append(f"QUEM PUBLICA: a PÁGINA DA EMPRESA \"{e.get('nome_pagina') or 'empresa'}\" no LinkedIn. Escreva na voz da "
+                     "marca (primeira pessoa do plural: \"nós\", \"aqui na empresa\"), nunca como uma pessoa física. Objetivo: "
+                     "fortalecer a marca, gerar demanda e atrair seguidores qualificados.")
+        else:
+            L.append("OBJETIVO NO LINKEDIN: negócio — gerar leads e vendas.")
         for k, rot in (("site", "Site"), ("descricao", "Descrição do negócio"), ("proposta_valor", "Proposta de valor"),
                        ("produtos", "Produtos/serviços"), ("diferenciais", "Diferenciais")):
             if e.get(k):
@@ -7476,7 +7540,8 @@ def li_estado(campanha: str = ""):
     conta["proxima_acao_em"] = _li_iso(conta.get("proxima_acao_em"))
     conta["convites_bloqueados_ate"] = _li_iso(conta.get("convites_bloqueados_ate"))
     conta["verificado"] = _li_iso(conta.get("verificado"))
-    return {"conta": conta, "extensao": _li_conectado(u["id"]), "metricas": _li_metricas(d, campanha or None),
+    return {"conta": conta, "paginas": [_li_pag_pub(p) for p in d.get("paginas") or []],
+            "extensao": _li_conectado(u["id"]), "metricas": _li_metricas(d, campanha or None),
             "campanhas": camps, "n_leads": nleads, "fila": _li_fila_stats(d),
             "sync": {k: _li_iso(v) for k, v in d["sync"].items()}, "na_janela": _li_na_janela(d),
             "pausado": bool(d["limites"].get("pausado")), "passos": _LI_PASSOS, "etapas": _LI_ETAPAS}
@@ -7677,7 +7742,11 @@ def li_importar(body: dict):
     d = _li_db(u["id"])
     url = (body.get("url") or "").strip()
     fonte = body.get("fonte") or "busca"
-    if not re.match(r"https?://(www\.)?linkedin\.com/", url):
+    if fonte == "seguidores":
+        if not _li_pagina(d, body.get("pagina") or ""):
+            raise HTTPException(status_code=400, detail="escolha uma página da empresa cadastrada")
+        url = (_li_pagina(d, body["pagina"]) or {}).get("url") or ""
+    elif not re.match(r"https?://(www\.)?linkedin\.com/", url):
         raise HTTPException(status_code=400, detail="cole uma URL completa do LinkedIn")
     if fonte == "post" and not re.search(r"/(posts|feed/update)/", url):
         raise HTTPException(status_code=400, detail="essa não parece a URL de uma publicação (use 'Copiar link para a publicação')")
@@ -7686,7 +7755,8 @@ def li_importar(body: dict):
     if not _li_conectado(u["id"]):
         raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada neste navegador — instale/pareie em Baixar Extensão")
     job = {"id": _li_id(), "tipo": "importar", "fonte": fonte, "url": url, "max": int(body.get("max") or 25),
-           "modo": body.get("modo") or "ambos", "status": "pendente", "criado": _li_now(), "leads": []}
+           "modo": body.get("modo") or "ambos", "pagina": body.get("pagina") or "", "status": "pendente",
+           "criado": _li_now(), "leads": []}
     with _LI_LOCK:
         d["jobs"].append(job)
         d["jobs"] = d["jobs"][-30:]
@@ -7704,10 +7774,12 @@ def li_job_criar(body: dict):
         raise HTTPException(status_code=400, detail="tipo inválido")
     if not _li_conectado(u["id"]):
         raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada — abra o navegador com a extensão pareada")
+    conta = _li_conta(d, body.get("conta") or "perfil")
     with _LI_LOCK:
-        j = next((x for x in d["jobs"] if x.get("tipo") == tipo and x.get("status") in ("pendente", "rodando")), None)
+        j = next((x for x in d["jobs"] if x.get("tipo") == tipo and x.get("status") in ("pendente", "rodando")
+                  and (x.get("conta") or "perfil") == conta), None)
         if not j:
-            j = {"id": _li_id(), "tipo": tipo, "status": "pendente", "criado": _li_now()}
+            j = {"id": _li_id(), "tipo": tipo, "status": "pendente", "criado": _li_now(), "conta": conta}
             d["jobs"].append(j)
             d["jobs"] = d["jobs"][-30:]
     _li_save()
@@ -7868,20 +7940,24 @@ def li_crm_acao(cid: str, body: dict):
 
 # --- Inbound: estratégia ---
 @app.get("/linkedin/estrategia")
-def li_estrategia_get():
+def li_estrategia_get(conta: str = "perfil"):
     u = _li_user()
     d = _li_db(u["id"])
-    e = d["estrategia"]
-    return {"estrategia": e, "calibragem": _li_calibragem(e), "objetivos_opcoes": _LI_OBJ_NEG}
+    conta = _li_conta(d, conta)
+    e = _li_estrategia_de(d, conta)
+    return {"estrategia": e, "calibragem": _li_calibragem(e), "objetivos_opcoes": _LI_OBJ_NEG, "conta": conta}
 
 
 @app.post("/linkedin/estrategia")
 def li_estrategia_set(body: dict):
     u = _li_user()
     d = _li_db(u["id"])
+    conta = _li_conta(d, (body or {}).get("conta") or "perfil")
     with _LI_LOCK:
-        e = d["estrategia"]
+        e = _li_estrategia_de(d, conta)
         for k, v in (body or {}).items():
+            if k in ("conta", "nome_pagina") or (k == "objetivo" and conta != "perfil"):
+                continue
             if k == "objetivos" and isinstance(v, list):
                 e[k] = [x for x in v if x in _LI_OBJ_NEG]
             elif k == "extra_emojis":
@@ -7889,14 +7965,58 @@ def li_estrategia_set(body: dict):
             elif isinstance(v, str) and re.match(r"^[a-z_]{2,30}$", k):
                 e[k] = v[:6000]
     _li_save()
-    return {"ok": True, "calibragem": _li_calibragem(d["estrategia"])}
+    return {"ok": True, "calibragem": _li_calibragem(_li_estrategia_de(d, conta))}
 
 
 @app.get("/linkedin/estrategia/contexto")
-def li_estrategia_contexto():
+def li_estrategia_contexto(conta: str = "perfil"):
     u = _li_user()
     d = _li_db(u["id"])
-    return {"contexto": _li_contexto(d["estrategia"]), "modelo": " → ".join(_li_modelos())}
+    return {"contexto": _li_contexto(_li_estrategia_de(d, _li_conta(d, conta))), "modelo": " → ".join(_li_modelos())}
+
+
+# --- Páginas da empresa (o usuário é admin) ---
+def _li_pag_pub(p):
+    return {"id": p["id"], "nome": p.get("nome") or p["id"], "url": p.get("url") or "", "seguidores": p.get("seguidores") or 0,
+            "verificada": _li_iso(p.get("verificada")), "admin": bool(p.get("admin"))}
+
+
+@app.get("/linkedin/paginas")
+def li_paginas():
+    u = _li_user()
+    d = _li_db(u["id"])
+    return {"paginas": [_li_pag_pub(p) for p in d["paginas"]]}
+
+
+@app.post("/linkedin/paginas")
+def li_paginas_add(body: dict):
+    """Cadastra uma página da empresa: a extensão abre o painel de admin dela para confirmar o acesso e ler o nome."""
+    u = _li_user()
+    d = _li_db(u["id"])
+    m = re.search(r"linkedin\.com/company/([^/?#\s]+)", (body.get("url") or "").strip(), re.I)
+    if not m:
+        raise HTTPException(status_code=400, detail="cole o link da página, ex.: https://www.linkedin.com/company/sua-empresa/")
+    slug = m.group(1).strip().lower()
+    if not _li_conectado(u["id"]):
+        raise HTTPException(status_code=409, detail="a extensão do Cerne não está conectada — ela precisa abrir o painel da página")
+    job = {"id": _li_id(), "tipo": "pagina_info", "url": f"https://www.linkedin.com/company/{slug}/", "slug": slug,
+           "status": "pendente", "criado": _li_now()}
+    with _LI_LOCK:
+        d["jobs"].append(job)
+        d["jobs"] = d["jobs"][-30:]
+    _li_save()
+    _LI_WAKE.set()
+    return {"ok": True, "job": job["id"]}
+
+
+@app.post("/linkedin/paginas/{pid}/remover")
+def li_paginas_remover(pid: str):
+    u = _li_user()
+    d = _li_db(u["id"])
+    with _LI_LOCK:
+        d["paginas"] = [p for p in d["paginas"] if p["id"] != pid]
+    _li_save()
+    return {"ok": True}
 
 
 # --- Inbound: posts ---
@@ -7908,13 +8028,15 @@ def _li_post_pub(p):
             "visibilidade": p.get("visibilidade") or "qualquer", "comentarios": p.get("comentarios") or "qualquer",
             "metricas": p.get("metricas") or {}, "metricas_em": _li_iso(p.get("metricas_em")),
             "li_url": p.get("li_url") or "", "erro": p.get("erro") or "", "origem": p.get("origem") or "cerne",
-            "imagem_prompt": p.get("imagem_prompt") or ""}
+            "imagem_prompt": p.get("imagem_prompt") or "", "autor": p.get("autor") or "perfil"}
 
 
 @app.get("/linkedin/posts")
-def li_posts(periodo: str = "tudo", de: str = "", ate: str = ""):
+def li_posts(periodo: str = "tudo", de: str = "", ate: str = "", conta: str = "perfil"):
     u = _li_user()
     d = _li_db(u["id"])
+    conta = _li_conta(d, conta)
+    da_conta = [p for p in d["posts"] if (p.get("autor") or "perfil") == conta]
     agora = _li_now()
     ini, fim = 0, agora + 10 ** 9
     if periodo in ("7", "14", "30"):
@@ -7926,15 +8048,18 @@ def li_posts(periodo: str = "tudo", de: str = "", ate: str = ""):
             fim = (_dt.datetime.fromisoformat(ate).timestamp() + 86400) if ate else fim
         except Exception:
             pass
-    pubs = [p for p in d["posts"] if p.get("status") == "publicado" and ini <= (p.get("publicado_em") or 0) <= fim]
+    pubs = [p for p in da_conta if p.get("status") == "publicado" and ini <= (p.get("publicado_em") or 0) <= fim]
     tot = {"impressoes": 0, "reacoes": 0, "comentarios": 0, "compartilhamentos": 0}
     for p in pubs:
         for k in tot:
             tot[k] += int((p.get("metricas") or {}).get(k) or 0)
     tot["interacoes"] = tot["reacoes"] + tot["comentarios"] + tot["compartilhamentos"]
-    posts = sorted(d["posts"], key=lambda p: -(p.get("agendado_para") or p.get("publicado_em") or p.get("criado") or 0))
-    return {"posts": [_li_post_pub(p) for p in posts], "totais": tot, "n_periodo": len(pubs),
-            "sync_posts": _li_iso(d["sync"].get("posts")), "image_creator_url": d["limites"].get("image_creator_url")}
+    posts = sorted(da_conta, key=lambda p: -(p.get("agendado_para") or p.get("publicado_em") or p.get("criado") or 0))
+    pg = _li_pagina(d, conta)
+    return {"posts": [_li_post_pub(p) for p in posts], "totais": tot, "n_periodo": len(pubs), "conta": conta,
+            "autor_nome": (pg or {}).get("nome") or d["conta"].get("nome") or "",
+            "sync_posts": _li_iso(d["sync"].get("posts" if conta == "perfil" else "posts:" + conta)),
+            "image_creator_url": d["limites"].get("image_creator_url")}
 
 
 @app.post("/linkedin/posts/gerar")
@@ -7945,8 +8070,10 @@ def li_post_gerar(body: dict):
     if not assunto:
         raise HTTPException(status_code=400, detail="descreva o assunto do post")
     tipo = _LI_TIPOS_POST.get(body.get("tipo") or "livre", "Post livre")
-    ctx = _li_contexto(d["estrategia"])
-    prompt = ("Você é ghostwriter de LinkedIn no Brasil. Escreva UM post em português do Brasil para o perfil descrito "
+    conta = _li_conta(d, body.get("conta") or "perfil")
+    ctx = _li_contexto(_li_estrategia_de(d, conta))
+    prompt = ("Você é ghostwriter de LinkedIn no Brasil. Escreva UM post em português do Brasil para "
+              + ("a PÁGINA DA EMPRESA descrita" if conta != "perfil" else "o perfil descrito") + " "
               "no CONTEXTO, sobre o ASSUNTO. Formato: " + tipo + ". Regras: gancho forte na 1ª linha (até 12 palavras, "
               "sem clichê); parágrafos curtos de 1-3 linhas com linha em branco entre eles; escaneável; conteúdo concreto "
               "e útil para o público (ICP); ligue o tema ao negócio/carreira sem virar propaganda; termine com um CTA "
@@ -7958,11 +8085,13 @@ def li_post_gerar(body: dict):
     rasc = _li_limpa_post(_li_gerar_texto(prompt, 1600))
     if len(rasc) < 80:
         raise HTTPException(status_code=502, detail="o modelo não devolveu um post — tente de novo")
-    final = _li_limpa_post(_li_gerar_texto(_LI_VICIOS + rasc, 1600))   # 2ª passada: tira os vícios de IA
+    vicios = _LI_VICIOS if conta == "perfil" else _LI_VICIOS.replace(
+        "primeira pessoa.", "voz da EMPRESA na primeira pessoa do PLURAL (\"nós\", \"aqui na empresa\") — nunca \"eu\".")
+    final = _li_limpa_post(_li_gerar_texto(vicios + rasc, 1600))   # 2ª passada: tira os vícios de IA
     if len(final) < 0.5 * len(rasc):
         final = rasc
     post = {"id": _li_id(), "texto": final, "status": "rascunho", "criado": _li_now(), "midias": [],
-            "origem": "cerne", "assunto": assunto[:300], "tipo": body.get("tipo") or "livre"}
+            "origem": "cerne", "assunto": assunto[:300], "tipo": body.get("tipo") or "livre", "autor": conta}
     with _LI_LOCK:
         d["posts"].append(post)
     _li_save()
@@ -7978,7 +8107,8 @@ def li_post_salvar(body: dict):
         pid = body.get("id")
         post = next((p for p in d["posts"] if p["id"] == pid), None) if pid else None
         if not post:
-            post = {"id": _li_id(), "status": "rascunho", "criado": _li_now(), "midias": [], "origem": "cerne"}
+            post = {"id": _li_id(), "status": "rascunho", "criado": _li_now(), "midias": [], "origem": "cerne",
+                    "autor": _li_conta(d, body.get("autor") or body.get("conta") or "perfil")}
             d["posts"].append(post)
         if post.get("status") in ("publicado", "publicando"):
             raise HTTPException(status_code=400, detail="post já publicado não pode ser editado aqui")
@@ -8033,7 +8163,7 @@ def li_post_imagem_prompt(pid: str):
     post = next((p for p in d["posts"] if p["id"] == pid), None)
     if not post or not (post.get("texto") or "").strip():
         raise HTTPException(status_code=400, detail="escreva ou gere o post primeiro")
-    e = d["estrategia"]
+    e = _li_estrategia_de(d, _li_conta(d, post.get("autor") or "perfil"))
     prompt = ("Crie um PROMPT para gerar UMA imagem que acompanhe o post de LinkedIn abaixo. A imagem deve ser profissional, "
               "moderna e chamar atenção no feed (formato quadrado 1:1 ou 4:5), com uma metáfora visual clara do tema, "
               "composição limpa, iluminação de qualidade e, se fizer sentido, um título curto em português (até 6 palavras) "
@@ -8135,7 +8265,10 @@ def li_midia_get(mid: str):
 def li_automacoes_get():
     u = _li_user()
     d = _li_db(u["id"])
-    posts = [{"url": p["li_url"], "texto": (p.get("texto") or "")[:80]} for p in d["posts"] if p.get("li_url")]
+    nomes = {p["id"]: p.get("nome") or p["id"] for p in d["paginas"]}
+    posts = [{"url": p["li_url"], "texto": (p.get("texto") or "")[:80], "autor": p.get("autor") or "perfil",
+              "autor_nome": nomes.get(p.get("autor") or "", "Meu perfil")}
+             for p in sorted(d["posts"], key=lambda x: -(x.get("publicado_em") or 0)) if p.get("li_url")]
     return {"automacoes": d["automacoes"], "posts": posts[:40], "ultima": _li_iso(d["sync"].get("automacoes"))}
 
 
@@ -8152,7 +8285,8 @@ def li_automacoes_set(body: dict):
                     "gatilho": "palavra" if body.get("gatilho") == "palavra" else "qualquer",
                     "palavra": (body.get("palavra") or "").strip()[:60], "convite": bool(body.get("convite")),
                     "nota": (body.get("nota") or "")[:300], "mensagem": bool(body.get("mensagem")),
-                    "texto": (body.get("texto") or "")[:3000]}
+                    "texto": (body.get("texto") or "")[:3000],
+                    "conta": "" if not body.get("conta") else _li_conta(d, body["conta"])}
             if novo["gatilho"] == "palavra" and not novo["palavra"]:    # valida ANTES de gravar
                 raise HTTPException(status_code=400, detail="informe a palavra-chave do comentário")
             if novo["mensagem"] and not novo["texto"].strip():
@@ -14419,6 +14553,21 @@ button:focus-visible,a:focus-visible,[role=button]:focus-visible,.sel:focus-visi
  .wsbar{padding:10px 12px 8px}.wssub{display:none}.composer{padding:8px 10px}
  .lreopen{top:12px;left:8px;padding:5px 9px}.wsbar{padding-left:48px}
  .modalbox{padding:16px}
+ /* Control Tower / Model Ops */
+ .main,.opswrap{padding:14px 12px 80px!important}
+ h1.h{font-size:21px}.lead{font-size:12.5px;margin-bottom:14px}
+ .panel{padding:14px}
+ .grid>*,.ovwrap>*{min-width:0}
+ .grid[style*="repeat(4"]{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+ .grid[style*="repeat(3"],.grid[style*="repeat(2"],.grid[style*="1fr 1fr"],.grid[style*="1.6fr"],.grid[style*="minmax(300px"]{grid-template-columns:minmax(0,1fr)!important}
+ .ovwrap{grid-template-columns:minmax(0,1fr)!important}.ovside{flex-direction:column!important}.ovcore{min-height:260px}
+ .main table,.opswrap table{display:block;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+ .tbl th,.tbl td{padding:8px 9px}
+ .crow{grid-template-columns:92px minmax(0,1fr) 40px}
+ .feed{flex-wrap:wrap;gap:4px 10px}
+ .kv{flex-wrap:wrap;gap:4px 12px}.kv .v{text-align:right;word-break:break-word}
+ .agkpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .panel [style*="display:flex"][style*="gap"]{flex-wrap:wrap}
  /* LinkedIn */
  .li-wrap{gap:12px;grid-template-columns:minmax(0,1fr)!important}.li-side,.li-main,.li-side .li-card{min-width:0;max-width:100%}
  .li-side{position:static;gap:8px}
@@ -14426,6 +14575,7 @@ button:focus-visible,a:focus-visible,[role=button]:focus-visible,.sel:focus-visi
  .li-brand{display:none}
  .li-nav{flex:none;width:auto;padding:8px 12px;white-space:nowrap}
  .li-conn{flex:none;margin:0;padding:7px 10px;white-space:nowrap}.li-conn span{display:none}
+ .li-side .li-card.li-conta{display:block;overflow:visible}
  .li-head{padding:14px}.li-head h2{font-size:18px}
  .li-acts{width:100%}.li-acts .btn,.li-acts .li-btn2{flex:1 1 auto;justify-content:center}
  .li-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.li-stat{padding:11px 12px}.li-stat b{font-size:20px}.li-stat .ic{margin-bottom:8px}
@@ -15688,7 +15838,10 @@ let CORE={ok:true,svc:{}};
 /* ===================== LinkedIn (Workspace → LinkedIn) ===================== */
 const LI={sec:'outbound',inb:'posts',outTab:'campanhas',outArq:false,outQ:'',metCamp:'',leadsQ:'',leadsSt:'',camp:null,wiz:null,
  crmTab:'pipeline',crmQ:'',crmEtapa:'',crmOrig:'',crm:null,drawer:null,est:null,estTab:'principal',per:'tudo',perDe:'',perAte:'',
- pView:'lista',pQ:'',pF:'',calM:null,st:null,menu:null};
+ pView:'lista',pQ:'',pF:'',calM:null,st:null,menu:null,conta:(function(){try{return localStorage.getItem('cerne_li_conta')||'perfil'}catch(e){return 'perfil'}})()};
+function liPags(){return (LI.st&&LI.st.paginas)||[];}
+function liContaNome(c){c=c||LI.conta;if(c==='perfil')return ((LI.st&&LI.st.conta)||{}).nome||'Meu perfil';const p=liPags().find(x=>x.id===c);return p?p.nome:'Meu perfil';}
+function liSetConta(c){LI.conta=c||'perfil';try{localStorage.setItem('cerne_li_conta',LI.conta)}catch(e){}liRefresh();}
 const LI_IC={send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>',
  inbox:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></svg>',
  users:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>',
@@ -15721,10 +15874,13 @@ function liSide(){const st=LI.st||{},c=st.conta||{};const nv=(s,ic,l,extra)=>`<b
  const ok=st.extensao&&c.logado!==false&&c.nome;
  const conn=ok?`<div class="li-conn ok"><b>✓ LinkedIn conectado</b><span>${esc(c.nome)}</span></div>`:(st.extensao?`<div class="li-conn warn" onclick="liReconectar()"><b>! Verifique a conta</b><span>${c.logado===false?'Entre no LinkedIn no seu navegador':'Extensão conectada — clique para verificar o LinkedIn'}</span></div>`:`<div class="li-conn warn" onclick="liReconectar()"><b>! LinkedIn desconectado</b><span>Conecte a extensão do Cerne no seu navegador</span></div>`);
  let h=`<aside class="li-side"><div class="li-card"><div class="li-brand"><div class="li-logo">in</div><div><b>LinkedIn</b><span>Prospecção e conteúdo</span></div></div>${nv('outbound',LI_IC.send,'Outbound')}${nv('inbound',LI_IC.inbox,'Inbound')}${nv('crm',LI_IC.users,'CRM','<span class="li-beta">BETA</span>')}${nv('limites',LI_IC.shield,'Segurança e limites')}${conn}</div>`;
- if(LI.sec==='inbound'){const sb=(s,ic,l)=>`<button class="li-nav${LI.inb===s?' on':''}" onclick="liGo('inbound','${s}')">${ic}<span>${l}</span></button>`;h+=`<div class="li-card">${sb('estrategia',LI_IC.spark,'Estratégia')}${sb('posts',LI_IC.doc,'Posts')}${sb('automacoes',LI_IC.bot,'Automações')}</div>`;}
+ if(LI.sec==='inbound'){const sb=(s,ic,l)=>`<button class="li-nav${LI.inb===s?' on':''}" onclick="liGo('inbound','${s}')">${ic}<span>${l}</span></button>`;
+  const ops=`<option value="perfil"${LI.conta==='perfil'?' selected':''}>👤 Meu perfil</option>`+liPags().map(p=>`<option value="${esc(p.id)}"${LI.conta===p.id?' selected':''}>🏢 ${esc(p.nome)}</option>`).join('');
+  h+=`<div class="li-card li-conta"><div class="faint" style="font-size:10.5px;letter-spacing:.08em;font-weight:700;margin:2px 4px 6px">PUBLICAR COMO</div><select class="field" style="margin:0" onchange="liSetConta(this.value)">${ops}</select><button class="li-btn2" style="width:100%;justify-content:center;margin-top:8px;font-size:12px" onclick="liPaginasModal()">🏢 ${liPags().length?'Gerenciar páginas':'Adicionar página da empresa'}</button></div><div class="li-card">${sb('estrategia',LI_IC.spark,'Estratégia')}${sb('posts',LI_IC.doc,'Posts')}${sb('automacoes',LI_IC.bot,'Automações')}</div>`;}
  return h+'</aside>';}
 
 async function liPage(){try{LI.st=await J('/linkedin/estado'+(LI.metCamp?('?campanha='+encodeURIComponent(LI.metCamp)):''));}catch(e){LI.st={};}
+ if(LI.conta!=='perfil'&&!liPags().some(p=>p.id===LI.conta))LI.conta='perfil';
  let body='';try{
   if(LI.wiz)body=liWizHtml();
   else if(LI.sec==='outbound')body=LI.camp?await liCampDet():await liOutbound();
@@ -15767,8 +15923,8 @@ function liRenomear(id){const c=(LI.st.campanhas||[]).find(x=>x.id===id);const n
 function liExcluirCamp(id){if(confirm('Excluir a campanha e todos os leads dela? Isso não pode ser desfeito.'))liCampAcao(id,'excluir');}
 function liAbrirCamp(id){LI.camp=id;LI.menu=null;liRefresh();}
 async function liProcessar(b){b.disabled=true;try{const r=await liP('/linkedin/processar');toast(r.extensao?'Processando a fila agora (os limites diários continuam valendo)':'Fila liberada — mas a extensão do navegador não está conectada','ok');}catch(e){toast(e.message,'error');}setTimeout(liRefresh,2500);}
-async function liSyncJob(tipo,b){if(b)b.disabled=true;const nomes={sync_aceites:'aceites',sync_respostas:'respostas',sync_posts:'posts',status:'conta'};const t=toast('Sincronizando '+nomes[tipo]+' pelo seu navegador…','load');
- try{const r=await liP('/linkedin/job',{tipo});const j=await liJob(r.job);toastKill(t);if(j.status==='ok')toast('Sincronização concluída','ok');else toast('Falhou: '+(j.erro||'erro'),'error');}catch(e){toastKill(t);toast(e.message,'error');if(/extensão/.test(e.message))liReconectar();}
+async function liSyncJob(tipo,b,conta){if(b)b.disabled=true;const nomes={sync_aceites:'aceites',sync_respostas:'respostas',sync_posts:'posts',status:'conta'};const t=toast('Sincronizando '+nomes[tipo]+' pelo seu navegador…','load');
+ try{const r=await liP('/linkedin/job',{tipo,conta:conta||'perfil'});const j=await liJob(r.job);toastKill(t);if(j.status==='ok')toast('Sincronização concluída','ok');else toast('Falhou: '+(j.erro||'erro'),'error');}catch(e){toastKill(t);toast(e.message,'error');if(/extensão/.test(e.message))liReconectar();}
  if(b)b.disabled=false;liRefresh();}
 async function liReconectar(){const st=LI.st||await J('/linkedin/estado');
  if(st.extensao){liSyncJob('status');return;}
@@ -15780,6 +15936,16 @@ async function liReconectar(){const st=LI.st||await J('/linkedin/estado');
  <li>Entre no LinkedIn nesse mesmo navegador.</li><li>Volte aqui e clique em <b>Verificar</b>. O Cerne usa uma <b>aba fixada</b> em segundo plano para agir — pode deixá-la aberta.</li></ol></div>
  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Fechar</button><button class="btn" onclick="closeModal();LI.st=null;J('/linkedin/estado').then(s=>{LI.st=s;if(s.extensao)liSyncJob('status');else toast('A extensão ainda não conectou — confira o código e se o navegador está aberto','error');})">Verificar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
 
+async function liPaginasModal(){closeModal();const ps=liPags();const w=document.createElement('div');
+ w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:560px"><div class="modalh"><b>🏢 Páginas da empresa</b><button class="cvbtn" onclick="closeModal()">✕</button></div>
+ <div class="faint" style="font-size:12.5px;line-height:1.55">Páginas que você <b>administra</b> no LinkedIn. Com uma página escolhida em <b>Publicar como</b>, a Estratégia, os Posts (gerar, agendar, publicar e métricas) e as Automações passam a ser da página. Convites e mensagens continuam saindo do seu perfil — o LinkedIn não deixa página prospectar.</div>
+ <div style="margin-top:12px">${ps.map(p=>`<div class="li-lrow" style="border:1px solid var(--line);border-radius:10px;margin-bottom:7px"><div class="li-av" style="border-radius:8px;background:#0a66c2;color:#fff">${esc(liIni(p.nome))}</div><div style="flex:1;min-width:0"><b style="color:var(--ink)">${esc(p.nome)}</b><div class="faint" style="font-size:11px">${p.seguidores?p.seguidores.toLocaleString('pt-BR')+' seguidores · ':''}verificada ${liDH(p.verificada)}</div></div><a class="li-icbtn" href="${esc(p.url)}" target="_blank" rel="noopener" title="Abrir">${LI_IC.ext}</a><button class="li-icbtn" title="Verificar de novo" onclick="liPaginaAdd('${esc(p.url)}',this)">↻</button><button class="li-icbtn" title="Remover" onclick="if(confirm('Remover a página do Cerne? (nada muda no LinkedIn)'))liP('/linkedin/paginas/${esc(p.id)}/remover').then(()=>{closeModal();liRefresh();})">✕</button></div>`).join('')||'<div class="faint" style="font-size:12px;padding:6px 0">Nenhuma página ainda.</div>'}</div>
+ <label class="li-lbl">Adicionar página</label><div style="display:flex;gap:8px"><input class="field" id="lipgurl" style="margin:0" placeholder="https://www.linkedin.com/company/sua-empresa/"><button class="btn" onclick="liPaginaAdd(lipgurl.value,this)">Adicionar</button></div>
+ <div class="faint" style="font-size:11px;margin-top:6px" id="lipgmsg">A extensão abre o painel de admin da página para confirmar o acesso e ler o nome.</div></div></div>`;document.body.appendChild(w.firstChild);}
+async function liPaginaAdd(url,b){if(!url||!url.trim()){toast('Cole o link da página','error');return;}if(b)b.disabled=true;const m=document.getElementById('lipgmsg');if(m)m.textContent='Verificando pelo seu navegador… (abre o painel de admin numa aba fixada)';
+ try{const r=await liP('/linkedin/paginas',{url:url.trim()});const j=await liJob(r.job);if(j.status==='ok'){toast('Página verificada: você é admin','ok');LI.st=await J('/linkedin/estado');if(j.pagina)liSetConta(j.pagina);else liRefresh();closeModal();}else{toast('Não deu: '+(j.erro||'erro'),'error');if(m)m.textContent=j.erro||'';}}
+ catch(e){toast(e.message,'error');if(m)m.textContent=e.message;if(/extensão/.test(e.message)){closeModal();liReconectar();}}
+ if(b)b.disabled=false;}
 async function liLeadsTbl(campId){const q='/linkedin/leads?limite=400'+(campId?'&campanha='+campId:'')+(LI.leadsQ?'&q='+encodeURIComponent(LI.leadsQ):'')+(LI.leadsSt?'&status='+LI.leadsSt:'');const d=await J(q);const ls=d.leads||[];
  const sts='<option value="">Todos os status</option>'+Object.entries(LI_LST).map(([k,v])=>`<option value="${k}"${LI.leadsSt===k?' selected':''}>${v[0]}</option>`).join('');
  const rows=ls.map(l=>{const s=LI_LST[l.status]||[l.status,'cinza'];return `<tr><td><div style="display:flex;gap:9px;align-items:center"><div class="li-av">${esc(liIni(l.nome))}</div><div><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.nome)}</a><div class="faint" style="font-size:11px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(l.cargo||'')}</div></div></div></td>${campId?'':`<td>${esc(l.campanha)}</td>`}<td><span class="li-pill ${s[1]}">${s[0]}</span>${l.convidado?' <span class="faint" title="convite enviado">➤</span>':''}${l.conectado?' <span title="conectado" style="color:var(--ok)">✓</span>':''}${l.respondeu?' <span title="respondeu">💬</span>':''}</td><td class="faint" style="font-size:11.5px">${esc(l.erro||l.ultimo||'')}${l.prox_em&&!['concluido','respondeu','ignorado','erro','nao_aceitou'].includes(l.status)?'<div>próx.: '+liDH(l.prox_em)+'</div>':''}</td><td style="text-align:right;white-space:nowrap"><button class="li-icbtn" title="Adicionar ao CRM" onclick="liLeadAcao('${l.id}','crm')">＋</button> <button class="li-icbtn" title="Pular este lead" onclick="liLeadAcao('${l.id}','pular')">⏭</button> <button class="li-icbtn" title="Remover" onclick="liLeadAcao('${l.id}','remover')">✕</button></td></tr>`;}).join('');
@@ -15834,9 +16000,11 @@ function liWizHtml(){const w=LI.wiz;const tt={nova:'Nova campanha',passos:'Edita
   h+=`<div class="li-g2"><div class="li-pane"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px">${LI_IC.link}</div><div><h4 style="font-size:14px">URLs do LinkedIn</h4><p class="sub">Uma URL de perfil por linha</p></div></div><textarea class="field" id="liurls" rows="6" style="margin-top:12px" placeholder="https://www.linkedin.com/in/perfil-1&#10;https://www.linkedin.com/in/perfil-2" oninput="LI.wiz.urls=this.value">${esc(w.urls||'')}</textarea><button class="btn" style="width:100%;margin-top:10px" onclick="liAddUrls()">＋ Adicionar perfis</button></div>
   <div class="li-pane"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px;color:var(--ok);background:rgba(53,230,160,.12)">▦</div><div><h4 style="font-size:14px">Importar CSV</h4><p class="sub">Nome, empresa, cargo e URL do LinkedIn</p></div></div><label class="li-drop" style="display:block;margin-top:12px"><input type="file" accept=".csv,text/csv" style="display:none" onchange="liCsv(this)"><div style="font-size:20px">🗎</div><b style="color:var(--ink)">Selecione um arquivo CSV</b><div style="font-size:11px;margin-top:4px">Inclua a coluna linkedin_url, linkedin ou url</div></label></div></div>
   <div class="li-imp"><div style="display:flex;gap:10px;align-items:center"><div class="li-av" style="border-radius:9px;background:#0a66c2;color:#fff">in</div><div><h4 style="font-size:14px;margin:0;color:var(--ink)">Importar pelo LinkedIn</h4><p class="sub" style="font-size:12px;color:var(--dim);margin:2px 0 0">Busca clássica, Sales Navigator ou pessoas que interagiram com uma publicação.</p></div></div>
-  <div class="li-improw"><select class="field" style="margin:0" onchange="LI.wiz.imp.fonte=this.value;liWizRender()"><option value="busca"${imp.fonte==='busca'?' selected':''}>LinkedIn Search</option><option value="sales"${imp.fonte==='sales'?' selected':''}>Sales Navigator</option><option value="post"${imp.fonte==='post'?' selected':''}>URL de publicação</option></select><input class="field" style="margin:0" placeholder="${ph}" value="${esc(imp.url)}" oninput="LI.wiz.imp.url=this.value"><select class="field" style="margin:0" onchange="LI.wiz.imp.max=+this.value">${[25,50,100,250,500].map(n=>`<option value="${n}"${imp.max===n?' selected':''}>${n} leads</option>`).join('')}</select></div>
+  <div class="li-improw"><select class="field" style="margin:0" onchange="LI.wiz.imp.fonte=this.value;if(this.value==='seguidores'&&!LI.wiz.imp.pagina)LI.wiz.imp.pagina=(liPags()[0]||{}).id||'';liWizRender()"><option value="busca"${imp.fonte==='busca'?' selected':''}>LinkedIn Search</option><option value="sales"${imp.fonte==='sales'?' selected':''}>Sales Navigator</option><option value="post"${imp.fonte==='post'?' selected':''}>URL de publicação</option>${liPags().length?`<option value="seguidores"${imp.fonte==='seguidores'?' selected':''}>Seguidores da minha página</option>`:''}</select>${imp.fonte==='seguidores'?`<select class="field" style="margin:0" onchange="LI.wiz.imp.pagina=this.value">${liPags().map(p=>`<option value="${esc(p.id)}"${imp.pagina===p.id?' selected':''}>🏢 ${esc(p.nome)}</option>`).join('')}</select>`:`<input class="field" style="margin:0" placeholder="${ph}" value="${esc(imp.url)}" oninput="LI.wiz.imp.url=this.value">`}<select class="field" style="margin:0" onchange="LI.wiz.imp.max=+this.value">${[25,50,100,250,500].map(n=>`<option value="${n}"${imp.max===n?' selected':''}>${n} leads</option>`).join('')}</select></div>
   ${imp.fonte==='post'?`<div class="faint" style="font-size:11.5px;margin-top:10px;line-height:1.55">Use o link da <b>publicação original</b>, não de um compartilhamento (repost) dela — compartilhamentos têm comentários e reações próprios, separados do post original, e não podem ser importados. Pra pegar o link certo: abra a publicação no LinkedIn, clique nos três pontinhos (•••) no canto do post e escolha <b>"Copiar link para a publicação"</b>.</div><div class="li-seg" style="margin-top:10px">${[['comentarios','Comentários'],['reacoes','Reações'],['ambos','Ambos']].map(([k,l])=>`<button class="${imp.modo===k?'on':''}" onclick="LI.wiz.imp.modo='${k}';liWizRender()">${l}</button>`).join('')}</div>`:''}
   ${imp.fonte==='sales'?'<div class="faint" style="font-size:11.5px;margin-top:10px">A extração do Sales Navigator ainda é limitada — se falhar, faça a mesma busca no LinkedIn Search.</div>':''}
+  ${imp.fonte==='seguidores'?'<div class="faint" style="font-size:11.5px;margin-top:10px">Lê a lista de seguidores no painel de admin da página (Analytics → Seguidores), dos mais recentes para os mais antigos. Os convites e mensagens saem do seu perfil.</div>':''}
+  ${!liPags().length?'<div class="faint" style="font-size:11.5px;margin-top:10px">Quer importar os seguidores da sua página? <a href="javascript:void(0)" onclick="liPaginasModal()" style="color:var(--iris)">Adicione a página da empresa</a>.</div>':''}
   <div style="display:flex;align-items:center;gap:12px;margin-top:12px"><button class="btn" id="liimpbtn" onclick="liImportar()" ${w.job?'disabled style="opacity:.6"':''}>${w.job?'Importando…':'⌕ Buscar e importar leads'}</button><span class="faint" id="liimpmsg" style="font-size:12px">${w.job?'A extensão está percorrendo o LinkedIn numa aba fixada (pode levar alguns minutos)…':''}</span></div></div>
   <div class="li-pane" style="margin-top:14px;padding:0"><div class="li-bar"><b style="color:var(--ink)">Leads adicionados</b><div style="display:flex;gap:8px;align-items:center"><span class="li-pill azul">${w.leads.length} lead(s)</span>${w.leads.length?'<button class="li-btn2" onclick="if(confirm(\'Remover todos os leads da lista?\')){LI.wiz.leads=[];liWizRender();}">Limpar</button>':''}</div></div>
   <div class="li-leadl">${w.leads.length?w.leads.map((l,i)=>`<div class="li-lrow"><div class="li-av">${esc(liIni(l.nome||l.url.split('/in/')[1]))}</div><div style="flex:1;min-width:0"><b style="color:var(--ink)">${esc(l.nome||l.url.split('/in/')[1].replace('/',''))}</b><div class="faint" style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(l.cargo||l.url)}</div></div><button class="li-icbtn" onclick="LI.wiz.leads.splice(${i},1);liWizRender()">✕</button></div>`).join(''):'<div class="li-empty" style="padding:26px">Nenhum lead adicionado.</div>'}</div></div>`;}
@@ -15865,8 +16033,8 @@ function liCsv(inp){const f=inp.files[0];if(!f)return;const rd=new FileReader();
  const iu=col('linkedin_url','linkedin','url','perfil','profile'),inm=col('nome','name'),ifn=col('first name','primeiro'),iln=col('last name','sobrenome'),ie=col('empresa','company','organiza'),ic=col('cargo','title','headline','posição','position');
  if(iu<0){toast('Não achei a coluna da URL do LinkedIn (linkedin_url, linkedin ou url)','error');return;}
  const arr=rows.slice(1).map(r=>({url:r[iu]||'',nome:(inm>=0?r[inm]:((ifn>=0?r[ifn]:'')+' '+(iln>=0?r[iln]:''))).trim(),empresa:ie>=0?r[ie]:'',cargo:ic>=0?r[ic]:''}));const n=liLeadAdd(arr);toast(n+' lead(s) importado(s) do CSV','ok');liWizRender();};rd.readAsText(f,'utf-8');}
-async function liImportar(){const w=LI.wiz,imp=w.imp;if(!imp.url.trim()){toast('Cole a URL do LinkedIn','error');return;}
- try{const r=await liP('/linkedin/importar',{url:imp.url.trim(),fonte:imp.fonte,max:imp.max,modo:imp.modo});w.job=r.job;liWizRender();
+async function liImportar(){const w=LI.wiz,imp=w.imp;if(imp.fonte!=='seguidores'&&!imp.url.trim()){toast('Cole a URL do LinkedIn','error');return;}
+ try{const r=await liP('/linkedin/importar',{url:imp.url.trim(),fonte:imp.fonte,max:imp.max,modo:imp.modo,pagina:imp.pagina||''});w.job=r.job;liWizRender();
   const j=await liJob(r.job,jj=>{const m=document.getElementById('liimpmsg');if(m&&jj.status==='rodando')m.textContent='Extraindo leads… a extensão está percorrendo as páginas do LinkedIn.';});
   w.job=null;if(j.status==='ok'){const n=liLeadAdd(j.leads||[]);toast(n+' lead(s) importado(s)'+(j.aviso?' · '+j.aviso:''),n?'ok':'info');}else toast('Importação falhou: '+(j.erro||'erro'),'error');}
  catch(e){w.job=null;toast(e.message,'error');if(/extensão/.test(e.message))liReconectar();}
@@ -15911,11 +16079,12 @@ async function liCrmMsg(id){const t=(document.getElementById('lidmsg')||{}).valu
 
 /* ---------- Inbound: Estratégia ---------- */
 const LI_EST_TABS={negocio:[['principal','Meu negócio'],['ref','Posts de referência'],['icp','Sobre seu ICP'],['extra','Informações adicionais']],carreira:[['principal','Minha carreira'],['ref','Posts de referência'],['icp','Sobre seu público'],['extra','Informações adicionais']]};
-async function liEstrategia(){const d=await J('/linkedin/estrategia');LI.est=d.estrategia||{};LI.estObjs=d.objetivos_opcoes||[];LI.estCal=d.calibragem||0;return liEstHtml();}
-function liEstHtml(){const e=LI.est,obj=e.objetivo||'negocio';const tabs=LI_EST_TABS[obj];
+async function liEstrategia(){const d=await J('/linkedin/estrategia?conta='+encodeURIComponent(LI.conta));LI.est=d.estrategia||{};LI.estObjs=d.objetivos_opcoes||[];LI.estCal=d.calibragem||0;return liEstHtml();}
+function liEstHtml(){const e=LI.est,pag=e.objetivo==='pagina',obj=pag?'negocio':(e.objetivo||'negocio');const tabs=pag?[['principal','Minha empresa'],['ref','Posts de referência'],['icp','Sobre seu ICP'],['extra','Informações adicionais']]:LI_EST_TABS[obj];
  const F=(k,l,req,ph,rows)=>`<div><label class="li-lbl">${l}${req?' <span style="color:var(--crit)">*</span>':''}</label>${rows?`<textarea class="field" rows="${rows}" placeholder="${ph||''}" oninput="LI.est['${k}']=this.value">${esc(e[k]||'')}</textarea>`:`<input class="field" placeholder="${ph||''}" value="${esc(e[k]||'')}" oninput="LI.est['${k}']=this.value">`}</div>`;
  let h=`<div class="li-head"><div><div class="li-eyebrow">LINKEDIN INBOUND</div><h2>Estratégia de conteúdo</h2><p>Construa a base usada na criação dos seus conteúdos.</p></div><div class="li-acts"><div class="li-calib"><div class="t">Calibragem IA <b id="licalib">${LI.estCal}%</b></div><div class="tr"><i style="width:${LI.estCal}%"></i></div></div><button class="li-btn2" onclick="liInspecionar()">👁 Inspecionar Contexto IA</button><button class="btn" onclick="liEstSalvar(this)">💾 Salvar</button></div></div>`;
- h+=`<div class="li-pane"><b style="color:var(--ink);font-size:13.5px">Qual é o seu objetivo no LinkedIn?</b><div class="faint" style="font-size:11.5px;margin-top:3px">Isso ajusta os campos desta página e as mensagens geradas pela IA para o seu objetivo. Nada do que você já preencheu é apagado ao trocar.</div><div class="li-radio">${[['negocio','Meu negócio','Tenho uma empresa/produto/serviço e quero gerar leads e vendas pelo LinkedIn.'],['carreira','Minha carreira','Sou profissional CLT e quero construir autoridade, posicionamento e expandir minha rede.']].map(([k,t,s])=>`<label class="li-ropt${obj===k?' on':''}"><input type="radio" name="liobj" ${obj===k?'checked':''} onchange="LI.est.objetivo='${k}';LI.estTab='principal';liEstRender()"><div><b>${t}</b><span>${s}</span></div></label>`).join('')}</div></div>`;
+ if(pag)h+=`<div class="li-info">🏢 Estratégia da página <b>${esc(e.nome_pagina||liContaNome())}</b> — os posts gerados aqui saem na voz da empresa ("nós"), separados da estratégia do seu perfil.</div>`;
+ else h+=`<div class="li-pane"><b style="color:var(--ink);font-size:13.5px">Qual é o seu objetivo no LinkedIn?</b><div class="faint" style="font-size:11.5px;margin-top:3px">Isso ajusta os campos desta página e as mensagens geradas pela IA para o seu objetivo. Nada do que você já preencheu é apagado ao trocar.</div><div class="li-radio">${[['negocio','Meu negócio','Tenho uma empresa/produto/serviço e quero gerar leads e vendas pelo LinkedIn.'],['carreira','Minha carreira','Sou profissional CLT e quero construir autoridade, posicionamento e expandir minha rede.']].map(([k,t,s])=>`<label class="li-ropt${obj===k?' on':''}"><input type="radio" name="liobj" ${obj===k?'checked':''} onchange="LI.est.objetivo='${k}';LI.estTab='principal';liEstRender()"><div><b>${t}</b><span>${s}</span></div></label>`).join('')}</div></div>`;
  h+=`<div class="li-seg" style="align-self:flex-start">${tabs.map(([k,l])=>`<button class="${LI.estTab===k?'on':''}" onclick="LI.estTab='${k}';liEstRender()">${l}</button>`).join('')}</div><div class="li-pane">`;
  if(LI.estTab==='principal'){
   if(obj==='negocio')h+=`<h4 style="font-size:17px">Visão geral</h4><p class="sub">Conte sobre sua empresa e o valor entregue.</p><div class="li-g2">${F('linkedin_url','LinkedIn URL',0,'https://www.linkedin.com/in/...')}${F('site','Site da empresa',1,'https://...')}</div>`;
@@ -15929,12 +16098,12 @@ function liEstHtml(){const e=LI.est,obj=e.objetivo||'negocio';const tabs=LI_EST_
  return h+'</div>';}
 function liEstRender(){const m=document.querySelector('#limount .li-main');if(m)m.innerHTML=liEstHtml();}
 function liEstObj(o,on){const a=LI.est.objetivos=LI.est.objetivos||[];if(on&&!a.includes(o))a.push(o);if(!on)LI.est.objetivos=a.filter(x=>x!==o);liEstRender();}
-async function liEstSalvar(b){b.disabled=true;try{const r=await liP('/linkedin/estrategia',LI.est);LI.estCal=r.calibragem;toast('Estratégia salva · calibragem '+r.calibragem+'%','ok');liEstRender();}catch(e){toast(e.message,'error');}b.disabled=false;}
-async function liInspecionar(){try{await liP('/linkedin/estrategia',LI.est);}catch(e){}const d=await J('/linkedin/estrategia/contexto');const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:720px"><div class="modalh"><b>👁 Contexto que a IA recebe</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-bottom:8px">Este é o texto que acompanha cada pedido de post (modelo: <span class="mono">${esc(d.modelo||'')}</span>).</div><pre class="mono" style="white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:11.5px;max-height:60vh;overflow:auto;color:var(--ink2)">${esc(d.contexto||'')}</pre></div></div>`;document.body.appendChild(w.firstChild);}
+async function liEstSalvar(b){b.disabled=true;try{const r=await liP('/linkedin/estrategia',Object.assign({},LI.est,{conta:LI.conta}));LI.estCal=r.calibragem;toast('Estratégia salva · calibragem '+r.calibragem+'%','ok');liEstRender();}catch(e){toast(e.message,'error');}b.disabled=false;}
+async function liInspecionar(){try{await liP('/linkedin/estrategia',Object.assign({},LI.est,{conta:LI.conta}));}catch(e){}const d=await J('/linkedin/estrategia/contexto?conta='+encodeURIComponent(LI.conta));const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:720px"><div class="modalh"><b>👁 Contexto que a IA recebe</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-bottom:8px">Este é o texto que acompanha cada pedido de post (modelo: <span class="mono">${esc(d.modelo||'')}</span>).</div><pre class="mono" style="white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:11.5px;max-height:60vh;overflow:auto;color:var(--ink2)">${esc(d.contexto||'')}</pre></div></div>`;document.body.appendChild(w.firstChild);}
 
 /* ---------- Inbound: Posts ---------- */
-async function liPosts(){const q='/linkedin/posts?periodo='+(LI.per==='custom'?'custom&de='+LI.perDe+'&ate='+LI.perAte:LI.per);const d=await J(q);LI.posts=d;const t=d.totais||{};const st=LI.st||{};
- let h=liHead('LINKEDIN INBOUND','','Posts','Crie, sincronize, agende e acompanhe seus conteúdos.',`${st.extensao?`<span class="li-btn2" style="cursor:default;color:var(--ok);border-color:rgba(53,230,160,.35);background:rgba(53,230,160,.06)">● Sincronização Automática Ativa (Proteção 1h)</span>`:''}<button class="li-btn2" title="Sincronizar posts e métricas agora" onclick="liSyncJob('sync_posts',this)">${LI_IC.sync}</button><button class="li-btn2 ai" onclick="liGerarModal()">✧ Gerar com IA</button><button class="btn" onclick="liNovoPost()">＋ Novo post</button>`);
+async function liPosts(){const q='/linkedin/posts?conta='+encodeURIComponent(LI.conta)+'&periodo='+(LI.per==='custom'?'custom&de='+LI.perDe+'&ate='+LI.perAte:LI.per);const d=await J(q);LI.posts=d;const t=d.totais||{};const st=LI.st||{};
+ let h=liHead('LINKEDIN INBOUND','','Posts','Crie, sincronize, agende e acompanhe seus conteúdos. Publicando como <b style="color:var(--ink)">'+(LI.conta==='perfil'?'👤 ':'🏢 ')+esc(d.autor_nome||liContaNome())+'</b>.',`${st.extensao?`<span class="li-btn2" style="cursor:default;color:var(--ok);border-color:rgba(53,230,160,.35);background:rgba(53,230,160,.06)">● Sincronização Automática Ativa (Proteção 1h)</span>`:''}<button class="li-btn2" title="Sincronizar posts e métricas agora" onclick="liSyncJob('sync_posts',this,LI.conta)">${LI_IC.sync}</button><button class="li-btn2 ai" onclick="liGerarModal()">✧ Gerar com IA</button><button class="btn" onclick="liNovoPost()">＋ Novo post</button>`);
  h+=`<div class="li-box" style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;flex-wrap:wrap;gap:10px"><div><b style="color:var(--ink);font-size:13.5px">Período</b><div class="faint" style="font-size:11.5px">${{7:'Últimos 7 dias',14:'Últimos 14 dias',tudo:'Todo o período',custom:'Personalizado'}[LI.per]} · ${d.n_periodo||0} post(s)</div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${LI.per==='custom'?`<input type="date" class="field" style="margin:0;width:auto" value="${LI.perDe}" onchange="LI.perDe=this.value;liRefresh()"><input type="date" class="field" style="margin:0;width:auto" value="${LI.perAte}" onchange="LI.perAte=this.value;liRefresh()">`:''}<div class="li-seg">${[['7','7 dias'],['14','14 dias'],['tudo','Tudo'],['custom','Personalizar']].map(([k,l])=>`<button class="${LI.per===k?'on2':''}" onclick="LI.per='${k}';liRefresh()">${l}</button>`).join('')}</div></div></div>`;
  h+=`<div class="li-stats">${liStat('👁','rgba(176,108,255,.13)','var(--violet)',(t.impressoes||0).toLocaleString('pt-BR'),'Impressões')}${liStat('〰','rgba(53,224,230,.12)','var(--cyan)',(t.interacoes||0).toLocaleString('pt-BR'),'Interações')}${liStat('👍','rgba(53,230,160,.12)','var(--ok)',(t.reacoes||0).toLocaleString('pt-BR'),'Reações')}${liStat('💬','rgba(255,184,77,.13)','var(--warn)',(t.comentarios||0).toLocaleString('pt-BR'),'Comentários')}</div>`;
  const F={'':'Todos',rascunho:'Rascunhos',agendado:'Agendados',publicado:'Publicados',erro:'Com erro'};
@@ -15952,14 +16121,14 @@ function liCal(ps){const b=LI.calM?new Date(LI.calM):new Date();b.setDate(1);con
  for(let i=0;i<42;i++){const d=new Date(ini);d.setDate(ini.getDate()+i);const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   h+=`<div class="d${d.getMonth()!==mo?' out':''}${k===hoje?' hj':''}">${d.getDate()}${(ev[k]||[]).map(p=>`<span class="ev li-pill ${p.status}" onclick="liAbrirPost('${p.id}')" title="${esc(p.texto.slice(0,120))}">${(p.status==='publicado'?p.publicado_em:p.agendado_para||'').slice(11,16)} ${esc(p.texto.slice(0,30))}</span>`).join('')}</div>`;}
  return h+'</div>';}
-function liGerarModal(){const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:520px"><div class="modalh"><b>Gerar post com IA</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-top:-6px">O resultado será aberto como rascunho para sua revisão.</div>
+function liGerarModal(){const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:520px"><div class="modalh"><b>Gerar post com IA</b><button class="cvbtn" onclick="closeModal()">✕</button></div><div class="faint" style="font-size:12px;margin-top:-6px">O resultado será aberto como rascunho para sua revisão · como <b>${esc(liContaNome())}</b>.</div>
  <label class="li-lbl">Tipo</label><select class="field" id="ligt"><option value="livre">Post livre</option><option value="storytelling">Storytelling</option><option value="lista">Lista de dicas</option><option value="opiniao">Opinião / contraponto</option><option value="case">Case de sucesso</option><option value="bastidores">Bastidores</option><option value="tutorial">Passo a passo</option><option value="pergunta">Pergunta para engajar</option></select>
  <label class="li-lbl">Assunto</label><textarea class="field" id="liga" rows="4" placeholder="Descreva o tema e o ponto principal..." oninput="document.getElementById('ligbtn').disabled=!this.value.trim()"></textarea>
  <label class="li-lbl">Orientações adicionais</label><textarea class="field" id="ligo" rows="3"></textarea>
  ${(LI.estCal||0)<40?'<div class="li-info" style="margin-top:10px">Dica: preencha a <b>Estratégia</b> — a IA usa esse contexto para escrever sobre o seu negócio/carreira.</div>':''}
  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" id="ligbtn" disabled onclick="liGerar(this)">✧ Gerar post</button></div></div></div>`;document.body.appendChild(w.firstChild);setTimeout(()=>{const a=document.getElementById('liga');if(a)a.focus();},50);}
-async function liGerar(b){b.disabled=true;b.textContent='Gerando… (escreve e depois tira os vícios de IA)';try{const r=await liP('/linkedin/posts/gerar',{tipo:ligt.value,assunto:liga.value,orientacoes:ligo.value});closeModal();toast('Post gerado — revise antes de publicar','ok');await liRefresh();liEditor(r.post);}catch(e){toast(e.message,'error');b.disabled=false;b.textContent='✧ Gerar post';}}
-async function liNovoPost(){try{const r=await liP('/linkedin/posts',{texto:''});liEditor(r.post);}catch(e){toast(e.message,'error');}}
+async function liGerar(b){b.disabled=true;b.textContent='Gerando… (escreve e depois tira os vícios de IA)';try{const r=await liP('/linkedin/posts/gerar',{tipo:ligt.value,assunto:liga.value,orientacoes:ligo.value,conta:LI.conta});closeModal();toast('Post gerado — revise antes de publicar','ok');await liRefresh();liEditor(r.post);}catch(e){toast(e.message,'error');b.disabled=false;b.textContent='✧ Gerar post';}}
+async function liNovoPost(){try{const r=await liP('/linkedin/posts',{texto:'',autor:LI.conta});liEditor(r.post);}catch(e){toast(e.message,'error');}}
 function liAbrirPost(id){const p=((LI.posts||{}).posts||[]).find(x=>x.id===id);if(p)liEditor(p);}
 function liEditor(p){LI.ed=JSON.parse(JSON.stringify(p));closeModal();const ro=['publicado','publicando'].includes(p.status);const icu=(LI.posts||{}).image_creator_url||'https://chatgpt.com/';
  const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox li-modal"><div class="modalh"><div><b>Editor de post</b><div class="faint" style="font-size:11.5px;margin-top:3px">O LinkedIn publica texto puro. A prévia abaixo mostra o texto e a mídia que serão enviados.</div></div><button class="cvbtn" onclick="closeModal();liRefresh()">✕</button></div>
@@ -15972,12 +16141,12 @@ function liEditor(p){LI.ed=JSON.parse(JSON.stringify(p));closeModal();const ro=[
  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;justify-content:flex-end"><button class="li-btn2 danger" style="margin-right:auto" onclick="if(confirm('Excluir este post?'))liP('/linkedin/posts/${p.id}/excluir').then(()=>{closeModal();liRefresh();})">Excluir</button><button class="li-btn2" onclick="liEdSalvar('rascunho',this)">Salvar rascunho</button><button class="li-btn2" onclick="liEdSalvar('agendar',this)">📅 Agendar</button><button class="btn" onclick="liEdSalvar('publicar',this)">Publicar agora</button></div>`}
  ${p.status==='agendado'?`<div class="li-info" style="margin-top:10px">Agendado para ${liDH(p.agendado_para)} — publica pelo seu navegador (ele precisa estar aberto com a extensão). Salvar como rascunho cancela o agendamento.</div>`:''}</div>
  <div class="li-prev"><div class="faint mono" style="font-size:10.5px;letter-spacing:.12em;margin-bottom:10px">PRÉVIA DA PUBLICAÇÃO</div><div class="li-prevcard" id="liedprev"></div></div></div></div></div>`;document.body.appendChild(w.firstChild);liEdPrev();}
-function liEdPrev(){const p=LI.ed,el=document.getElementById('liedprev');if(!el)return;const c=(LI.st&&LI.st.conta)||{};const nm=c.nome||(ME&&ME.nome)||'Você';
+function liEdPrev(){const p=LI.ed,el=document.getElementById('liedprev');if(!el)return;const c=(LI.st&&LI.st.conta)||{};const nm=(p.autor&&p.autor!=='perfil')?liContaNome(p.autor):(c.nome||(ME&&ME.nome)||'Você');
  const imgs=(p.midias||[]).filter(m=>(m.tipo||'').startsWith('image/'));const outros=(p.midias||[]).filter(m=>!(m.tipo||'').startsWith('image/'));
  el.innerHTML=`<div class="who"><div class="a">${esc(liIni(nm))}</div><div><b>${esc(nm)}</b><span>agora · 🌐</span></div></div><div class="tx">${esc(p.texto||'Seu texto aparece aqui…')}</div>${imgs.slice(0,1).map(m=>`<img src="/linkedin/midia/${m.id}" alt="">`).join('')}${imgs.length>1?`<div style="font-size:11.5px;color:#666;margin-top:6px">+${imgs.length-1} imagem(ns)</div>`:''}${outros.map(m=>`<div style="margin-top:10px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:12px">📎 ${esc(m.nome)}</div>`).join('')}`;
  const cnt=document.getElementById('liedcnt');if(cnt)cnt.textContent=(p.texto||'').length+'/3000';
  const th=document.getElementById('liedthumbs');if(th)th.innerHTML=(p.midias||[]).map(m=>`<div>${(m.tipo||'').startsWith('image/')?`<img src="/linkedin/midia/${m.id}">`:`<div style="width:76px;height:76px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:10px;padding:4px;text-align:center">${esc(m.nome)}</div>`}${['publicado','publicando'].includes(p.status)?'':`<button onclick="liEdRmMidia('${m.id}')">✕</button>`}</div>`).join('');}
-async function liEdPersist(){const p=LI.ed;const r=await liP('/linkedin/posts',{id:p.id,texto:(document.getElementById('liedtx')||{}).value||p.texto,visibilidade:(document.getElementById('liedvis')||{}).value,comentarios:(document.getElementById('liedcom')||{}).value,acao:'rascunho'});return r.post;}
+async function liEdPersist(){const p=LI.ed;const r=await liP('/linkedin/posts',{id:p.id,autor:p.autor,texto:(document.getElementById('liedtx')||{}).value||p.texto,visibilidade:(document.getElementById('liedvis')||{}).value,comentarios:(document.getElementById('liedcom')||{}).value,acao:'rascunho'});return r.post;}
 async function liEdUpload(inp){const fs=[...inp.files];for(const f of fs){const fd=new FormData();fd.append('file',f);const r=await fetch('/linkedin/posts/'+LI.ed.id+'/midia',{method:'POST',body:fd});const j=await r.json().catch(()=>({}));if(!r.ok){toast(j.detail||'falha no upload','error');continue;}LI.ed.midias.push(j.midia);}inp.value='';liEdPrev();}
 async function liEdRmMidia(mid){await liP('/linkedin/posts/'+LI.ed.id+'/midia/'+mid+'/remover');LI.ed.midias=LI.ed.midias.filter(m=>m.id!==mid);liEdPrev();}
 async function liEdPrompt(b){b.disabled=true;const o=b.textContent;b.textContent='gerando…';try{await liEdPersist();const r=await liP('/linkedin/posts/'+LI.ed.id+'/imagem-prompt');document.getElementById('liedip').value=r.prompt;LI.ed.imagem_prompt=r.prompt;}catch(e){toast(e.message,'error');}b.disabled=false;b.textContent=o;}
@@ -15991,17 +16160,18 @@ async function liEdSalvar(acao,b){const p=LI.ed;const body={id:p.id,texto:docume
 /* ---------- Inbound: Automações ---------- */
 async function liAutomacoes(){const d=await J('/linkedin/automacoes');LI.auto=d;const as=d.automacoes||[];
  let h=liHead('LINKEDIN INBOUND','','Automações','Transforme comentários dos seus posts em conversas: o Cerne lê os comentários dos posts recentes (até 14 dias) a cada 2h e age por você, dentro dos limites.',`<button class="btn" onclick="liAutoModal()">＋ Nova automação</button>`);
- h+=`<div class="li-box">${as.length?as.map(a=>`<div class="li-auto"><button class="li-sw${a.ativo?' on':''}" title="${a.ativo?'Desativar':'Ativar'}" onclick="liAutoSalvar(Object.assign({},LI.auto.automacoes.find(x=>x.id==='${a.id}'),{ativo:${!a.ativo}}))"></button><div style="flex:1;min-width:0"><b style="color:var(--ink);font-size:13.5px">${esc(a.nome)}</b><div class="faint" style="font-size:12px;margin-top:3px">Quando alguém comentar ${a.gatilho==='palavra'?'<b>"'+esc(a.palavra)+'"</b>':'qualquer coisa'} em ${a.post_url?'um post específico':'qualquer post recente'} → adiciona ao CRM${a.convite?' · envia convite':''}${a.mensagem?' · envia mensagem':''}</div><div class="faint" style="font-size:11px;margin-top:3px">${a.disparos||0} disparo(s)</div></div><button class="li-btn2" onclick="liAutoModal('${a.id}')">Editar</button><button class="li-icbtn" onclick="if(confirm('Excluir automação?'))liAutoSalvar({excluir:'${a.id}'})">✕</button></div>`).join(''):`<div class="li-empty"><b>Nenhuma automação</b>Exemplo: "quem comentar <i>QUERO</i> no meu post recebe o material por mensagem e entra no CRM".</div>`}</div>`;
+ h+=`<div class="li-box">${as.length?as.map(a=>`<div class="li-auto"><button class="li-sw${a.ativo?' on':''}" title="${a.ativo?'Desativar':'Ativar'}" onclick="liAutoSalvar(Object.assign({},LI.auto.automacoes.find(x=>x.id==='${a.id}'),{ativo:${!a.ativo}}))"></button><div style="flex:1;min-width:0"><b style="color:var(--ink);font-size:13.5px">${esc(a.nome)}</b><div class="faint" style="font-size:12px;margin-top:3px">Quando alguém comentar ${a.gatilho==='palavra'?'<b>"'+esc(a.palavra)+'"</b>':'qualquer coisa'} em ${a.post_url?'um post específico':('qualquer post recente'+(a.conta?(' de '+(a.conta==='perfil'?'meu perfil':'🏢 '+esc(liContaNome(a.conta)))):' (perfil e páginas)'))} → adiciona ao CRM${a.convite?' · envia convite':''}${a.mensagem?' · envia mensagem':''}</div><div class="faint" style="font-size:11px;margin-top:3px">${a.disparos||0} disparo(s)</div></div><button class="li-btn2" onclick="liAutoModal('${a.id}')">Editar</button><button class="li-icbtn" onclick="if(confirm('Excluir automação?'))liAutoSalvar({excluir:'${a.id}'})">✕</button></div>`).join(''):`<div class="li-empty"><b>Nenhuma automação</b>Exemplo: "quem comentar <i>QUERO</i> no meu post recebe o material por mensagem e entra no CRM".</div>`}</div>`;
  if(d.ultima)h+=`<div class="faint" style="font-size:11.5px">Última verificação: ${liDH(d.ultima)}</div>`;return h;}
-function liAutoModal(id){const a=id?(LI.auto.automacoes||[]).find(x=>x.id===id):{nome:'',ativo:true,gatilho:'qualquer',palavra:'',post_url:'',convite:true,nota:'',mensagem:false,texto:''};const posts=LI.auto.posts||[];
+function liAutoModal(id){const a=id?(LI.auto.automacoes||[]).find(x=>x.id===id):{nome:'',ativo:true,gatilho:'qualquer',palavra:'',post_url:'',convite:true,nota:'',mensagem:false,texto:'',conta:LI.conta==='perfil'?'':LI.conta};const posts=LI.auto.posts||[];
  const w=document.createElement('div');w.innerHTML=`<div class="modal" id="modal"><div class="modalbox" style="width:600px"><div class="modalh"><b>${id?'Editar':'Nova'} automação</b><button class="cvbtn" onclick="closeModal()">✕</button></div>
  <label class="li-lbl">Nome</label><input class="field" id="laN" value="${esc(a.nome)}" placeholder="Ex.: Material grátis — comentou QUERO">
- <label class="li-lbl">Em qual post?</label><select class="field" id="laP"><option value="">Qualquer post recente (até 14 dias)</option>${posts.map(p=>`<option value="${esc(p.url)}"${a.post_url===p.url?' selected':''}>${esc(p.texto)}</option>`).join('')}</select>${posts.length?'':'<div class="faint" style="font-size:11px;margin-top:4px">Sincronize seus posts em Posts para escolher um específico.</div>'}
+ <label class="li-lbl">De qual conta?</label><select class="field" id="laK"><option value="">Perfil e páginas</option><option value="perfil"${a.conta==='perfil'?' selected':''}>👤 Meu perfil</option>${liPags().map(p=>`<option value="${esc(p.id)}"${a.conta===p.id?' selected':''}>🏢 ${esc(p.nome)}</option>`).join('')}</select>
+ <label class="li-lbl">Em qual post?</label><select class="field" id="laP"><option value="">Qualquer post recente (até 14 dias)</option>${posts.map(p=>`<option value="${esc(p.url)}"${a.post_url===p.url?' selected':''}>${p.autor==='perfil'?'👤':'🏢'} ${esc(p.texto)}</option>`).join('')}</select>${posts.length?'':'<div class="faint" style="font-size:11px;margin-top:4px">Sincronize seus posts em Posts para escolher um específico.</div>'}
  <label class="li-lbl">Quando alguém comentar</label><div style="display:flex;gap:8px"><select class="field" id="laG" style="margin:0;max-width:220px" onchange="laW.style.display=this.value==='palavra'?'':'none'"><option value="qualquer">qualquer comentário</option><option value="palavra"${a.gatilho==='palavra'?' selected':''}>que contenha a palavra</option></select><input class="field" id="laW" style="margin:0;${a.gatilho==='palavra'?'':'display:none'}" value="${esc(a.palavra)}" placeholder="Ex.: QUERO"></div>
  <label class="li-lbl">Então</label><label class="li-obj on" style="opacity:.8"><input type="checkbox" checked disabled> Adicionar ao CRM (origem "Comentário automatizado")</label>
  <label class="li-obj${a.convite?' on':''}" style="margin-top:8px"><input type="checkbox" id="laC" ${a.convite?'checked':''}> Enviar pedido de conexão</label><textarea class="field" id="laCN" rows="2" maxlength="300" placeholder="Nota do convite (opcional) — use {{primeiro_nome}}" style="margin-top:6px">${esc(a.nota)}</textarea>
  <label class="li-obj${a.mensagem?' on':''}" style="margin-top:8px"><input type="checkbox" id="laM" ${a.mensagem?'checked':''}> Enviar mensagem (só chega a quem já é conexão)</label><textarea class="field" id="laMT" rows="4" placeholder="Oi {{primeiro_nome}}, vi seu comentário! Aqui está o material: ..." style="margin-top:6px">${esc(a.texto)}</textarea>
- <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" onclick="liAutoSalvar({id:${id?`'${id}'`:'null'},nome:laN.value,ativo:${a.ativo!==false},post_url:laP.value,gatilho:laG.value,palavra:laW.value,convite:laC.checked,nota:laCN.value,mensagem:laM.checked,texto:laMT.value},true)">Salvar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
+ <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" onclick="liAutoSalvar({id:${id?`'${id}'`:'null'},conta:laK.value,nome:laN.value,ativo:${a.ativo!==false},post_url:laP.value,gatilho:laG.value,palavra:laW.value,convite:laC.checked,nota:laCN.value,mensagem:laM.checked,texto:laMT.value},true)">Salvar</button></div></div></div>`;document.body.appendChild(w.firstChild);}
 async function liAutoSalvar(b,fecha){try{await liP('/linkedin/automacoes',b);if(fecha)closeModal();toast('Automação salva','ok');liRefresh();}catch(e){toast(e.message,'error');}}
 
 /* ---------- Segurança e limites ---------- */
