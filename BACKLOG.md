@@ -28,7 +28,7 @@ Plataforma de **IA soberana** rodando 100% na própria infra: **RAG privado com 
 | **L1 Core Infra** | Docker ✅ · GPU ⬜ · K8s/Terraform ⬜ | 🟡 |
 | **L2 Integration** | PII masking Presidio pt ✅ · CPF/CNPJ (checksum)/RG/título/CNH/PIS/CEP/cartão ✅ · OCR (Tesseract) ✅ · Unstructured/Airbyte/Prefect ⬜ | 🟡 |
 | **L3 Context** | Qdrant (vetor) ✅ · Neo4j (grafo) ✅ · RAG híbrido ✅ · Reranker BGE+lexical ✅ · memória de sessão ✅ · mem0/Cognee ⬜ | 🟡 |
-| **L4 Intelligence** | Ollama (qwen2.5:3b, CPU) ✅ · embeddings ✅ · vLLM/NIM ⬜ · fine-tuning (Axolotl) ⬜ · registry ⬜ | 🟡 |
+| **L4 Intelligence** | Ollama (qwen3.5:4b texto+visão, CPU) ✅ · embeddings ✅ · vLLM/NIM ⬜ · fine-tuning (Axolotl) ⬜ · registry ⬜ | 🟡 |
 | **L5 Action/Gateway** | LiteLLM OpenAI-compat ✅ · provedores externos mascarados ✅ · roteamento por sensibilidade ⬜ · MCP ⬜ | 🟡 |
 | **L6 Agentic** | Agente (tools+memória+Agentic RAG) ✅ · Guardrails ✅ · multi-agente/CrewAI/A2A ⬜ | 🟡 |
 | **L7 Management** | Admin Center ✅ · Observability (LiteLLM+PG) ✅ · Audit Ledger ✅ · Preflight ✅ · RBAC ⬜ · FinOps ⬜ · Policy/Blueprint/Troubleshooting ⬜ | 🟡 |

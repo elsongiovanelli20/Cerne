@@ -1,4 +1,6 @@
 # Gateway universal (L5) — API compatível com OpenAI na porta 4000.
+# Modelo local soberano: qwen3.5:4b (2026-11-28; antes qwen2.5:3b) — melhor em RAG/raciocínio/visão no benchmark
+# feito na VM (4 núcleos ARM, só CPU). Também é o modelo de visão (VISION_MODEL).
 # O app e qualquer ferramenta externa falam "OpenAI"; o gateway roteia para o
 # backend real. Hoje: Ollama local. Amanhã: adicione um modelo em GPU na nuvem
 # ou um fallback para OpenAI/Anthropic apenas mudando este arquivo.
@@ -6,8 +8,9 @@
 model_list:
   - model_name: chat
     litellm_params:
-      model: ollama/qwen2.5:3b
+      model: ollama/qwen3.5:4b
       api_base: http://ollama:11434
+      think: false                         # Qwen 3.5 "pensa" por padrão: em CPU isso custa ~80s por resposta
 
   # Alias soberano para a CAMADA DE AGENTES (NanoClaw via Claude Agent SDK).
   # NanoClaw aponta ANTHROPIC_BASE_URL para este gateway e usa o modelo "agent":
@@ -16,18 +19,21 @@ model_list:
   # provedor externo COM PII mascarada, sob a governança híbrida — sem tocar no NanoClaw.
   - model_name: agent
     litellm_params:
-      model: ollama/qwen2.5:3b
+      model: ollama/qwen3.5:4b
       api_base: http://ollama:11434
+      think: false                         # Qwen 3.5 "pensa" por padrão: em CPU isso custa ~80s por resposta
   # Nomes de modelo padrão do Claude Agent SDK → resolvem para o modelo local soberano,
   # para o NanoClaw funcionar apontado ao gateway sem precisar de chave da Anthropic.
   - model_name: claude-3-5-sonnet-20241022
     litellm_params:
-      model: ollama/qwen2.5:3b
+      model: ollama/qwen3.5:4b
       api_base: http://ollama:11434
+      think: false                         # Qwen 3.5 "pensa" por padrão: em CPU isso custa ~80s por resposta
   - model_name: claude-3-5-haiku-20241022
     litellm_params:
-      model: ollama/qwen2.5:3b
+      model: ollama/qwen3.5:4b
       api_base: http://ollama:11434
+      think: false                         # Qwen 3.5 "pensa" por padrão: em CPU isso custa ~80s por resposta
 
   # (Gemma 4 E4B removido do gateway: 9.6GB inviável em CPU-only — reservado p/ tier com GPU)
   - model_name: embed

@@ -15,7 +15,7 @@ Para arquitetura e migração para a nuvem, veja o [README.md](README.md).
 |---|---|---|
 | **Painel + RAG** (`cerne-app`) | http://localhost:8000 | interface e API de ingestão/pergunta |
 | **Gateway** (`cerne-gateway`) | http://localhost:4000 | API compatível com OpenAI (aponte ferramentas aqui) |
-| **Ollama** (`cerne-ollama`) | 11434 | modelos: `qwen2.5:3b` (chat) + `nomic-embed-text` (embeddings) |
+| **Ollama** (`cerne-ollama`) | 11434 | modelos: `qwen3.5:4b` (chat + visão) + `bge-m3` (embeddings) |
 | **PII** (`cerne-pii`) | interno | mascara CPF, CNPJ, CEP, nome, e-mail, telefone (Presidio pt) |
 | **Qdrant** (`cerne-qdrant`) | 6333 | banco vetorial (onde os documentos ficam indexados) |
 
@@ -161,12 +161,12 @@ em **`gateway/litellm-config.yaml`**. Para trocar o modelo de chat:
 
 ```powershell
 # 1) baixe o modelo desejado
-docker exec cerne-ollama ollama pull qwen2.5:3b        # bom em português (padrão atual)
+docker exec cerne-ollama ollama pull qwen3.5:4b        # padrão atual: texto + visão, bom em português
 # docker exec cerne-ollama ollama pull llama3.2:1b     # mais leve/rápido
 # docker exec cerne-ollama ollama pull llama3.1:8b     # melhor, mas exige mais RAM
 
 # 2) edite gateway/litellm-config.yaml, no model_name "chat":
-#      model: ollama/qwen2.5:3b
+#      model: ollama/qwen3.5:4b
 
 # 3) recarregue só o gateway
 cd D:\cerne; docker compose up -d gateway

@@ -33,7 +33,7 @@ docker compose up -d --build
 #   Windows (também baixa os modelos):  .\scripts\up.ps1
 
 # 4. Baixar os modelos locais do Ollama (se não usou o up.ps1)
-docker compose exec ollama ollama pull qwen2.5:3b
+docker compose exec ollama ollama pull qwen3.5:4b
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 

@@ -94,7 +94,7 @@ $r.pii_protegida          # tokens que foram mascarados
 Parâmetros: `provider` (`ext-glm`|`ext-gemini`|`ext-reason`|`ext-mistral`|`ext-nvidia-ultra`|…),
 `use_rag` (true = usa seus documentos; false = pergunta direta), `top_k`.
 
-Compare com o local: mesma pergunta em `/ask` (100% soberano, `qwen2.5:3b`) vs.
+Compare com o local: mesma pergunta em `/ask` (100% soberano, `qwen3.5:4b`) vs.
 `/ask-externo` (mais forte, mascarado). Roteie por sensibilidade da tarefa.
 
 ## Fontes da pesquisa

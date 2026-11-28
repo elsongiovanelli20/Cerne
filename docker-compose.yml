@@ -155,7 +155,7 @@ services:
       - EMBED_DIM=${EMBED_DIM:-1024}          # bge-m3 = 1024d (era 768 no nomic); reindexar ao trocar
       - COLLECTION=cerne_docs
       - OLLAMA_URL=http://ollama:11434
-      - VISION_MODEL=${VISION_MODEL:-qwen2.5vl:3b}   # modelo de visão LOCAL (soberano); baixe com: ollama pull qwen2.5vl:3b
+      - VISION_MODEL=${VISION_MODEL:-qwen3.5:4b}   # modelo de visão LOCAL (soberano) — o mesmo do chat (qwen3.5 é multimodal)
       - VISION_ENABLED=${VISION_ENABLED:-1}
       - SEARXNG_URL=http://searxng:8080
       - RERANK=1

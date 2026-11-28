@@ -45,7 +45,7 @@ GATEWAY_KEY = os.getenv("GATEWAY_KEY", "")
 PII_URL = os.getenv("PII_URL", "http://pii:8080")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-VISION_MODEL = os.getenv("VISION_MODEL", "qwen2.5vl:3b")   # modelo de visão LOCAL (soberano) via Ollama
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen3.5:4b")   # modelo de visão LOCAL (soberano) via Ollama — o qwen3.5 é multimodal
 VISION_ENABLED = os.getenv("VISION_ENABLED", "1") not in ("0", "false", "no", "")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "")            # busca web self-hosted (opt-in); vazio = desligado
 CHAT_ALIAS = os.getenv("CHAT_ALIAS", "chat")
@@ -465,7 +465,7 @@ def _anexos_cleanup():
         _appstate_save(APPSTATE)
 
 
-# Orçamento de caracteres do anexo por TIPO de modelo: o local (qwen2.5:3b, janela de 4096 tokens) descarta o que
+# Orçamento de caracteres do anexo por TIPO de modelo: o local (qwen3.5:4b, janela de 4096 tokens) descarta o que
 # não cabe — mandar 120 mil caracteres faz ele não ver NADA do anexo. Externo (Mistral/Claude…) aguenta bem mais.
 _ANEXO_LIMITE_LOCAL = int(os.getenv("ANEXO_LIMITE_LOCAL", "7000"))
 _ANEXO_LIMITE_EXTERNO = int(os.getenv("ANEXO_LIMITE_EXTERNO", "110000"))
@@ -1495,7 +1495,9 @@ def _vision_describe(raw: bytes, prompt: str = "") -> str:
     r = httpx.post(f"{OLLAMA_URL}/api/chat", timeout=600,
                    json={"model": VISION_MODEL, "stream": False,
                          "messages": [{"role": "user", "content": p, "images": [b64]}],
-                         "options": {"temperature": 0.2}})
+                         "options": {"temperature": 0.2},
+                         # Qwen 3.x/Gemma 4 "pensam" por padrão — em CPU isso multiplica o tempo; aqui não precisa
+                         **({"think": False} if VISION_MODEL.startswith(("qwen3", "gemma4")) else {})})
     r.raise_for_status()
     return ((r.json().get("message") or {}).get("content") or "").strip()
 
@@ -14917,7 +14919,7 @@ V.components=async()=>{const s=await J('/stats'),svc=s.servicos||{};
   ["Plano de Governança","Observabilidade, Audit Ledger encadeado por hash e painel de controle",["LiteLLM logs","Postgres","SHA-256","RBAC"].concat(svc.langfuse!=null?["Langfuse traces"]:[]),svc.gateway,false],
   ["Plano Agêntico & Guardrails","Orquestrador multi-agente, guardrails anti-injeção (OWASP), rate limiting e execução durável (fila em 2º plano + aprovação humana)",["orquestrador","guardrails","rate limit","skills","fila","aprovação"],svc.gateway,false],
   ["Plano de Gateway","Gateway OpenAI-compatível: roteamento, escalonamento mascarado, fallback e cache semântico (perguntas equivalentes → resposta instantânea)",["LiteLLM","fallback","cache semântico"],svc.gateway,false],
-  ["Plano de Inteligência","Inferência e embeddings locais + reranker neural",["Ollama","qwen2.5:3b","bge-m3 1024d","qwen2.5-VL","BGE rerank"],svc.ollama,false],
+  ["Plano de Inteligência","Inferência e embeddings locais + reranker neural",["Ollama","qwen3.5:4b (texto + visão)","bge-m3 1024d","BGE rerank"],svc.ollama,false],
   ["Plano de Memória","Memória longa por organização — fatos e preferências entre sessões, com opt-out e exclusão (soberana)",["memória","por org","opt-out"],true,false],
   ["Plano de Contexto","RAG híbrido multi-consulta (PT+EN) + grafo + citação de fontes",["Qdrant","Neo4j","multi-consulta","citações"],svc.qdrant,false],
   ["Plano de Integração","PII mascarada (Presidio pt/BR) antes de qualquer saída, OCR e visão",["Presidio","PII BR","OCR","visão"].concat(svc.docling!=null?["Docling (PDF/Office)"]:[]),svc.pii,false],
